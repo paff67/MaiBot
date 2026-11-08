@@ -905,9 +905,9 @@ class ChatConfig(ConfigBase):
     """私聊回复时参考的最近消息数量。"""
 
     context_compaction_summary_max_chars: int = Field(
-        default=6000,
+        default=18000,
         ge=1000,
-        le=8000,
+        le=50000,
         json_schema_extra={
             "label": {
                 "zh_CN": "状态摘要字符上限",
@@ -1329,9 +1329,9 @@ class AMemorixIntegrationConfig(ConfigBase):
     """是否在 Maisaka Planner 调用前自动注入当前对象相关的人物画像"""
 
     person_profile_injection_max_profiles: int = Field(
-        default=3,
+        default=9,
         ge=1,
-        le=5,
+        le=50,
         json_schema_extra={
             "label": {
                 "zh_CN": "注入画像上限",
@@ -1402,9 +1402,9 @@ class AMemorixIntegrationConfig(ConfigBase):
     """每轮自然拉起的长期记忆数量上限"""
 
     heuristic_memory_recall_max_chars: int = Field(
-        default=900,
+        default=2700,
         ge=100,
-        le=4000,
+        le=20000,
         json_schema_extra={
             "label": {
                 "zh_CN": "自然拉起文本上限",

@@ -1,10 +1,11 @@
-﻿"""reply 工具适配与共用回复执行服务。"""
+"""reply 工具适配与共用回复执行服务。"""
 
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, Optional, Tuple
 
 import asyncio
 import json
+import os
 import traceback
 
 from src.chat.replyer.replyer_manager import replyer_manager
@@ -15,6 +16,7 @@ from src.common.data_models.message_component_data_model import TextComponent
 from src.common.data_models.reply_generation_data_models import ReplyGenerationResult, build_reply_monitor_detail
 from src.common.logger import get_logger
 from src.config import config as config_module
+from src.companion_vault.runtime_bridge import load_reply_greenlights_async
 from src.core.tooling import ToolAvailabilityContext, ToolExecutionContext, ToolExecutionResult, ToolInvocation, ToolSpec
 from src.maisaka.quote import decide_quote
 from src.maisaka.context.message_adapter import build_visible_text_from_sequence, parse_speaker_content
@@ -31,7 +33,9 @@ if TYPE_CHECKING:
     from src.maisaka.reply_supplement import ReplySupplement
 
 logger = get_logger("maisaka_builtin_reply")
-_REPLY_TOOL_INTERNAL_ARGUMENTS = {"msg_id", "_reply_id", "_plugin_reply_prompt"}
+_REPLY_TOOL_INTERNAL_ARGUMENTS = {
+    "msg_id", "_reply_id", "_plugin_reply_prompt", "_recalled_memory_block", "_recalled_file_parts",
+}
 _DUPLICATE_TARGET_REPLY_REMINDER_ARG = "_duplicate_target_reply_reminder"
 _DUPLICATE_TARGET_REPLY_REMINDER_TEMPLATE = (
     "你刚刚已经回复过这条消息，你刚刚的发言是：“{previous_reply}”\n"
@@ -142,6 +146,41 @@ def get_tool_spec(context: Optional[ToolAvailabilityContext] = None) -> ToolSpec
             "enum": ["简短表达", "正常回复", "长回复"],
         },
     }
+    properties.update({
+        "memory_greenlights": {
+            "type": "array",
+            "description": "可选。按目录 trigger_when 点亮需调取完整纪要与重要对话原话的编号列表（如 AM0001、SF0001）。",
+            "items": {
+                "type": "object",
+                "properties": {"code": {"type": "string"}, "reason": {"type": "string"}},
+                "required": ["code"],
+            },
+        },
+        "file_greenlights": {
+            "type": "array",
+            "description": "可选。按文件身份证目录点亮需重新挂载原文件（图片/语音/PDF）二进制句柄给表达器查看的编号列表（如 FM0001）。",
+            "items": {
+                "type": "object",
+                "properties": {"code": {"type": "string"}, "reason": {"type": "string"}},
+                "required": ["code"],
+            },
+        },
+        "person_greenlights": {
+            "type": "array",
+            "description": "可选。按重要角色索引点亮需调取完整人物印象与过往经历的 person_id 列表。",
+            "items": {"type": "string"},
+        },
+        "quick_state_patch": {
+            "type": "array", "description": "可选。快速更新用户高频硬状态 user_status。",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "key": {"type": "string"}, "category": {"type": "string"}, "value": {"type": "string"},
+                },
+                "required": ["key", "value"],
+            },
+        },
+    })
     if _use_expression_intent():
         properties["expression_intent"] = {
             "type": "object",
@@ -441,6 +480,38 @@ async def execute_reply(
             f"未找到要回复的目标消息，msg_id={to_display_message_id(target_message_id)}",
         )
 
+    quote_kwargs = {}
+    if target_message.platform == 'wechat':
+        from src.companion_vault.wechat_recall import quote_binding
+        group = target_message.message_info.group_info
+        quote_kwargs = await asyncio.to_thread(
+            quote_binding, message_id=target_message.message_id, platform=target_message.platform,
+            account=target_message.account_id or '',
+            chat_id=group.group_id if group else target_message.message_info.user_info.user_id,
+        )
+    if any(invocation_arguments.get(key) for key in ("memory_greenlights", "file_greenlights", "person_greenlights", "quick_state_patch")):
+        memory_block, file_parts = await load_reply_greenlights_async(
+            is_group_chat=tool_ctx.runtime.chat_stream.is_group_session,
+            user_id=target_message.message_info.user_info.user_id,
+            platform=target_message.platform,
+            memory_greenlights=invocation_arguments.get("memory_greenlights", []),
+            file_greenlights=invocation_arguments.get("file_greenlights", []),
+            person_greenlights=invocation_arguments.get("person_greenlights", []),
+            quick_state_patch=invocation_arguments.get("quick_state_patch", []),
+            gemini_api_key=os.environ.get("GEMINI_API_KEY", ""),
+            anchor_message_id=target_message.message_id,
+            account=target_message.account_id or '',
+            chat_id=target_message.message_info.group_info.group_id if target_message.message_info.group_info else target_message.message_info.user_info.user_id,
+        )
+        reply_tool_args["_recalled_memory_block"] = memory_block
+        reply_tool_args["_recalled_file_parts"] = file_parts
+
+    if quote_kwargs:
+        from src.companion_vault.wechat_recall import build_quote_context_async
+        quote_block, quote_parts = await build_quote_context_async([target_message])
+        reply_tool_args['_recalled_memory_block'] = reply_tool_args.get('_recalled_memory_block','') + '\n' + quote_block
+        reply_tool_args['_recalled_file_parts'] = [*reply_tool_args.get('_recalled_file_parts',[]),*quote_parts]
+
     extension_execution = ReplyExtensionExecution(
         context=ToolAvailabilityContext(
             session_id=tool_ctx.runtime.session_id,
@@ -665,6 +736,28 @@ async def execute_reply(
         reply_metadata["reply_supplement"] = supplement.metadata
     # 旧链路保留群聊/私聊的三档抽样；补充器在解析编排时同样遵守「不引用」设置。
     effective_set_quote = set_quote
+    if (
+        not effective_set_quote
+        and tool_ctx.runtime.chat_stream.is_group_session
+        and tool_ctx.runtime.chat_stream.platform != CLI_PLATFORM_NAME
+        and config_module.global_config.chat.reply_style.group_quote_frequency != "never"
+    ):
+        has_pending = bool(getattr(tool_ctx.runtime, "_has_pending_messages", lambda: False)())
+        latest_user_message_id = next(
+            (
+                str(msg.message_id or "").strip()
+                for msg in reversed(getattr(tool_ctx.runtime, "_chat_history", []))
+                if isinstance(msg, SessionBackedMessage) and msg.source_kind == "user"
+            ),
+            "",
+        )
+        target_has_moved_on = bool(
+            latest_user_message_id
+            and target_message_id
+            and latest_user_message_id != str(target_message_id).strip()
+        )
+        if has_pending or target_has_moved_on:
+            effective_set_quote = True
     if quote_probability is not None:
         reply_metadata["quote_probability"] = quote_probability
     sent_message_ids: list[str] = []
@@ -672,6 +765,7 @@ async def execute_reply(
     # 逐段更新回执，后续发送抛错时也保留已经送达的消息，避免误判为完全未发送。
     reply_metadata["sent_message_ids"] = sent_message_ids
     reply_metadata["send_results"] = send_results
+    tool_ctx.runtime._last_reply_target_message_id = str(target_message_id or "").strip()
     try:
         sent = False
         if tool_ctx.runtime.chat_stream.platform == CLI_PLATFORM_NAME:

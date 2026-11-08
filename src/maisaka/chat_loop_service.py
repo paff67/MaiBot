@@ -33,6 +33,7 @@ from src.llm_models.payload_content.context_item import (
     get_response_reasoning,
     get_response_text,
     get_response_tool_calls,
+    replace_output_projection,
 )
 from src.llm_models.payload_content.context_protocol import ContextProtocolMode
 from src.llm_models.payload_content.native_tool import NativeToolCallSummary
@@ -175,6 +176,18 @@ class ChatResponse:
 
 
 logger = get_logger("maisaka_chat_loop")
+
+
+def _is_gateway_error_placeholder(text: Optional[str]) -> bool:
+    """判断文本是否为上游网关在截断或空回复时注入的错误提示占位。"""
+
+    normalized = str(text or "").strip()
+    return (
+        normalized.startswith("[网关提示]")
+        or "此提示由网关生成，不是模型回答" in normalized
+        or normalized.startswith("[Gateway notice]")
+        or "This gateway-generated notice is not a model answer" in normalized
+    )
 
 
 def register_maisaka_hook_specs(registry: HookSpecRegistry) -> List[HookSpec]:
@@ -1026,7 +1039,7 @@ class MaisakaChatLoopService:
         *,
         enable_visual_message: bool,
         include_day_boundary_time_messages: bool = False,
-        injected_user_messages: Sequence[str] | None = None,
+        injected_user_messages: Sequence[str | UserMessageItem] | None = None,
         tail_user_messages: Sequence[str] | None = None,
         final_user_message: str | None = None,
         system_prompt: Optional[str] = None,
@@ -1109,6 +1122,9 @@ class MaisakaChatLoopService:
             current_chat_attention,
         ]
         for injected_message in final_user_messages:
+            if isinstance(injected_message, UserMessageItem):
+                normalized_injected_items.append(injected_message)
+                continue
             normalized_message = str(injected_message or "").strip()
             if not normalized_message:
                 continue
@@ -1158,7 +1174,7 @@ class MaisakaChatLoopService:
         self,
         chat_history: List[LLMContextMessage],
         *,
-        injected_user_messages: Sequence[str] | None = None,
+        injected_user_messages: Sequence[str | UserMessageItem] | None = None,
         request_kind: str = "planner",
         response_format: RespFormat | None = None,
         tool_definitions: Sequence[ToolDefinitionInput] | None = None,
@@ -1325,15 +1341,25 @@ class MaisakaChatLoopService:
             )
         else:
             llm_chat = self._get_llm_chat_client(request_kind)
+            generation_options = LLMGenerationOptions(
+                tool_options=all_tools if all_tools else None,
+                response_format=response_format,
+                interrupt_flag=self._interrupt_flag,
+                force_stream_mode=request_kind == "planner" and global_config.chat.reply_timing.planner_message_steering,
+            )
             generation_result = await llm_chat.generate_response_with_context(
                 context_factory=context_factory,
-                options=LLMGenerationOptions(
-                    tool_options=all_tools if all_tools else None,
-                    response_format=response_format,
-                    interrupt_flag=self._interrupt_flag,
-                    force_stream_mode=request_kind == "planner" and global_config.chat.reply_timing.planner_message_steering,
-                ),
+                options=generation_options,
             )
+            if (
+                not get_response_tool_calls(generation_result.output_items)
+                and _is_gateway_error_placeholder(get_response_text(generation_result.output_items))
+            ):
+                logger.warning("检测到上游网关截断提示文本，正在自动重试一次")
+                generation_result = await llm_chat.generate_response_with_context(
+                    context_factory=context_factory,
+                    options=generation_options,
+                )
         if request_kind == "planner":
             self.planner_request_snapshot = (
                 PlannerRequestSnapshot(external_snapshot, tuple(selected_history)) if external_planner else
@@ -1386,6 +1412,18 @@ class MaisakaChatLoopService:
                 )
             except Exception as exc:
                 logger.warning(f"Hook maisaka.planner.after_response 返回的 output_items 无法反序列化，已忽略: {exc}")
+        if request_kind == "sub_agent" and _is_gateway_error_placeholder(get_response_text(final_output_items)):
+            raise RuntimeError("上游网关返回截断提示文本，拒绝作为子代理有效输出")
+        if (
+            not get_response_tool_calls(final_output_items)
+            and _is_gateway_error_placeholder(get_response_text(final_output_items))
+        ):
+            logger.warning("重试后上游网关仍返回截断提示文本，已过滤避免污染对话历史")
+            final_output_items = replace_output_projection(
+                final_output_items,
+                content="",
+                replace_content=True,
+            )
         prompt_tokens = self._coerce_int(after_response_kwargs.get("prompt_tokens"), generation_result.prompt_tokens)
         completion_tokens = self._coerce_int(
             after_response_kwargs.get("completion_tokens"),

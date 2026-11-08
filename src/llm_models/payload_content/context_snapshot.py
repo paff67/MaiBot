@@ -1,10 +1,11 @@
 """Context Item 的纯数据快照，不加载模型客户端或请求日志。"""
 
 from datetime import datetime
-from typing import Any, Sequence
+from typing import Any, List, Sequence, Tuple
 
 from .context_item import (
-    AssistantMessageItem, ContextImagePart, ContextItem, ContextItemMeta, ContextRefusalPart, ContextTextPart,
+    AssistantMessageItem, ContextContentPart, ContextFileUriPart, ContextImagePart, ContextItem, ContextItemMeta,
+    ContextRefusalPart, ContextTextPart,
     ContextToolCall, FunctionCallItem, FunctionCallOutputItem, ProviderActivityItem, ProviderOpaqueItem,
     ReasoningItem, ReasoningRepresentation, SystemMessageItem, UserMessageItem,
 )
@@ -74,6 +75,12 @@ def _serialize_content_parts(parts: Sequence[Any]) -> list[dict[str, Any]]:
 
     parts_payload: list[dict[str, Any]] = []
     for part in parts:
+        if isinstance(part, ContextFileUriPart):
+            parts_payload.append({
+                "type": "file_uri", "file_uri": part.file_uri,
+                "mime_type": part.mime_type, "file_code": part.file_code,
+            })
+            continue
         if isinstance(part, ContextTextPart):
             parts_payload.append({"type": "text", "text": part.text})
             continue
@@ -90,16 +97,24 @@ def _serialize_content_parts(parts: Sequence[Any]) -> list[dict[str, Any]]:
     return parts_payload
 
 
-def _deserialize_content_parts(raw_parts: Any) -> tuple[ContextTextPart | ContextImagePart | ContextRefusalPart, ...]:
+def _deserialize_content_parts(raw_parts: Any) -> Tuple[ContextContentPart, ...]:
     """从快照恢复规范化内容片段。"""
 
     if not isinstance(raw_parts, list):
         raise ValueError("快照中的 item.parts 必须是列表")
-    parts: list[ContextTextPart | ContextImagePart | ContextRefusalPart] = []
+    parts: List[ContextContentPart] = []
     for raw_part in raw_parts:
         if not isinstance(raw_part, dict):
             raise ValueError("快照中的 item part 必须是字典")
         part_type = str(raw_part.get("type", "")).strip().lower()
+        if part_type == "file_uri":
+            file_uri = raw_part.get("file_uri")
+            mime_type = raw_part.get("mime_type")
+            file_code = raw_part.get("file_code", "")
+            if not all(isinstance(value, str) for value in (file_uri, mime_type, file_code)):
+                raise ValueError("文件 part 的 file_uri、mime_type、file_code 必须是字符串")
+            parts.append(ContextFileUriPart(file_uri, mime_type, file_code))
+            continue
         if part_type == "text":
             text = raw_part.get("text")
             if not isinstance(text, str):
@@ -294,5 +309,3 @@ def deserialize_context_items_snapshot(raw_items: Any) -> list[ContextItem]:
     if not isinstance(raw_items, list):
         raise ValueError("快照中的 context_items 必须是列表")
     return [deserialize_context_item_snapshot(raw_item) for raw_item in raw_items]
-
-

@@ -76,7 +76,7 @@ from src.web_search.service import WebSearchService
 from src.plugin_runtime.tool_provider import PluginToolProvider
 from src.services.message_word_frequency_service import update_high_frequency_terms_from_context_messages
 
-from .chat_loop_service import ChatResponse, MaisakaChatLoopService
+from .chat_loop_service import ChatResponse, MaisakaChatLoopService, _is_gateway_error_placeholder
 from .reasoning_engine import MaisakaReasoningEngine
 from .subagent_tasks import SubAgentTask, SubAgentTaskManager, format_tool_usage
 
@@ -202,6 +202,7 @@ class MaisakaHeartFlowChatting(MaisakaRuntimeDisplayMixin):
         self._forced_turn_enabled = False
         self._forced_turn_message_id = ""
         self._forced_turn_reason = ""
+        self._last_reply_target_message_id = ""
         self._planner_continuation_active = False
         self._planner_interrupt = PlannerInterruptController()
         self._monitor_session_start_task: Optional[asyncio.Task[None]] = None
@@ -588,13 +589,18 @@ class MaisakaHeartFlowChatting(MaisakaRuntimeDisplayMixin):
             user_info = message.message_info.user_info
             speaker_name = user_info.user_cardname or user_info.user_nickname or user_info.user_id
             include_chat_id = self._is_focus_mode_active_for_current_chat()
+            quote_ids = extract_quote_ids_from_message_sequence(message.raw_message)
+            if not quote_ids and source_kind == "guided_reply":
+                fallback_target_id = str(getattr(self, "_last_reply_target_message_id", "") or "").strip()
+                if fallback_target_id:
+                    quote_ids = [fallback_target_id]
             planner_prefix = build_planner_prefix(
                 timestamp=message.timestamp,
                 user_name=speaker_name,
                 group_card=user_info.user_cardname or "",
                 message_id=message.message_id,
                 chat_id=message.session_id,
-                quote_ids=extract_quote_ids_from_message_sequence(message.raw_message),
+                quote_ids=quote_ids,
                 include_message_id=not message.is_notify and bool(message.message_id),
                 include_chat_id=include_chat_id,
                 is_self_message=source_kind == "guided_reply",
@@ -1388,13 +1394,16 @@ class MaisakaHeartFlowChatting(MaisakaRuntimeDisplayMixin):
             model_task_name=model_task_name,
         )
         sub_agent.set_interrupt_flag(interrupt_flag)
-        return await sub_agent.chat_loop_step(
+        response = await sub_agent.chat_loop_step(
             sub_agent_history,
             request_kind=request_kind,
             response_format=response_format,
             tool_definitions=[] if tool_definitions is None else tool_definitions,
             max_context_size=context_message_limit,
         )
+        if _is_gateway_error_placeholder(response.content):
+            raise RuntimeError("上游网关返回截断提示文本，拒绝作为子代理有效输出")
+        return response
 
     @staticmethod
     def _drop_head_context_messages(

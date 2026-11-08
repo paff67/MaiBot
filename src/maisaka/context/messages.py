@@ -445,6 +445,8 @@ def _build_item_from_sequence(
     tool_call_id: Optional[str] = None,
     tool_name: Optional[str] = None,
     meta: ContextItemMeta | None = None,
+    vault_evidence_block: str = "",
+    vault_descriptors: Sequence[Dict[str, Any]] = (),
 ) -> Optional[ContextItem]:
     """根据消息片段构造统一 Context Item。"""
     builder = ContextItemBuilder().set_role(role)
@@ -505,6 +507,29 @@ def _build_item_from_sequence(
         if isinstance(component, ReplyComponent):
             has_content = _append_reply_component(builder, component) or has_content
             continue
+
+    if vault_evidence_block and vault_evidence_block.strip():
+        builder.add_text_content(vault_evidence_block.strip())
+        has_content = True
+
+    for part in vault_descriptors:
+        if "text" in part and part["text"]:
+            builder.add_text_content(str(part["text"]))
+            has_content = True
+        elif "image_base64" in part and part["image_base64"]:
+            if enable_visual_message:
+                builder.add_image_base64_part(
+                    image_format=part.get("image_format", "jpeg"),
+                    image_base64=part["image_base64"],
+                )
+                has_content = True
+        elif "file_uri" in part and part["file_uri"]:
+            builder.add_file_uri_part(
+                part["file_uri"],
+                part.get("mime_type", "application/octet-stream"),
+                part.get("file_code"),
+            )
+            has_content = True
 
     if not has_content and fallback_text.strip():
         builder.add_text_content(fallback_text)
@@ -574,6 +599,8 @@ class ContentContextMessage(LLMContextMessage):
     message_id: Optional[str] = None
     source_kind: str = "user"
     context_item_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    vault_evidence_block: str = ""
+    vault_descriptors: Tuple[Dict[str, Any], ...] = ()
 
     @property
     def media_sequence(self) -> MessageSequence:
@@ -612,6 +639,8 @@ class ContentContextMessage(LLMContextMessage):
             limit_emoji_size=limit_emoji_size,
             max_image_side=max_image_side,
             meta=ContextItemMeta.create(item_id=self.context_item_id, timestamp=self.timestamp),
+            vault_evidence_block=self.vault_evidence_block,
+            vault_descriptors=self.vault_descriptors,
         )
 
 

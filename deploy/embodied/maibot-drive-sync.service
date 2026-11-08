@@ -1,0 +1,15 @@
+[Unit]
+Description=Verify and upload MaiBot original archives to Google Drive
+After=network-online.target maibot-gdrive.service
+Wants=maibot-gdrive.service
+
+[Service]
+WorkingDirectory=/opt/maibot-brain
+EnvironmentFile=/etc/maibot-media.env
+ExecStart=/usr/bin/python3 -m src.companion_vault.media_ingestor --mode sync
+Restart=on-failure
+RestartSec=10
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

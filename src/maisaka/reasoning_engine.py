@@ -23,6 +23,7 @@ from src.common.data_models.message_component_data_model import (
 )
 from src.common.logger import get_logger
 from src.config.config import global_config
+from src.companion_vault.runtime_bridge import build_planner_truth_catalog_async
 from src.core.tooling import (
     ToolAvailabilityContext,
     ToolContentItem,
@@ -52,7 +53,7 @@ from src.maisaka.builtin_tool import (
     get_builtin_tool_visibility,
     is_builtin_tool_in_action_stage,
 )
-from .chat_loop_service import ChatResponse
+from .chat_loop_service import ChatResponse, _is_gateway_error_placeholder
 from .mode_policy import build_consecutive_wait_reminders
 from .reply_supplement import ReplySupplement, generate_reply_supplement
 from .tool_result_condenser import condense_tool_result, should_condense_tool_result
@@ -81,10 +82,12 @@ from src.maisaka.jargon_context_matcher import (
     build_jargon_reference_message,
     extract_jargon_reference_contents,
 )
-from src.maisaka.memory.heuristic_injector import heuristic_memory_injector
-from src.maisaka.memory.image_injector import image_memory_injector
 from src.maisaka.monitor.tool_media import build_tool_result_images
-from src.maisaka.context.compaction import ContextSummaryMessage, build_context_summary
+from src.maisaka.context.compaction import (
+    ContextSummaryMessage,
+    build_context_summary,
+    build_deterministic_fallback_summary,
+)
 from src.maisaka.monitor.events import (
     emit_flow_step,
     emit_planner_snapshot,
@@ -102,6 +105,7 @@ logger = get_logger("maisaka_reasoning_engine")
 HISTORY_DEFERRED_TOOL_RESULT_NAMES = {"wait"}
 TOOL_RESULT_MEDIA_TYPES = {"image", "audio", "resource_link", "resource", "binary"}
 STOP_AFTER_EXECUTION_PAUSE_REASON = "stop_after_execution"
+MAX_COMPACTION_FAILURES_BEFORE_FALLBACK = 5
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,6 +163,7 @@ class MaisakaReasoningEngine:
         self._last_reasoning_content: str = ""
         self._active_logical_turn_id: str | None = None
         self._turn_passive_replyer: Optional[bool] = None
+        self._compaction_failure_count: int = 0
 
     @property
     def passive_replyer_enabled(self) -> bool:
@@ -192,7 +197,7 @@ class MaisakaReasoningEngine:
     async def _run_interruptible_planner(
         self,
         *,
-        injected_user_messages: Optional[list[str]] = None,
+        injected_user_messages: Optional[list[str | UserMessageItem]] = None,
         tail_user_messages: Optional[list[str]] = None,
         tool_definitions: Optional[list[dict[str, Any]]] = None,
     ) -> Any:
@@ -284,21 +289,12 @@ class MaisakaReasoningEngine:
         source_messages: list[SessionMessage],
         deferred_tools_reminder: str,
         round_text: Optional[str] = None,
-    ) -> list[str]:
+    ) -> list[str | UserMessageItem]:
         """构造本轮 planner 的一次性注入消息。"""
 
-        injected_messages: list[str] = []
+        injected_messages: list[str | UserMessageItem] = []
         if deferred_tools_reminder:
             injected_messages.append(deferred_tools_reminder)
-
-        async def build_heuristic_memory_message() -> str:
-            try:
-                return await heuristic_memory_injector.build_injection_message(
-                    session_id=str(self._runtime.session_id or ""),
-                )
-            except Exception as exc:
-                logger.debug(f"{self._runtime.log_prefix} 启发式记忆自然拉起失败，已跳过: {exc}")
-                return ""
 
         async def build_profile_messages() -> list[str]:
             try:
@@ -310,19 +306,20 @@ class MaisakaReasoningEngine:
                 logger.debug(f"{self._runtime.log_prefix} 人物画像自动注入失败，已跳过: {exc}")
                 return []
 
-        async def build_image_memory_message() -> str:
-            try:
-                return await image_memory_injector.build_injection_message(
-                    session_id=str(self._runtime.session_id or ""),
-                    source_messages=source_messages,
-                )
-            except Exception as exc:
-                logger.debug(f"{self._runtime.log_prefix} 图片记忆自然拉起失败，已跳过: {exc}")
-                return ""
+        async def build_truth_catalog_message() -> str:
+            return await build_planner_truth_catalog_async(
+                session_id=self._runtime.session_id,
+                is_group_chat=self._runtime.chat_stream.is_group_session,
+                user_id=profile_message.message_info.user_info.user_id,
+                platform=profile_message.platform,
+                anchor_message_id=profile_message.message_id,
+                account=profile_message.account_id or '',
+                chat_id=profile_message.message_info.group_info.group_id if profile_message.message_info.group_info else profile_message.message_info.user_info.user_id,
+            )
 
-        pending = {"启发式记忆", "人物画像", "图片记忆"}
+        pending = {"人物画像", "真值目录"}
         if round_text is not None:
-            self._runtime._update_stage_status("组织上下文", "正在准备：启发式记忆、人物画像、图片记忆", round_text=round_text)
+            self._runtime._update_stage_status("组织上下文", "正在准备：人物画像、真值目录", round_text=round_text)
 
         async def measure_injection(name: str, build: Callable[[], Awaitable[Any]]) -> Any:
             started = time.perf_counter()
@@ -333,19 +330,29 @@ class MaisakaReasoningEngine:
                 pending.discard(name)
                 logger.info(f"{self._runtime.log_prefix} 上下文准备: {name} 耗时={elapsed:.2f}s")
                 if pending and round_text is not None:
-                    remaining = "、".join(item for item in ("启发式记忆", "人物画像", "图片记忆") if item in pending)
+                    remaining = "、".join(item for item in ("人物画像", "真值目录") if item in pending)
                     self._runtime._update_stage_status("组织上下文", f"正在等待：{remaining}", round_text=round_text)
 
-        heuristic_memory_message, profile_messages, image_memory_message = await asyncio.gather(
-            measure_injection("启发式记忆", build_heuristic_memory_message),
+        profile_messages, truth_catalog_message = await asyncio.gather(
             measure_injection("人物画像", build_profile_messages),
-            measure_injection("图片记忆", build_image_memory_message),
+            measure_injection("真值目录", build_truth_catalog_message),
         )
-        if heuristic_memory_message:
-            injected_messages.append(heuristic_memory_message)
         injected_messages.extend(profile_messages)
-        if image_memory_message:
-            injected_messages.append(image_memory_message)
+        injected_messages.append(truth_catalog_message)
+        # Explicit references are context evidence, not a new Planner decision/tool.
+        from src.companion_vault.wechat_recall import build_quote_context_async, quote_context_item
+
+        hydrated_direct_ids = tuple(
+            msg.message_id
+            for msg in self._runtime._chat_history
+            if isinstance(msg, SessionBackedMessage) and getattr(msg, "vault_descriptors", ())
+        )
+        quote_block, quote_parts = await build_quote_context_async(
+            source_messages or [profile_message],
+            exclude_direct_attachment_ids=hydrated_direct_ids,
+        )
+        if quote_block:
+            injected_messages.append(quote_context_item(quote_block, quote_parts))
         return injected_messages
 
     def _refresh_jargon_reference_message(self) -> Optional[ReferenceMessage]:
@@ -392,6 +399,17 @@ class MaisakaReasoningEngine:
         """处理 Planner 响应中的工具调用，或无工具输出策略。"""
 
         planner_content = self._get_planner_content(response)
+        if not response.tool_calls and _is_gateway_error_placeholder(planner_content):
+            logger.warning(f"{self._runtime.log_prefix} Planner 返回上游网关截断提示文本，已过滤避免写入历史")
+            planner_content = ""
+            if hasattr(response, "output_items") and response.output_items:
+                response.output_items = replace_output_projection(
+                    response.output_items,
+                    content="",
+                    replace_content=True,
+                )
+            elif hasattr(response, "raw_messages"):
+                response.raw_messages = []
         if (response.tool_calls or not self.passive_replyer_enabled) and self._should_replace_reasoning(planner_content):
             planner_content = "我应该根据我上面思考的内容进行反思，重新思考我下一步的行动，我需要分析当前场景，对话，然后直接输出我的想法："
             replaced_items = replace_output_projection(
@@ -963,7 +981,7 @@ class MaisakaReasoningEngine:
                         # 工具执行或整理上下文期间收到的消息，在下一次模型请求前补齐。
                         pending_round_messages = await self._ingest_pending_messages() if round_index > 0 else []
                         if pending_round_messages:
-                            cached_messages = pending_round_messages
+                            cached_messages = self._merge_turn_source_messages(cached_messages, pending_round_messages)
                             trigger_message = pending_round_messages[-1]
 
                         cycle_detail, round_text = await self._start_cycle_round(round_index)
@@ -1010,7 +1028,9 @@ class MaisakaReasoningEngine:
                             if not interrupt_result.retry_messages:
                                 break
 
-                            cached_messages = interrupt_result.retry_messages
+                            cached_messages = self._merge_turn_source_messages(
+                                cached_messages, interrupt_result.retry_messages
+                            )
                             trigger_message = interrupt_result.retry_messages[-1]
                             continue
                         except asyncio.CancelledError:
@@ -1211,6 +1231,36 @@ class MaisakaReasoningEngine:
                     f"{self._runtime.log_prefix} 回填图片或表情二进制数据失败，Maisaka 将退化为文本占位: {result}"
                 )
 
+    @staticmethod
+    def _merge_turn_source_messages(
+        existing: list[SessionMessage], incoming: list[SessionMessage]
+    ) -> list[SessionMessage]:
+        """合并同一逻辑回合内先后到达的源消息，保持时间顺序且不丢失前序媒体消息。"""
+
+        merged: list[SessionMessage] = []
+        seen_ids: set[str] = set()
+        for msg in [*existing, *incoming]:
+            mid = str(getattr(msg, "message_id", "") or "")
+            if mid and mid in seen_ids:
+                continue
+            if mid:
+                seen_ids.add(mid)
+            merged.append(msg)
+        return merged
+
+    async def _refresh_wechat_vault_media(self, chat_history: List[LLMContextMessage]) -> int:
+        """将已就绪的微信原件按消息原始时间位置就地挂载到对应的历史消息节点。"""
+
+        try:
+            from src.companion_vault.wechat_recall import hydrate_wechat_history_media_async
+
+            max_images = max(12, int(getattr(global_config.visual, "max_image_num", 8) or 8))
+            hydrated_ids = await hydrate_wechat_history_media_async(chat_history, max_hydrated=max_images)
+            return len(hydrated_ids)
+        except Exception as exc:
+            logger.debug(f"{self._runtime.log_prefix} 刷新微信历史原件挂载失败，已跳过: {exc}")
+            return 0
+
     async def _refresh_chat_history_visual_placeholders(
         self,
         *,
@@ -1221,6 +1271,7 @@ class MaisakaReasoningEngine:
 
         history = self._runtime._chat_history if chat_history is None else chat_history
         refreshed_count = await self._refresh_chat_history_visual_placeholders_once(history)
+        await self._refresh_wechat_vault_media(history)
         wait_seconds = self._resolve_image_recognition_wait_seconds(wait_for_text_model=wait_for_text_model)
         if wait_seconds <= 0:
             return refreshed_count
@@ -1235,6 +1286,7 @@ class MaisakaReasoningEngine:
             refreshed_count += await self._refresh_chat_history_visual_placeholders_once(history)
 
         refreshed_count += await self._refresh_chat_history_visual_placeholders_once(history)
+        await self._refresh_wechat_vault_media(history)
         return refreshed_count
 
     def _resolve_image_recognition_wait_seconds(self, *, wait_for_text_model: bool = False) -> float:
@@ -1276,9 +1328,28 @@ class MaisakaReasoningEngine:
         )
 
     def _insert_chat_history_message(self, message: LLMContextMessage) -> int:
-        """将消息按处理顺序追加到聊天历史末尾。"""
-        self._runtime._chat_history.append(message)
-        return len(self._runtime._chat_history) - 1
+        """将消息按处理顺序追加到聊天历史末尾；若末尾存在时间戳更晚的已发送消息，则按时间顺序插入其前。"""
+        history = self._runtime._chat_history
+        if isinstance(message, SessionBackedMessage) and message.source_kind == "user":
+            candidate_index = len(history)
+            insert_index = len(history)
+            while candidate_index > 0:
+                prev = history[candidate_index - 1]
+                if isinstance(prev, SessionBackedMessage):
+                    if prev.timestamp > message.timestamp:
+                        candidate_index -= 1
+                        insert_index = candidate_index
+                    else:
+                        break
+                elif isinstance(prev, ToolResultMessage):
+                    candidate_index -= 1
+                else:
+                    break
+            if insert_index < len(history):
+                history.insert(insert_index, message)
+                return insert_index
+        history.append(message)
+        return len(history) - 1
 
     def _start_cycle(self) -> CycleDetail:
         """开始一轮 Maisaka 思考循环。"""
@@ -1307,7 +1378,7 @@ class MaisakaReasoningEngine:
         enable_compaction: bool = True,
         consume_references: bool = True,
     ) -> None:
-        """生成滚动状态后提交裁切；压缩失败也丢弃本批旧原文，继续处理近期消息。"""
+        """生成滚动状态后提交裁切；压缩失败时优先保留原文延后重试，仅在超限且连续失败达上限时降级归档。"""
         original_history = list(self._runtime._chat_history)
         process_result = process_chat_history_after_cycle(
             self._runtime._chat_history,
@@ -1340,7 +1411,7 @@ class MaisakaReasoningEngine:
                     max_summary_chars=global_config.chat.context_compaction_summary_max_chars,
                 )
             except Exception:
-                logger.exception(f"{self._runtime.log_prefix} 上下文压缩失败，将直接裁切本批旧原文，不再重试本批内容")
+                logger.exception(f"{self._runtime.log_prefix} 上下文压缩请求异常")
             finally:
                 cycle_detail.time_records["context_compaction"] = time.time() - summary_started_at
             # /clear 或其他异步操作可能在模型请求期间改变历史，禁止用旧快照覆盖新状态。
@@ -1351,6 +1422,7 @@ class MaisakaReasoningEngine:
                 logger.info(f"{self._runtime.log_prefix} 压缩期间上下文已改变，取消提交旧快照")
                 return
             if summary is not None:
+                self._compaction_failure_count = 0
                 final_history = [summary, *[
                     message for message in final_history if not isinstance(message, ContextSummaryMessage)
                 ]]
@@ -1359,7 +1431,36 @@ class MaisakaReasoningEngine:
                     f"压缩={trimmed_chat_count} 保留原文={process_result.remaining_context_count} "
                     f"摘要字符={len(summary.content)}"
                 )
-            # 失败时直接提交已规划的裁切，保留上一份有效摘要；清除快照后不再尝试同一批旧原文。
+            else:
+                self._compaction_failure_count += 1
+                total_context_count = trimmed_chat_count + process_result.remaining_context_count
+                overload_limit = self._runtime._max_context_size * 2
+                if (
+                    self._compaction_failure_count < MAX_COMPACTION_FAILURES_BEFORE_FALLBACK
+                    or total_context_count <= overload_limit
+                ):
+                    self._runtime._chat_history = list(process_result.untrimmed_history or original_history)
+                    logger.warning(
+                        f"{self._runtime.log_prefix} 上下文压缩失败 "
+                        f"(连续失败={self._compaction_failure_count}/{MAX_COMPACTION_FAILURES_BEFORE_FALLBACK}, "
+                        f"当前上下文={total_context_count}/{overload_limit})，"
+                        f"保留本批 {trimmed_chat_count} 条原文到下一轮重试，不直接裁切丢弃"
+                    )
+                    return
+                self._compaction_failure_count = 0
+                fallback_summary = build_deterministic_fallback_summary(
+                    process_result.removed_messages,
+                    previous_summary=previous_summary,
+                    max_summary_chars=global_config.chat.context_compaction_summary_max_chars,
+                )
+                final_history = [fallback_summary, *[
+                    message for message in final_history if not isinstance(message, ContextSummaryMessage)
+                ]]
+                logger.warning(
+                    f"{self._runtime.log_prefix} 上下文压缩连续失败达 {MAX_COMPACTION_FAILURES_BEFORE_FALLBACK} 次 "
+                    f"且上下文超限 ({total_context_count} > {overload_limit})，"
+                    f"已启用本地确定性降级摘要归档 {trimmed_chat_count} 条原文 (摘要字符={len(fallback_summary.content)})"
+                )
 
         self._runtime._chat_history = final_history
         if process_result.removed_messages:
@@ -2174,6 +2275,12 @@ class MaisakaReasoningEngine:
                 logger.warning(f"{self._runtime.log_prefix} 回复工具未生成可见消息，将继续下一轮循环")
 
             if result.success and result.stop_after_execution:
+                should_stop_after_execution = True
+            if (
+                result.success
+                and invocation.tool_name in {"reply", "send_emoji"}
+                and not bool(getattr(self._runtime, "_has_pending_messages", lambda: False)())
+            ):
                 should_stop_after_execution = True
 
             if bool(result.metadata.get("pause_execution", False)):

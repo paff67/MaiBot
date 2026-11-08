@@ -213,6 +213,60 @@ def _build_compaction_request(
     return request
 
 
+def _is_gateway_error_placeholder(text: str | None) -> bool:
+    """判断文本是否为上游网关在截断或空回复时注入的错误提示占位。"""
+    normalized = str(text or "").strip()
+    return (
+        normalized.startswith("[网关提示]")
+        or "此提示由网关生成，不是模型回答" in normalized
+        or normalized.startswith("[Gateway notice]")
+        or "This gateway-generated notice is not a model answer" in normalized
+    )
+
+
+def build_deterministic_fallback_summary(
+    removed_messages: Sequence[LLMContextMessage],
+    *,
+    previous_summary: ContextSummaryMessage | None,
+    max_summary_chars: int,
+) -> ContextSummaryMessage:
+    """当上游模型连续多次摘要失败且上下文超过阈值时，生成本地确定性降级摘要以避免消息静默丢失。"""
+    if not removed_messages:
+        raise ValueError("没有可归档的历史内容")
+
+    lines: List[str] = []
+    for message in removed_messages:
+        if isinstance(message, SessionBackedMessage):
+            user_info = message.original_message.message_info.user_info
+            speaker = (user_info.user_cardname or user_info.user_nickname or user_info.user_id or "未知用户").strip()
+            text = (message.processed_plain_text or "").strip().replace("\n", " ")
+            if text:
+                if len(text) > 160:
+                    text = text[:157] + "..."
+                lines.append(f"- [{message.timestamp.strftime('%H:%M:%S')}] {speaker}: {text}")
+        else:
+            raw = message_text_for_compaction(message).strip()
+            if raw:
+                if len(raw) > 160:
+                    raw = raw[:157] + "..."
+                lines.append(f"- {raw}")
+
+    header = "进展与结论:\n- [本地确定性归档] 以下为模型摘要连续失败期间自动归档的历史对话要点："
+    body = "\n".join(lines) if lines else "- （无可提取文本消息）"
+    combined_sections: List[str] = []
+    if previous_summary is not None and previous_summary.content.strip():
+        combined_sections.append(previous_summary.content.strip())
+    combined_sections.append(f"{header}\n{body}")
+    rendered = "\n\n".join(combined_sections)
+    if len(rendered) > max_summary_chars:
+        keep_tail = max(200, max_summary_chars - len(header) - 32)
+        tail_body = body[-keep_tail:]
+        if "\n" in tail_body:
+            tail_body = tail_body[tail_body.find("\n") + 1 :]
+        rendered = f"{header}\n{tail_body}"[:max_summary_chars]
+    return ContextSummaryMessage(content=rendered, timestamp=removed_messages[-1].timestamp)
+
+
 async def build_context_summary(
     removed_messages: Sequence[LLMContextMessage],
     *,
@@ -229,22 +283,38 @@ async def build_context_summary(
         previous_summary=previous_summary, recent_messages=recent_messages,
         max_summary_chars=max_summary_chars, source_context=source_context,
     )
-    if isinstance(request, ACPPlannerSnapshot):
-        result = await generate_planner_response(
-            request.config, session_id, request.context_items, [], history_item_ids=request.history_item_ids,
-        )
-    else:
-        client = LLMServiceClient(task_name="planner", request_type="maisaka.context_compaction", session_id=session_id)
-        result = await client.generate_response_from_snapshot(request)
-    try:
-        await asyncio.to_thread(
-            save_compaction_prompt_preview, request.context_items, result=result, session_id=session_id,
-        )
-    except Exception:
-        logger.exception("上下文压缩请求记录保存失败")
-    if result.tool_calls or result.native_tool_calls:
-        raise ValueError("压缩响应包含被禁止的工具调用，拒绝提交摘要")
-    rendered = ConversationState.model_validate_json(result.response).render()
+    last_error: Exception | None = None
+    for attempt in range(2):
+        if isinstance(request, ACPPlannerSnapshot):
+            result = await generate_planner_response(
+                request.config, session_id, request.context_items, [], history_item_ids=request.history_item_ids,
+            )
+        else:
+            client = LLMServiceClient(task_name="planner", request_type="maisaka.context_compaction", session_id=session_id)
+            result = await client.generate_response_from_snapshot(request)
+        try:
+            await asyncio.to_thread(
+                save_compaction_prompt_preview, request.context_items, result=result, session_id=session_id,
+            )
+        except Exception:
+            logger.exception("上下文压缩请求记录保存失败")
+        if result.tool_calls or result.native_tool_calls:
+            raise ValueError("压缩响应包含被禁止的工具调用，拒绝提交摘要")
+        if _is_gateway_error_placeholder(result.response):
+            last_error = RuntimeError("上游网关返回截断提示文本，拒绝作为子代理有效输出")
+            if attempt == 0:
+                logger.warning(f"上下文压缩检测到上游网关截断提示文本，正在重试一次 (session={session_id})")
+                continue
+            raise last_error
+        try:
+            rendered = ConversationState.model_validate_json(result.response).render()
+            break
+        except Exception as exc:
+            last_error = exc
+            if attempt == 0:
+                logger.warning(f"上下文压缩响应 JSON 校验失败，正在重试一次 (session={session_id}): {exc}")
+                continue
+            raise
     if not rendered or len(rendered) > max_summary_chars:
         raise ValueError(f"状态摘要为空或超过字符预算: {len(rendered)}/{max_summary_chars}")
     logger.info(

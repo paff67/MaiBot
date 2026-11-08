@@ -1,0 +1,15 @@
+[Unit]
+Description=Resolve committed WeChat media messages into verified private assets
+After=maibot-message-ingest.service
+Wants=maibot-message-ingest.service
+
+[Service]
+WorkingDirectory=/opt/maibot-brain
+EnvironmentFile=/etc/maibot-media.env
+ExecStart=/usr/bin/python3 -m src.companion_vault.message_media_worker
+Restart=on-failure
+RestartSec=10
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

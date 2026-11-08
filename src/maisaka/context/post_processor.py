@@ -1,6 +1,6 @@
 """Maisaka 历史消息轮次结束后处理。"""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
 from .compaction import ContextSummaryMessage
@@ -26,6 +26,7 @@ class HistoryPostProcessResult:
     removed_count: int
     changed_count: int
     remaining_context_count: int
+    untrimmed_history: list[LLMContextMessage] = field(default_factory=list)
 
 
 def process_chat_history_after_cycle(
@@ -49,6 +50,7 @@ def process_chat_history_after_cycle(
         pending_call_ids=pending_call_ids,
     )
     remaining_context_count = sum(1 for message in processed_history if message.count_in_context)
+    untrimmed_history = list(processed_history)
 
     compact_removed_count = 0
     removed_messages: list[LLMContextMessage] = []
@@ -75,6 +77,7 @@ def process_chat_history_after_cycle(
         removed_count=removed_count,
         changed_count=changed_count,
         remaining_context_count=remaining_context_count,
+        untrimmed_history=untrimmed_history,
     )
 
 

@@ -669,6 +669,27 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
     def _uses_retro_prompt(self) -> bool:
         return global_config.debug.replyer_retro_prompt
 
+    @staticmethod
+    def _build_recalled_messages(reply_tool_args: Optional[Dict[str, Any]]) -> List[ContextItem]:
+        """装载层产物按原生文件句柄传入，不转换为文字描述。"""
+        if reply_tool_args is None:
+            return []
+        items: List[ContextItem] = []
+        memory_block = reply_tool_args.get("_recalled_memory_block", "")
+        if memory_block:
+            items.append(ContextItemBuilder().set_role(RoleType.User).add_text_part(memory_block).build())
+        file_parts = reply_tool_args.get("_recalled_file_parts", [])
+        if file_parts:
+            builder = ContextItemBuilder().set_role(RoleType.User)
+            builder.add_text_part("【系统已为你挂载点亮的历史原文件，请直接查看原文件画面/音频/文档作答】")
+            for part in file_parts:
+                if 'text' in part:
+                    builder.add_text_part(part['text'])
+                else:
+                    builder.add_file_uri_part(part["file_uri"], part["mime_type"], part["file_code"])
+            items.append(builder.build())
+        return items
+
     @defer_context_image_encoding(lambda items: items)
     def _build_request_messages(
         self,
@@ -735,6 +756,7 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
             )
         if reply_reference_message:
             items.append(ContextItemBuilder().set_role(RoleType.User).add_text_content(reply_reference_message).build())
+        items.extend(self._build_recalled_messages(reply_tool_args))
         items.append(ContextItemBuilder().set_role(RoleType.User).add_text_content(final_user_message).build())
         if requested_reply_style_message:
             items.append(

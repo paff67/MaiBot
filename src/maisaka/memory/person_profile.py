@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
+import json
+from pathlib import Path
+import sqlite3
 from typing import Sequence
 
 from src.chat.message_receive.message import SessionMessage
@@ -18,6 +22,7 @@ logger = get_logger("maisaka_person_profile_injector")
 
 PROFILE_QUERY_LIMIT = 4
 PROFILE_TEXT_MAX_CHARS = 900
+DEFAULT_TRUTH_DB_PATH = "data/companion_truth.db"
 
 
 @dataclass(frozen=True)
@@ -28,6 +33,7 @@ class PersonProfileCandidate:
     person_name: str = ""
     user_id: str = ""
     source: str = ""
+    platform: str = ""
 
 
 def _clean_text(value: object) -> str:
@@ -75,6 +81,10 @@ def _resolve_candidate(
         )
         return None
 
+    if not person_id and clean_person_name:
+        truth_hit = _query_companion_truth_profile(clean_platform, clean_user_id, clean_person_name)
+        if truth_hit is not None:
+            person_id = f"truth:{clean_person_name}"
     if not person_id:
         return None
     return PersonProfileCandidate(
@@ -82,6 +92,7 @@ def _resolve_candidate(
         person_name=clean_person_name,
         user_id=clean_user_id,
         source=source,
+        platform=clean_platform,
     )
 
 
@@ -219,10 +230,98 @@ def _format_profile_person_block(display_name: str, profile_text: str) -> str:
     return f"{display_name}：\n  {_truncate_profile_text(profile_text)}"
 
 
+def _query_companion_truth_profile(
+    platform: str,
+    user_id: str,
+    person_name: str,
+    db_path: str = DEFAULT_TRUTH_DB_PATH,
+) -> tuple[str, str] | None:
+    """从 companion_truth.db -> person_info 查询只读人物画像。"""
+
+    clean_platform = _clean_text(platform)
+    clean_user_id = _clean_text(user_id)
+    clean_person_name = _clean_text(person_name)
+    path = Path(db_path)
+    if not path.is_file():
+        return None
+
+    try:
+        conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+    except Exception:
+        try:
+            conn = sqlite3.connect(str(path))
+        except Exception:
+            return None
+
+    try:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT * FROM person_info").fetchall()
+    except Exception as exc:
+        logger.debug(f"读取 companion_truth.db 人物画像失败: err={exc}")
+        return None
+    finally:
+        conn.close()
+
+    matched_row: sqlite3.Row | None = None
+    for row in rows:
+        row_keys = set(row.keys())
+        row_person_id = _clean_text(row["person_id"]) if "person_id" in row_keys else ""
+        try:
+            pids = json.loads(row["platform_ids"] or "{}") if "platform_ids" in row_keys else {}
+            if not isinstance(pids, dict):
+                pids = {}
+        except (ValueError, TypeError):
+            pids = {}
+        if clean_user_id and (
+            row_person_id == clean_user_id
+            or (clean_platform and _clean_text(pids.get(clean_platform)) == clean_user_id)
+            or (not clean_platform and clean_user_id in {_clean_text(v) for v in pids.values()})
+        ):
+            matched_row = row
+            break
+
+    if matched_row is None and clean_person_name:
+        for row in rows:
+            row_keys = set(row.keys())
+            row_name = _clean_text(row["person_name"]) if "person_name" in row_keys else ""
+            row_remark = _clean_text(row["wechat_remark"]) if "wechat_remark" in row_keys else ""
+            if clean_person_name in {row_name, row_remark}:
+                matched_row = row
+                break
+
+    if matched_row is None:
+        return None
+
+    row_keys = set(matched_row.keys())
+    row_person_id = _clean_text(matched_row["person_id"]) if "person_id" in row_keys else ""
+    row_person_name = _clean_text(matched_row["person_name"]) if "person_name" in row_keys else ""
+    wechat_remark = _clean_text(matched_row["wechat_remark"]) if "wechat_remark" in row_keys else ""
+    trust_role = _clean_text(matched_row["trust_role"]) if "trust_role" in row_keys else ""
+    impression = _clean_text(matched_row["impression"]) if "impression" in row_keys else ""
+    relationship_text = ""
+    if "relationship_text" in row_keys:
+        relationship_text = _clean_text(matched_row["relationship_text"])
+    if not relationship_text and "one_line_intro" in row_keys:
+        relationship_text = _clean_text(matched_row["one_line_intro"])
+
+    if not (impression or relationship_text or trust_role):
+        return None
+
+    display_name = _candidate_name(row_person_name, wechat_remark, clean_person_name, clean_user_id, row_person_id)
+    profile_text = (
+        f"身份角色：{trust_role}\n"
+        f"备注/称呼：{row_person_name or wechat_remark or display_name}\n"
+        f"印象：{impression}\n"
+        f"关系与相处准则：{relationship_text}"
+    )
+    return display_name, profile_text
+
+
 async def build_person_profile_injection_messages(
     *,
     anchor_message: SessionMessage,
     pending_messages: Sequence[SessionMessage] | None = None,
+    db_path: str = DEFAULT_TRUTH_DB_PATH,
 ) -> list[str]:
     """构造注入 planner 的一次性人物画像内部参考消息。"""
 
@@ -245,6 +344,23 @@ async def build_person_profile_injection_messages(
     )[:1000]
     blocks: list[str] = []
     for candidate in candidates:
+        try:
+            truth_profile = await asyncio.to_thread(
+                _query_companion_truth_profile,
+                candidate.platform or anchor_message.platform,
+                candidate.user_id or candidate.person_id,
+                candidate.person_name,
+                db_path,
+            )
+        except Exception as exc:
+            logger.debug(f"从 companion_truth.db 查询人物画像失败: person_id={candidate.person_id!r} err={exc}")
+            truth_profile = None
+
+        if truth_profile is not None:
+            display_name, profile_text = truth_profile
+            blocks.append(_format_profile_person_block(display_name, profile_text))
+            continue
+
         try:
             payload = await memory_service.profile_admin(
                 action="query",

@@ -3,6 +3,7 @@ from typing import TYPE_CHECKING, Any, Optional
 from rich.traceback import install
 
 import asyncio
+import os
 import sys
 import time
 
@@ -202,6 +203,19 @@ class MainSystem:
         logger.info(t("startup.chat_manager_initialized"))
         await memory_automation_service.start()
 
+        wechat_config = os.environ.get("MAIBOT_WECHAT_CONFIG", "")
+        if wechat_config:
+            from src.platform_io import get_platform_io_manager
+            from src.platform_io.wechat.driver import configured_wechat_drivers, register_wechat_driver
+
+            platform_io_manager = get_platform_io_manager()
+            if not platform_io_manager.has_inbound_dispatcher:
+                platform_io_manager.set_inbound_dispatcher(plugin_runtime_manager._dispatch_platform_inbound)
+            await platform_io_manager.ensure_send_pipeline_ready()
+            wechat_drivers = await asyncio.to_thread(configured_wechat_drivers, wechat_config)
+            for wechat_driver in wechat_drivers:
+                await register_wechat_driver(platform_io_manager, wechat_driver)
+
         from src.agent.service import agent_service
         from src.computer.service import computer_service
         from src.desktop_pet.service import desktop_pet_service
@@ -265,6 +279,11 @@ class MainSystem:
                 periodic_transfer_temp_cleanup(),
                 periodic_file_cleanup(),
             ]
+            memory_config = os.environ.get('MAIBOT_MEMORY_CONFIG', '')
+            if memory_config:
+                from src.companion_vault.consolidator import configured_consolidation_tasks, run_consolidation_service
+                configurations = await asyncio.to_thread(configured_consolidation_tasks, memory_config)
+                tasks.extend(run_consolidation_service(**configuration) for configuration in configurations)
             # 插件式适配器通过 SDK 通信，不依赖 maim_message 的网络监听服务。
             if global_config.maim_message.enabled:
                 self._register_message_handlers()
@@ -334,6 +353,10 @@ async def main() -> None:
         await a_memorix_host_service.stop()
         await get_plugin_runtime_manager().bridge_event("on_stop")
         await get_plugin_runtime_manager().stop()
+        from src.platform_io import get_platform_io_manager
+
+        if get_platform_io_manager().is_started:
+            await get_platform_io_manager().stop()
         await async_task_manager.stop_and_wait_all_tasks()
         await get_mcp_service().close()
         await config_manager.stop_file_watcher()

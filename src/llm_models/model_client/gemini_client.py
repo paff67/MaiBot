@@ -53,6 +53,7 @@ from src.llm_models.exceptions import (
 )
 from src.llm_models.payload_content.context_item import (
     AssistantMessageItem,
+    ContextFileUriPart,
     ContextImagePart,
     ContextItem,
     ContextRefusalPart,
@@ -167,7 +168,7 @@ def _normalize_image_mime_type(image_format: str) -> str:
 
 
 def _build_non_tool_parts(item: UserMessageItem | AssistantMessageItem) -> List[Part]:
-    """将消息中的文本与图片片段转换为 Gemini `Part` 列表。
+    """将消息中的文本、图片与文件句柄转换为 Gemini `Part` 列表。
 
     Args:
         item: 内部消息 Item。
@@ -177,6 +178,9 @@ def _build_non_tool_parts(item: UserMessageItem | AssistantMessageItem) -> List[
     """
     converted_parts: List[Part] = []
     for message_part in item.parts:
+        if isinstance(message_part, ContextFileUriPart):
+            converted_parts.append(Part.from_uri(file_uri=message_part.file_uri, mime_type=message_part.mime_type))
+            continue
         if isinstance(message_part, ContextTextPart):
             converted_parts.append(Part.from_text(text=message_part.text))
             continue

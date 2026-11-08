@@ -1,6 +1,7 @@
 from .context_item import (
     AssistantMessageItem,
     ContextContentPart,
+    ContextFileUriPart,
     ContextImagePart,
     ContextItem,
     ContextItemBuilder,
@@ -27,6 +28,7 @@ from .tool_option import ToolCall
 __all__ = [
     "AssistantMessageItem",
     "ContextContentPart",
+    "ContextFileUriPart",
     "ContextImagePart",
     "ContextItem",
     "ContextItemBuilder",

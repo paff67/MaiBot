@@ -1,0 +1,15 @@
+[Unit]
+Description=MaiBot private plaintext Google Drive vault
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=/usr/bin/mkdir -p /mnt/gdrive/companion_vault /var/cache/maibot-rclone
+ExecStart=/usr/bin/rclone mount maibot_gdrive:maibot-companion-vault-v1 /mnt/gdrive/companion_vault --config=/root/.config/rclone/rclone.conf --vfs-cache-mode=full --cache-dir=/var/cache/maibot-rclone --vfs-cache-max-size=2G --vfs-cache-max-age=24h --dir-cache-time=1m --poll-interval=30s
+ExecStop=/bin/fusermount3 -uz /mnt/gdrive/companion_vault
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

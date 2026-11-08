@@ -165,6 +165,12 @@ class RetroReplyPromptMixin:
             expression_habits=expression_habits,
             reply_requirements=reply_requirements,
         )
+        # 有召回时把引用单独放在记忆之前，最终回复模板仍保持在最后。
+        recalled_messages = self._build_recalled_messages(reply_tool_args)
+        reply_reference_message = ""
+        if recalled_messages:
+            reply_reference_message = template_context["planner_reasoning"]
+            template_context["planner_reasoning"] = ""
         user_builder = ContextItemBuilder().set_role(RoleType.User)
         if enable_visual_message:
             dialogue_marker = uuid4().hex
@@ -197,8 +203,11 @@ class RetroReplyPromptMixin:
             user_builder.add_text_content(self._load_prompt(prompt_name, **template_context))
         items = [
             ContextItemBuilder().set_role(RoleType.System).add_text_content(system_prompt).build(),
-            user_builder.build(),
         ]
+        if reply_reference_message:
+            items.append(ContextItemBuilder().set_role(RoleType.User).add_text_part(reply_reference_message).build())
+        items.extend(recalled_messages)
+        items.append(user_builder.build())
         return items
 
     @staticmethod

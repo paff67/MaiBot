@@ -106,6 +106,19 @@ class ContextImagePart:
 
 
 @dataclass(frozen=True, slots=True)
+class ContextFileUriPart:
+    """不可变原生多模态文件句柄。"""
+
+    file_uri: str
+    mime_type: str
+    file_code: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.file_uri.strip() or not self.mime_type.strip():
+            raise ValueError("文件 URI 和 MIME 类型不能为空")
+
+
+@dataclass(frozen=True, slots=True)
 class ContextRefusalPart:
     """模型拒答内容片段。"""
 
@@ -116,7 +129,7 @@ class ContextRefusalPart:
             raise ValueError("拒答内容不能为空")
 
 
-ContextContentPart: TypeAlias = ContextTextPart | ContextImagePart | ContextRefusalPart
+ContextContentPart: TypeAlias = ContextTextPart | ContextImagePart | ContextFileUriPart | ContextRefusalPart
 
 
 @dataclass(frozen=True, slots=True)
@@ -436,6 +449,12 @@ class ContextItemBuilder:
     def add_text_content(self, text: str) -> "ContextItemBuilder":
         return self.add_text_part(text)
 
+    def add_file_uri_part(
+        self, file_uri: str, mime_type: str, file_code: str = ""
+    ) -> "ContextItemBuilder":
+        self.__parts.append(ContextFileUriPart(file_uri, mime_type, file_code))
+        return self
+
     def add_image_base64_part(
         self,
         image_format: str,
@@ -667,6 +686,7 @@ __all__ = [
     "AssistantMessageItem",
     "CONTEXT_ITEM_SCHEMA_VERSION",
     "ContextContentPart",
+    "ContextFileUriPart",
     "ContextImagePart",
     "ContextItem",
     "ContextItemBuilder",

@@ -10,10 +10,12 @@ from src.core.tooling import ToolAvailabilityContext, ToolExecutionContext, Tool
 from src.llm_models.payload_content.tool_option import ToolDefinitionInput
 
 from .context import BuiltinToolRuntimeContext
-from .query_memory import get_tool_spec as get_query_memory_tool_spec
-from .query_memory import handle_tool as handle_query_memory_tool
-from .query_image_memory import get_tool_spec as get_query_image_memory_tool_spec
-from .query_image_memory import handle_tool as handle_query_image_memory_tool
+from .device_sandbox_tools import (
+    get_phone_action_tool_spec,
+    get_sandbox_task_tool_spec,
+    handle_phone_action_tool,
+    handle_sandbox_task_tool,
+)
 from .query_person_profile import get_tool_spec as get_query_person_profile_tool_spec
 from .query_person_profile import handle_tool as handle_query_person_profile_tool
 from .read_tool_result import get_tool_spec as get_read_tool_result_tool_spec
@@ -69,12 +71,6 @@ class BuiltinToolEntry:
         return tool_spec
 
 
-def _get_query_memory_tool_spec() -> ToolSpec:
-    """根据配置生成 query_memory 工具声明。"""
-
-    return get_query_memory_tool_spec(enabled=bool(global_config.a_memorix.integration.enable_memory_query_tool))
-
-
 def _get_query_person_profile_tool_spec() -> ToolSpec:
     """根据配置生成 query_person_profile 工具声明。"""
 
@@ -83,11 +79,9 @@ def _get_query_person_profile_tool_spec() -> ToolSpec:
     )
 
 
-def _get_query_image_memory_tool_spec() -> ToolSpec:
-    return get_query_image_memory_tool_spec(enabled=bool(global_config.a_memorix.image_memory.enabled))
-
-
 BUILTIN_TOOL_ENTRIES: List[BuiltinToolEntry] = [
+    BuiltinToolEntry("phone_action", get_phone_action_tool_spec, handle_phone_action_tool, stage="action", chat_scope="private"),
+    BuiltinToolEntry("sandbox_task", get_sandbox_task_tool_spec, handle_sandbox_task_tool, stage="action", chat_scope="private"),
     BuiltinToolEntry("wait", get_wait_tool_spec, handle_wait_tool, stage="both"),
     BuiltinToolEntry("stop", get_stop_tool_spec, handle_stop_tool, stage="action"),
     BuiltinToolEntry("reply", get_reply_tool_spec, handle_reply_tool, stage="action"),
@@ -98,18 +92,12 @@ BUILTIN_TOOL_ENTRIES: List[BuiltinToolEntry] = [
         stage="action",
         visibility="deferred",
     ),
-    BuiltinToolEntry("query_memory", _get_query_memory_tool_spec, handle_query_memory_tool, stage="action"),
-    BuiltinToolEntry(
-        "query_image_memory",
-        _get_query_image_memory_tool_spec,
-        handle_query_image_memory_tool,
-        stage="action",
-    ),
     BuiltinToolEntry(
         "query_person_profile",
         _get_query_person_profile_tool_spec,
         handle_query_person_profile_tool,
         stage="action",
+        visibility="deferred",
     ),
     BuiltinToolEntry("send_emoji", get_send_emoji_tool_spec, handle_send_emoji_tool, stage="action"),
     BuiltinToolEntry("show_emoji_list", get_show_emoji_list_tool_spec, handle_show_emoji_list_tool, stage="action"),
@@ -165,6 +153,11 @@ def _is_builtin_tool_enabled_by_config(entry: BuiltinToolEntry) -> bool:
 
 def _is_builtin_tool_available(entry: BuiltinToolEntry, context: ToolAvailabilityContext) -> bool:
     """判断内置工具是否适用于当前聊天。"""
+
+    if entry.name in {"send_emoji", "show_emoji_list"}:
+        platform = str(getattr(context, "platform", "") or "").lower()
+        if platform == "wechat":
+            return False
 
     if entry.chat_scope == "all":
         return True

@@ -1,0 +1,15 @@
+[Unit]
+Description=Archive WeChat message ledger by verified account and conversation
+After=maibot-message-ingest.service
+Requires=maibot-message-ingest.service
+
+[Service]
+WorkingDirectory=/opt/maibot-brain
+EnvironmentFile=/etc/maibot-media.env
+ExecStart=/usr/bin/python3 -m src.companion_vault.message_archive
+Restart=on-failure
+RestartSec=5
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

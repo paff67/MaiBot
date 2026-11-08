@@ -70,6 +70,8 @@ async def refresh_chat_history_visual_placeholders(
             continue
         if isinstance(rebuilt_history_message, SessionBackedMessage):
             rebuilt_history_message.context_item_id = history_message.context_item_id
+            rebuilt_history_message.vault_evidence_block = history_message.vault_evidence_block
+            rebuilt_history_message.vault_descriptors = history_message.vault_descriptors
 
         chat_history[index] = rebuilt_history_message
         refreshed_count += 1

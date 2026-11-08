@@ -90,6 +90,10 @@ class MessageDeduplicator:
         heapq.heappush(self._expire_heap, (expires_at, dedupe_key))
         return True
 
+    def unmark_seen(self, dedupe_key: str) -> None:
+        """移除指定去重键的已见标记（用于下游分发失败时回滚去重状态以允许重试）。"""
+        self._seen.pop(dedupe_key, None)
+
     def clear(self) -> None:
         """清空全部去重缓存。"""
         self._expire_heap.clear()

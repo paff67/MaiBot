@@ -492,7 +492,17 @@ class PlatformIOManager:
                 logger.info(f"忽略重复入站消息: dedupe_key={dedupe_key}")
                 return False
 
-        self._schedule_inbound_dispatch(envelope)
+        try:
+            await self._inbound_dispatcher(envelope)
+        except asyncio.CancelledError:
+            if dedupe_key is not None:
+                self._deduplicator.unmark_seen(dedupe_key)
+            raise
+        except Exception:
+            if dedupe_key is not None:
+                self._deduplicator.unmark_seen(dedupe_key)
+            logger.exception("Platform IO 入站消息分发失败")
+            return False
         return True
 
     def _schedule_inbound_dispatch(self, envelope: InboundMessageEnvelope) -> None:

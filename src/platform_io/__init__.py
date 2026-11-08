@@ -1,39 +1,32 @@
-"""导出 Platform IO 层的公开入口。
+"""Platform IO public exports, loaded only when requested."""
 
-当前仍处于地基阶段，调用方应优先从这里导入共享类型和全局管理器，
-而不是直接依赖更底层的私有子模块。
-"""
+from importlib import import_module
 
-from .adapter_policy import AdapterIdentity, AdapterPolicyManager, AdapterPolicyResult, get_adapter_policy_manager
-from .manager import PlatformIOManager, get_platform_io_manager
-from .route_key_factory import RouteKeyFactory
-from .routing import RouteTable
-from .types import (
-    DeliveryBatch,
-    DeliveryReceipt,
-    DeliveryStatus,
-    DriverDescriptor,
-    DriverKind,
-    InboundMessageEnvelope,
-    RouteBinding,
-    RouteKey,
-)
+_EXPORTS = {
+    "AdapterIdentity": ("adapter_policy", "AdapterIdentity"),
+    "AdapterPolicyManager": ("adapter_policy", "AdapterPolicyManager"),
+    "AdapterPolicyResult": ("adapter_policy", "AdapterPolicyResult"),
+    "get_adapter_policy_manager": ("adapter_policy", "get_adapter_policy_manager"),
+    "PlatformIOManager": ("manager", "PlatformIOManager"),
+    "get_platform_io_manager": ("manager", "get_platform_io_manager"),
+    "RouteKeyFactory": ("route_key_factory", "RouteKeyFactory"),
+    "RouteTable": ("routing", "RouteTable"),
+    "DeliveryBatch": ("types", "DeliveryBatch"),
+    "DeliveryReceipt": ("types", "DeliveryReceipt"),
+    "DeliveryStatus": ("types", "DeliveryStatus"),
+    "DriverDescriptor": ("types", "DriverDescriptor"),
+    "DriverKind": ("types", "DriverKind"),
+    "InboundMessageEnvelope": ("types", "InboundMessageEnvelope"),
+    "RouteBinding": ("types", "RouteBinding"),
+    "RouteKey": ("types", "RouteKey"),
+}
+__all__ = list(_EXPORTS)
 
-__all__ = [
-    "DeliveryBatch",
-    "DeliveryReceipt",
-    "DeliveryStatus",
-    "DriverDescriptor",
-    "DriverKind",
-    "InboundMessageEnvelope",
-    "PlatformIOManager",
-    "AdapterIdentity",
-    "AdapterPolicyManager",
-    "AdapterPolicyResult",
-    "RouteKeyFactory",
-    "RouteBinding",
-    "RouteKey",
-    "RouteTable",
-    "get_adapter_policy_manager",
-    "get_platform_io_manager",
-]
+
+def __getattr__(name):
+    if name not in _EXPORTS:
+        raise AttributeError(name)
+    module, symbol = _EXPORTS[name]
+    value = getattr(import_module("." + module, __name__), symbol)
+    globals()[name] = value
+    return value

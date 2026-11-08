@@ -1,0 +1,14 @@
+[Unit]
+Description=Committed WeChat message journal to durable conversation ledger
+After=network-online.target tailscaled.service
+
+[Service]
+WorkingDirectory=/opt/maibot-brain
+EnvironmentFile=/etc/maibot-media.env
+ExecStart=/usr/bin/python3 -m src.platform_io.wechat.message_ingestor
+Restart=on-failure
+RestartSec=5
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

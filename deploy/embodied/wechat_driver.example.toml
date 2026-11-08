@@ -1,0 +1,18 @@
+version = 1
+truth_path = "data/companion_truth.db"
+ledger_path = "data/message_ledger.db"
+
+# Use allowed_chats = ["*"] to enable all contacts (wxid_*) and group chats (*@chatroom)
+# under the bound WeChat account while automatically filtering out system pseudo-accounts.
+[[drivers]]
+enabled = false
+source = "https://100.90.156.92:8443"
+account = "4d86ac1b06dd252fa3c7327eb5614865"
+allowed_chats = ["*"]
+send_enabled = false
+use_hook_send = true
+max_sends_per_minute = 6
+max_sends_per_chat_per_minute = 3
+rate_limit_wait_seconds = 65.0
+poll_interval = 1.0
+backfill = false

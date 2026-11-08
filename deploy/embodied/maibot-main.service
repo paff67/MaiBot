@@ -1,0 +1,21 @@
+[Unit]
+Description=MaiBot Main Runtime (Maisaka + Platform IO WeChatRootDriver + MemoryConsolidator)
+After=network-online.target tailscaled.service maibot-message-ingest.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/maibot-brain
+EnvironmentFile=/etc/maibot-media.env
+Environment=PYTHONUNBUFFERED=1
+Environment=MAIBOT_WECHAT_CONFIG=/opt/maibot-brain/config/wechat_driver.toml
+Environment=MAIBOT_MEMORY_CONFIG=/opt/maibot-brain/config/memory.toml
+Environment=MAIBOT_ASSET_SPOOL=/opt/maibot-brain/data/companion_assets
+Environment=MAIBOT_FILES_BASE_URL=https://api.0-0.pro
+ExecStart=/usr/bin/python3 -m src.main
+Restart=on-failure
+RestartSec=5
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

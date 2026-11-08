@@ -1,0 +1,15 @@
+version = 1
+truth_path = "data/companion_truth.db"
+ledger_path = "data/message_ledger.db"
+
+# Use chat_id = "*" to dynamically discover and consolidate all active private and group
+# conversations in message_ledger.db for the bound WeChat account.
+[[scopes]]
+enabled = false
+source = "https://100.90.156.92:8443"
+account = "4d86ac1b06dd252fa3c7327eb5614865"
+chat_id = "*"
+model_task = "utils"
+batch_size = 20
+poll_interval = 15.0
+backfill = false

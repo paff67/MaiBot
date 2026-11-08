@@ -730,7 +730,11 @@ def build_session_info_message(
     """
     normalized_client_info = normalize_chat_client_info(client_info)
     # bot_qq 用于前端通过 WebUI 头像缓存接口加载机器人头像（qq_account == 0 表示未配置，不推送）。
-    bot_qq_account = int(global_config.bot.qq_account or 0)
+    raw_account = global_config.bot.qq_account
+    try:
+        bot_qq_account = int(raw_account) if str(raw_account).isdigit() else 0
+    except (ValueError, TypeError):
+        bot_qq_account = 0
     session_info_data: Dict[str, Any] = {
         "type": "session_info",
         "session_id": session_id,

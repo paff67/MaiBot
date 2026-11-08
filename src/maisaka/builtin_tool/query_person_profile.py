@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
+from pathlib import Path
+import sqlite3
 from typing import Any, Dict, Optional
 
 from src.core.tooling import ToolExecutionContext, ToolExecutionResult, ToolInvocation, ToolSpec
@@ -10,6 +14,7 @@ from src.services.memory_service import memory_service
 from .context import BuiltinToolRuntimeContext
 
 DEFAULT_PROFILE_LIMIT = 8
+DEFAULT_TRUTH_DB_PATH = "data/companion_truth.db"
 
 
 def get_tool_spec(*, enabled: bool = True) -> ToolSpec:
@@ -86,6 +91,109 @@ def _build_structured_content(
     }
 
 
+def _clean_text(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _query_companion_truth_person(
+    person_id: str,
+    person_name: str,
+    db_path: str = DEFAULT_TRUTH_DB_PATH,
+) -> Optional[Dict[str, str]]:
+    """从 companion_truth.db -> person_info 查询人物档案。"""
+
+    clean_id = _clean_text(person_id)
+    clean_name = _clean_text(person_name)
+    path = Path(db_path)
+    if not path.is_file():
+        return None
+
+    try:
+        conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+    except Exception:
+        try:
+            conn = sqlite3.connect(str(path))
+        except Exception:
+            return None
+
+    try:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT * FROM person_info").fetchall()
+    except Exception:
+        return None
+    finally:
+        conn.close()
+
+    matched_row: Optional[sqlite3.Row] = None
+    # 1. 精确匹配 person_id / platform_ids / person_name / wechat_remark
+    for row in rows:
+        row_keys = set(row.keys())
+        row_pid = _clean_text(row["person_id"]) if "person_id" in row_keys else ""
+        row_pname = _clean_text(row["person_name"]) if "person_name" in row_keys else ""
+        row_remark = _clean_text(row["wechat_remark"]) if "wechat_remark" in row_keys else ""
+        try:
+            pids = json.loads(row["platform_ids"] or "{}") if "platform_ids" in row_keys else {}
+            if not isinstance(pids, dict):
+                pids = {}
+        except (ValueError, TypeError):
+            pids = {}
+        pid_values = {_clean_text(v) for v in pids.values() if _clean_text(v)}
+        if clean_id and (clean_id == row_pid or clean_id in pid_values or clean_id in {row_pname, row_remark}):
+            matched_row = row
+            break
+        if clean_name and clean_name in {row_pname, row_remark, row_pid}:
+            matched_row = row
+            break
+
+    # 2. 模糊匹配 (LIKE / 子串)
+    if matched_row is None:
+        keyword = (clean_name or clean_id).lower()
+        if keyword:
+            for row in rows:
+                row_keys = set(row.keys())
+                fields = [
+                    _clean_text(row[col])
+                    for col in ("person_id", "person_name", "wechat_remark", "one_line_intro", "relationship_text", "impression")
+                    if col in row_keys and _clean_text(row[col])
+                ]
+                if any(keyword in field.lower() or field.lower() in keyword for field in fields):
+                    matched_row = row
+                    break
+
+    if matched_row is None:
+        return None
+
+    row_keys = set(matched_row.keys())
+    row_pid = _clean_text(matched_row["person_id"]) if "person_id" in row_keys else ""
+    row_pname = _clean_text(matched_row["person_name"]) if "person_name" in row_keys else ""
+    row_remark = _clean_text(matched_row["wechat_remark"]) if "wechat_remark" in row_keys else ""
+    trust_role = _clean_text(matched_row["trust_role"]) if "trust_role" in row_keys else ""
+    impression = _clean_text(matched_row["impression"]) if "impression" in row_keys else ""
+    relationship_text = ""
+    if "relationship_text" in row_keys:
+        relationship_text = _clean_text(matched_row["relationship_text"])
+    if not relationship_text and "one_line_intro" in row_keys:
+        relationship_text = _clean_text(matched_row["one_line_intro"])
+
+    profile_text = (
+        f"person_id: {row_pid}\n"
+        f"姓名/昵称: {row_pname}\n"
+        f"备注: {row_remark}\n"
+        f"身份角色: {trust_role}\n"
+        f"印象: {impression}\n"
+        f"关系与相处准则: {relationship_text}"
+    )
+    return {
+        "person_id": row_pid,
+        "person_name": row_pname or row_remark,
+        "wechat_remark": row_remark,
+        "trust_role": trust_role,
+        "impression": impression,
+        "relationship_text": relationship_text,
+        "profile_text": profile_text,
+    }
+
+
 async def handle_tool(
     tool_ctx: BuiltinToolRuntimeContext,
     invocation: ToolInvocation,
@@ -103,6 +211,34 @@ async def handle_tool(
         )
 
     limit = _normalize_limit(invocation.arguments.get("limit"))
+    db_path = str(invocation.arguments.get("db_path") or DEFAULT_TRUTH_DB_PATH).strip() or DEFAULT_TRUTH_DB_PATH
+    try:
+        truth_record = await asyncio.to_thread(_query_companion_truth_person, person_id, person_name, db_path)
+    except Exception:
+        truth_record = None
+
+    if truth_record is not None:
+        profile_text = truth_record["profile_text"]
+        structured_content = {
+            "success": True,
+            "summary": profile_text,
+            "traits": _extract_traits(profile_text),
+            "person_id": truth_record["person_id"],
+            "person_name": truth_record["person_name"],
+            "wechat_remark": truth_record["wechat_remark"],
+            "trust_role": truth_record["trust_role"],
+            "impression": truth_record["impression"],
+            "relationship_text": truth_record["relationship_text"],
+            "profile_source": "companion_truth",
+            "has_manual_override": False,
+            "from_cache": False,
+            "limit": limit,
+        }
+        return tool_ctx.build_success_result(
+            invocation.tool_name,
+            profile_text,
+            structured_content=structured_content,
+        )
     try:
         if person_id:
             payload = await memory_service.profile_admin(
