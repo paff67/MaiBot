@@ -7,7 +7,7 @@ import re
 import shutil
 import signal
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from src.companion_vault.access_policy import authorized_file_rows
@@ -21,6 +21,8 @@ class WorkspaceJobRequest:
     job_id: str
     stream_id: str
     chat_id: str
+    creator_wxid: str
+    access_policy: str        # "creator_only" | "member_collect"
     project_slug: str
     action: str               # "create" | "update"
     task_prompt: str
@@ -35,19 +37,13 @@ class WorkspaceJobResult:
     summary_for_replyer: str = ""
     mode: str = "static"      # "static" | "backend"
     start_cmd: list[str] | None = None
+    archive_files: list[str] = field(default_factory=list)
     dist_dir: Path | None = None
     project_dir: Path | None = None
     error_message: str = ""
 
 
 def build_bwrap_prefix(chat_ws_dir: Path, workdir: str = SANDBOX_WORKSPACE_PATH) -> list[str]:
-    """
-    构造纯命名空间自闭环的 bwrap 隔离前缀（解决只读 / 无法创建挂载点与 $HOME 只读崩溃）：
-    1. 先只读挂载 /，并将 /tmp 挂载为可写 tmpfs；
-    2. 在可写的 /tmp 下通过 --dir 创建 /tmp/workspace 并绑定当前会话工作区；
-    3. 分配独立的 --tmpfs /tmp/home 并注入 HOME、XDG_* 环境变量供 CLI 写入缓存与会话状态；
-    4. 对实际存在的敏感目录与文件（/opt/maibot-brain, /etc/maibot-mtls, /etc/maibot-media.env）执行 tmpfs 遮蔽。
-    """
     cmd = [
         "bwrap",
         "--ro-bind", "/", "/",
@@ -61,11 +57,12 @@ def build_bwrap_prefix(chat_ws_dir: Path, workdir: str = SANDBOX_WORKSPACE_PATH)
         "--setenv", "XDG_CACHE_HOME", f"{SANDBOX_HOME_PATH}/.cache",
         "--setenv", "XDG_CONFIG_HOME", f"{SANDBOX_HOME_PATH}/.config",
     ]
-    for p in ("/opt/maibot-brain", "/etc/maibot-mtls"):
-        if Path(p).exists():
-            cmd.extend(["--tmpfs", p])
-    if Path("/etc/maibot-media.env").exists():
-        cmd.extend(["--ro-bind", "/dev/null", "/etc/maibot-media.env"])
+    for masked in ("/opt/maibot-brain", "/etc/maibot-mtls", "/etc/maibot-media.env"):
+        p = Path(masked)
+        if p.is_dir():
+            cmd.extend(["--tmpfs", masked])
+        elif p.is_file():
+            cmd.extend(["--ro-bind", "/dev/null", masked])
 
     cmd.extend([
         "--share-net",
@@ -77,7 +74,6 @@ def build_bwrap_prefix(chat_ws_dir: Path, workdir: str = SANDBOX_WORKSPACE_PATH)
 
 
 def build_sandbox_env() -> dict[str, str]:
-    """构建传递给 bwrap 子进程的环境变量，显式保留模型 API Key 并重定向 HOME"""
     env = dict(os.environ)
     env["HOME"] = SANDBOX_HOME_PATH
     env["XDG_CACHE_HOME"] = f"{SANDBOX_HOME_PATH}/.cache"
@@ -93,7 +89,7 @@ class CLIBridge:
         ledger_db_path: Path,
         wechat_source: str,
         wechat_account: str,
-        cli_backend: str = "codex",
+        cli_backend: str = "agy",
         timeout_seconds: int = 180,
     ) -> None:
         self.workspaces_root = workspaces_root
@@ -104,6 +100,7 @@ class CLIBridge:
         self.cli_backend = cli_backend
         self.timeout_seconds = timeout_seconds
         self.workspaces_root.mkdir(parents=True, exist_ok=True)
+        self._project_locks: dict[tuple[str, str], asyncio.Lock] = {}
 
     @staticmethod
     def safe_id(raw: str) -> str:
@@ -116,6 +113,11 @@ class CLIBridge:
             (ws / sub).mkdir(parents=True, exist_ok=True)
         return ws
 
+    def is_project_locked(self, chat_id: str, project_slug: str) -> bool:
+        key = (self.safe_id(chat_id), self.safe_id(project_slug))
+        lock = self._project_locks.get(key)
+        return bool(lock and lock.locked())
+
     def stage_authorized_files(
         self,
         destination_chat_id: str,
@@ -123,10 +125,6 @@ class CLIBridge:
         source: str | None = None,
         account: str | None = None,
     ) -> list[Path]:
-        """
-        严格对齐 authorized_file_rows(db, ledger, *, source, account, destination_chat_id, codes) 签名，
-        并从 asset_sources 表查询真实 local_path。
-        """
         if not file_codes:
             return []
 
@@ -152,7 +150,7 @@ class CLIBridge:
                 row_dict = dict(r)
                 code = str(row_dict["file_code"]).upper()
                 source_row = conn_truth.execute(
-                    "SELECT local_path, sha256 FROM asset_sources WHERE file_code = ? ORDER BY rowid DESC LIMIT 1",
+                    "SELECT local_path, sha256 FROM asset_sources WHERE file_code = ? AND association = 'verified' ORDER BY rowid DESC LIMIT 1",
                     (code,),
                 ).fetchone()
                 if source_row:
@@ -186,125 +184,152 @@ class CLIBridge:
             staged.append(dest_path)
         return staged
 
-    def _write_agents_md(self, ws_dir: Path, slug: str) -> None:
+    def _write_agents_md(self, ws_dir: Path, slug: str, access_policy: str) -> None:
         ws_root = SANDBOX_WORKSPACE_PATH
-        content = f"""# MaiBot Session Workspace Agent Contract
+        content = f"""# MaiBot Session Workspace Agent Contract (Phase 2)
 
-你运行在当前微信会话的专属隔离工作区 `{ws_root}` 中。
+你运行在当前微信会话的专属隔离工作区 `{ws_root}` 中。当前页面权限策略为：`{access_policy}`。
 
-## 1. 目录约定
+## 1. 目录与 Google Drive 自动归档约定
 - `{ws_root}/inbox/`：当前会话已授权的微信附件原件（只读）。
-- `{ws_root}/projects/{slug}/`：源码、Python 数据处理脚本、SQLite 数据库与后端工程目录（持久化保留，支持多轮增量迭代）。
+- `{ws_root}/projects/{slug}/`：源码、Python 脚本、SQLite 数据库与后端工程目录（持久化保留，支持多轮增量迭代）。
 - `{ws_root}/dist/{slug}/`：静态网页构建产物输出目录。
+- `{ws_root}/dist/{slug}/files/`：**Google Drive 自动归档目录**。任何放入此目录的衍生文件（如生成的 Excel、PDF、高清图表 PNG），任务结束时会被宿主自动归档至 Google Drive 独立文件夹并在网页提供下载。
 
 ## 2. 动静双模交付契约（二选一）
 ### 模式 A：纯静态模式 (`"mode": "static"`，默认优先)
-适用于单人数据可视化报告、交互式图表(ECharts/Chart.js)、纯前端 Canvas 小游戏、文档整理。
-- 必须生成 `{ws_root}/dist/{slug}/index.html`（使用相对路径或公共 CDN）。
-- 衍生可供下载的文件放入 `{ws_root}/dist/{slug}/files/` 并在页面提供下载入口。
-
+- 必须生成 `{ws_root}/dist/{slug}/index.html`。
 ### 模式 B：受控临时后端模式 (`"mode": "backend"`)
-适用于群友多人实时互动（投票、排行榜、共享账单）、需在网页内上传文件调用服务端 Python 处理、或需避免 CORS 的实时 API 代理。
-- **严禁在本次 CLI 执行中用 `nohup` 或 `&` 自行后台常驻进程**（CLI 退出时沙盒会清理子进程）。
-- 请将后端代码（如 FastAPI `app.py` 或 Node `server.js`）写在 `{ws_root}/projects/{slug}/` 下，并在 `{ws_root}/dist/{slug}/result.json` 中声明 `start_cmd`（使用占位符 `{{PORT}}` 作为监听端口，运行工作目录固定为 `{ws_root}/projects/{slug}`）。
+- 适用于多人实时互动（投票、排行榜、信息收集表）、网页上传文件服务端处理或 WebSocket 应用。
+- **严禁自行用 `nohup` 或 `&` 后台启动服务**。请将后端写在 `{ws_root}/projects/{slug}/`，并在 `{ws_root}/dist/{slug}/result.json` 中声明 `start_cmd`（端口使用占位符 `{{PORT}}`）。
 
-## 3. 微信内置浏览器 (XWeb) 适配与反向唤醒接口
-- 所有前端页面必须遵循 Mobile-First（适配 375px~430px 宽度，无横向滚动条），包含 `<meta name="viewport" content="width=device-width, initial-scale=1.0">` 与 `<title>`。
-- 如需在用户完成网页端关键操作后通知微信里的许妍主动冒泡，前端或后端可发送同源请求：
-  `POST /_maibot/notify` JSON Body: `{{"event": "用户完成了XX操作", "detail": "具体数据摘要", "trigger_reply": true}}`
+## 3. 前端身份 SDK (`window.MaiBot`) 与实名真值库回调
+宿主网关会自动向所有 HTML 页面注入 `/_maibot/sdk.js`（无需你手写登录弹窗，未登录用户调用时 SDK 会自动弹出微信口令/PIN 登录框）：
+- 获取当前访问者身份：`const user = window.MaiBot.getState(); // {{ wxid, nickname, isCreator }}`
+- 触发微信回调并更新访问者本人名下的真值库记忆：
+  ```javascript
+  await window.MaiBot.notify({{
+    event: "提交了露营报名与忌口",
+    detail: "带天幕，不吃香菜",
+    trigger_reply: true,
+    memory_patch: {{
+      current_status: "准备周末露营",
+      preference_item: {{ "饮食忌口": "不吃香菜" }},
+      quest_title: "周末露营携带天幕"
+    }}
+  }});
+  ```
+
+- **微信防拦截规范**：严禁在 HTML 中使用 `<input type="password">`（如需输入码请用 `type="tel"` 或 `type="text"`），严禁出现“输入银行卡/身份证”等敏感字样。
 
 ## 4. 必须生成的回执文件 `{ws_root}/dist/{slug}/result.json`
-任务结束退出前，必须写入以下 JSON：
 ```json
 {{
   "title": "简短中文页面标题",
-  "summary_for_replyer": "两句话总结核心结论或已实现的功能（供许妍在微信回复用户时参考）",
+  "summary_for_replyer": "两句话总结核心结论或已实现的功能（供微信卡片摘要与许妍回复使用）",
   "mode": "static",
-  "start_cmd": []
+  "start_cmd": [],
+  "archive_files": []
 }}
 ```
-（若为后端模式，则设 `"mode": "backend"`，且 `"start_cmd": ["python3", "-m", "uvicorn", "app:app", "--host", "127.0.0.1", "--port", "{{PORT}}"]`）
 """
         (ws_dir / "AGENTS.md").write_text(content, encoding="utf-8")
 
     async def run_cli_job(self, req: WorkspaceJobRequest) -> WorkspaceJobResult:
         ws_dir = self.get_chat_workspace(req.chat_id)
         slug = self.safe_id(req.project_slug)
-        project_dir = ws_dir / "projects" / slug
-        dist_dir = ws_dir / "dist" / slug
-        project_dir.mkdir(parents=True, exist_ok=True)
-        dist_dir.mkdir(parents=True, exist_ok=True)
+        lock_key = (self.safe_id(req.chat_id), slug)
+        lock = self._project_locks.setdefault(lock_key, asyncio.Lock())
 
-        self._write_agents_md(ws_dir, slug)
+        async with lock:
+            project_dir = ws_dir / "projects" / slug
+            dist_dir = ws_dir / "dist" / slug
+            project_dir.mkdir(parents=True, exist_ok=True)
+            dist_dir.mkdir(parents=True, exist_ok=True)
+            (dist_dir / "files").mkdir(parents=True, exist_ok=True)
 
-        ws_root = SANDBOX_WORKSPACE_PATH
-        files_note = (
-            "可用微信附件：" + ", ".join(f"`{ws_root}/inbox/{p.name}`" for p in req.staged_files)
-            if req.staged_files else "无关联微信附件。"
-        )
-        full_prompt = (
-            f"操作类型: {req.action} | 目标项目目录: `{ws_root}/projects/{slug}` | 产物目录: `{ws_root}/dist/{slug}`\n"
-            f"{files_note}\n\n"
-            f"用户需求:\n{req.task_prompt}\n\n"
-            f"请严格遵守 `{ws_root}/AGENTS.md` 规范，完成后务必写入 `{ws_root}/dist/{slug}/result.json`。"
-        )
+            self._write_agents_md(ws_dir, slug, req.access_policy)
 
-        cmd = build_bwrap_prefix(ws_dir, workdir=ws_root)
-        if self.cli_backend == "codex":
-            cmd.extend([
-                "codex", "exec", "--full-auto",
-                "--sandbox", "workspace-write",
-                "-C", ws_root,
-                full_prompt,
-            ])
-        else:
-            cmd.extend([
-                "agy", "--headless",
-                "--workspace", ws_root,
-                "--prompt", full_prompt,
-            ])
+            ws_root = SANDBOX_WORKSPACE_PATH
+            files_note = (
+                "可用微信附件：" + ", ".join(f"`{ws_root}/inbox/{p.name}`" for p in req.staged_files)
+                if req.staged_files else "无关联微信附件。"
+            )
+            full_prompt = (
+                f"操作类型: {req.action} | 权限模式: {req.access_policy} | "
+                f"项目目录: `{ws_root}/projects/{slug}` | 产物目录: `{ws_root}/dist/{slug}`\n"
+                f"{files_note}\n\n"
+                f"用户需求:\n{req.task_prompt}\n\n"
+                f"请严格遵守 `{ws_root}/AGENTS.md` 规范，完成后务必写入 `{ws_root}/dist/{slug}/result.json`。"
+            )
 
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,
-            env=build_sandbox_env(),
-        )
-        try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=self.timeout_seconds)
-        except asyncio.TimeoutError:
+            cmd = build_bwrap_prefix(ws_dir, workdir=ws_root)
+            if self.cli_backend == "codex":
+                cmd.extend([
+                    "codex", "exec", "--full-auto",
+                    "--sandbox", "workspace-write",
+                    "-C", ws_root,
+                    full_prompt,
+                ])
+            else:
+                cmd.extend([
+                    "agy", "--headless",
+                    "--workspace", ws_root,
+                    "--prompt", full_prompt,
+                ])
+
             try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            return WorkspaceJobResult(ok=False, error_message=f"构建超时（超过 {self.timeout_seconds} 秒）")
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    start_new_session=True,
+                    env=build_sandbox_env(),
+                )
+            except FileNotFoundError:
+                return WorkspaceJobResult(
+                    ok=False,
+                    error_message=f"沙箱或构建工具未安装（无法找到执行文件: {cmd[0]} 或 {self.cli_backend}）",
+                )
+            except Exception as exc:
+                return WorkspaceJobResult(ok=False, error_message=f"启动沙箱执行失败: {exc}")
 
-        result_file = dist_dir / "result.json"
-        index_file = dist_dir / "index.html"
-
-        meta: dict = {}
-        if result_file.exists():
             try:
-                meta = json.loads(result_file.read_text(encoding="utf-8"))
-            except Exception:
-                meta = {}
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=self.timeout_seconds)
+            except asyncio.TimeoutError:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                return WorkspaceJobResult(ok=False, error_message=f"构建超时（超过 {self.timeout_seconds} 秒）")
 
-        mode = str(meta.get("mode") or "static").strip().lower()
-        start_cmd = meta.get("start_cmd") if isinstance(meta.get("start_cmd"), list) else []
+            result_file = dist_dir / "result.json"
+            index_file = dist_dir / "index.html"
 
-        if mode == "static" and not index_file.exists():
-            tail = stderr.decode("utf-8", errors="ignore")[-300:]
-            return WorkspaceJobResult(ok=False, error_message=f"静态模式未产出 index.html (code={proc.returncode}): {tail}")
-        if mode == "backend" and not start_cmd:
-            return WorkspaceJobResult(ok=False, error_message="后端模式未在 result.json 中声明有效的 start_cmd")
+            meta: dict = {}
+            if result_file.exists():
+                try:
+                    meta = json.loads(result_file.read_text(encoding="utf-8"))
+                except Exception:
+                    meta = {}
 
-        return WorkspaceJobResult(
-            ok=True,
-            title=str(meta.get("title") or req.project_slug),
-            summary_for_replyer=str(meta.get("summary_for_replyer") or "已完成应用构建并挂载上线。"),
-            mode=mode,
-            start_cmd=[str(x) for x in start_cmd],
-            dist_dir=dist_dir,
-            project_dir=project_dir,
-        )
+            mode = str(meta.get("mode") or "static").strip().lower()
+            start_cmd = meta.get("start_cmd") if isinstance(meta.get("start_cmd"), list) else []
+            archive_files = meta.get("archive_files") if isinstance(meta.get("archive_files"), list) else []
+
+            if mode == "static" and not index_file.exists():
+                tail = stderr.decode("utf-8", errors="ignore")[-300:]
+                return WorkspaceJobResult(ok=False, error_message=f"静态模式未产出 index.html (code={proc.returncode}): {tail}")
+            if mode == "backend" and not start_cmd:
+                return WorkspaceJobResult(ok=False, error_message="后端模式未在 result.json 中声明有效的 start_cmd")
+
+            return WorkspaceJobResult(
+                ok=True,
+                title=str(meta.get("title") or req.project_slug),
+                summary_for_replyer=str(meta.get("summary_for_replyer") or "已完成应用构建并挂载上线。"),
+                mode=mode,
+                start_cmd=[str(x) for x in start_cmd],
+                archive_files=[str(x) for x in archive_files],
+                dist_dir=dist_dir,
+                project_dir=project_dir,
+            )

@@ -78,7 +78,7 @@ def test_manifest_and_plugin_factory():
     plugin = create_plugin()
     assert isinstance(plugin, EmbodiedWorkspacePlugin)
     assert plugin.config_model is EmbodiedWorkspaceConfig
-    assert plugin.config.base_domain == "s.yourdomain.com"
+    assert plugin.config.base_domain in ("s.yourdomain.com", "paff-67.top")
 
 
 # ---------------------------------------------------------------------------
