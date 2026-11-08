@@ -74,15 +74,23 @@ flowchart LR
   4. **全表滚动巡检**：按游标每轮扫描 200 行历史消息，确保较早消息的修订最终一致。
 - **单写者原则**：`/data/user/0/com.tencent.mm/files/maibot_message_journal.db` 仅由微信进程内的 `message_capture.js` 写入（WAL 模式），`edge_server.py` 始终通过 `?mode=ro` 只读查询 `message_events`、`send_outbox` 与 `group_members_snapshot`，彻底杜绝多进程写锁冲突与 SELinux/UID 权限污染。
 
-### 2. 后台无 UI 文本发送与双层限流（`ISendMsgMgr` Hook + `SendLedger`）
-- **上层业务控制器调用**：
+### 2. 后台无 UI 文本与原生引用消息发送（`ISendMsgMgr` & `AppMsgLogic` Hook + `SendLedger`）
+- **常规文本发送（`ISendMsgMgr` Hook）**：
   `message_capture.js` 通过 `Java.cast(Java.use('no3.w1').a(), Java.use('rt5.i5')).Jj(chatId, content, msgType, 0)` 调用微信内部 `MicroMsg.SendMsgMgr`（实现 `ISendMsgMgr` 接口 `no3.c1`）。该入口不依赖前台 `ChattingUI`，支持手机息屏、处于桌面或停留在任意其他界面时向任意 `wxid_*` 或 `*@chatroom` 发送消息。
+- **原生引用回复（`AppMsgLogic:k0.I` + `nx0.r` AppMsg 57 消息卡片）**：
+  - **微信引用底层机制**：微信 Android 8.0.79 的引用回复并非纯文本拼接，而是标准的 AppMsg（库表 `type=822083633`，AppMsg 内部 `type=57`）。XML 内包含完整 `<refermsg>` 节点，涵盖被引用消息的全局唯一 `svrid`、来源会话 `fromusr`、原发送者 `chatusr`、原发送者昵称/备注 `displayname`、原消息摘要 `content` 与时间戳 `createtime`。
+  - **逆向反编译关键路径**：
+    - 数据模型反序列化：`Java.use('nx0.r').v(xml)` 解析 XML 并自动实例化 `com.tencent.mm.plugin.msgquote.model.MsgQuoteItem`（`na5.a`）至 AppMsg 的 `x2` 字段。
+    - 无 UI 发送分发：`Java.use('com.tencent.mm.pluginsdk.model.app.k0').I(appMsg, chatId, "", "", "", null)` 完成消息入库（`status=1`）、加入 NetScene 发送队列并返回 `Pair<Integer, Long>(0, localMsgId)`。
+  - **云端解析与端到端闭环（`driver.py` & `edge_client.py`）**：
+    - 当 Maisaka Planner 产出带 `ReplyComponent` 的回复时，`WeChatRootDriver._resolve_quote_target` 提取 `target_message_id`（如 `#wechat:scope:account:143229`），从 `message_ledger.db` 查询原始 `server_id`、`body`、`updated_at_ms`，并从 `companion_truth.db` 的 `person_info` 表匹配 `wechat_remark` 与 `person_name`。
+    - 组装标准 quote 元数据后通过 `POST /wechat/send_quote` 投递至手机端 `edge_server.py`，经原子 Spool 入队并由 Frida 脚本无 UI 调度 `k0.I` 原生出站，彻底解决微信端仅展示孤立纯文本气泡而丢失引用卡片的问题。
 - **原子 Spool 投递与崩溃恢复**：
-  1. `edge_server.py` 收到 `POST /wechat/send_text` 后，先在 `SendLedger`（`send_ledger.py`）校验 `request_id` 幂等性、目标会话合法性（支持 `MAIBOT_ALLOWED_SEND_CHATS="*"`）及滑动窗口限流；
+  1. `edge_server.py` 收到 `POST /wechat/send_text` 或 `POST /wechat/send_quote` 后，先在 `SendLedger`（`send_ledger.py`）校验 `request_id` 幂等性、目标会话合法性（支持 `MAIBOT_ALLOWED_SEND_CHATS="*"`）及滑动窗口限流；
   2. 执行拟人打字延迟 `compute_typing_delay_ms(text)`（按字数加随机抖动 `800ms ~ 10000ms`）；
-  3. 将指令写入 `/data/user/0/com.tencent.mm/files/maibot_send_spool/<request_id>.json`；
-  4. `message_capture.js` 先在 `send_outbox` 持久化 `status='queued'` 后再删除 Spool 文件（防止崩溃丢单），调用 `Jj()` 后置为 `status='sending'`，并在启动时自动执行 `recoverInterruptedSends()` 恢复未决任务；
-  5. `pollActiveSends()` 在 `EnMicroMsg.db` 中观测到 `isSend=1 AND talker=chatId AND msgId > maxMsgIdBefore AND status=2 AND msgSvrId > 0` 后，更新 `send_outbox.status='confirmed'` 并返回真实 `msg_id` 与 `msg_svr_id`。
+  3. 将指令写入 `/data/user/0/com.tencent.mm/files/maibot_send_spool/<request_id>.json`（包含 `msg_type: "quote"` 与完整 `quote` 节点）；
+  4. `message_capture.js` 先在 `send_outbox` 持久化 `status='queued'` 后再删除 Spool 文件（防止崩溃丢单），调用 `k0.I()` 或 `Jj()` 后置为 `status='sending'`，并在启动时自动执行 `recoverInterruptedSends()` 恢复未决任务；
+  5. `pollActiveSends()` 在 `EnMicroMsg.db` 中观测到 `isSend=1 AND talker=chatId AND msgId > maxMsgIdBefore AND status=2 AND msgSvrId > 0`（或匹配 `k0.I` 返回的 `localId`）后，更新 `send_outbox.status='confirmed'` 并返回真实 `msg_id` 与 `msg_svr_id`。
 - **双层滑动窗口防封限流**：
   - **单会话限流**：同一 `chat_id` 每分钟最多发送 `max_sends_per_chat_per_minute`（默认 3 条）；
   - **全局账号限流**：全账号每分钟最多发送 `max_sends_per_minute`（默认 6 条）；

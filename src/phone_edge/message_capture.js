@@ -103,6 +103,10 @@ function inspectChattingContext() {
  }catch(e){}
  return state;
 }
+function escapeXml(s){
+ if(!s)return '';
+ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&apos;');
+}
 function processSendSpool() {
  if(!queue || !source || !source.isOpen())return;
  const dir=JFile.$new(SPOOL_PATH);if(!dir.exists())return;
@@ -150,17 +154,52 @@ function processSendSpool() {
   try{if(mc.moveToFirst())maxMsgIdBefore=String(mc.getString(0)||'0');}finally{mc.close();}
   const chattingState=inspectChattingContext();
   try{
-   const msgType=Number(Java.use('l41.d2').C(chatId))||1;
-   const usePpc=Boolean(Java.use('f61.u1').a(chatId));
-   const rawMgr=Java.use('no3.w1').a();
-   const sendMgr=Java.cast(rawMgr,Java.use('rt5.i5'));
-   const layer='ISendMsgMgr:rt5.i5.Jj(via no3.w1.a,type='+msgType+',ppc='+usePpc+')';
-   putOutbox(Object.assign({},baseEntry,{status:'sending',send_layer:layer,chatting_context_talker:chattingState}));
-   sendWindowMs.push(now);
-   sendMgr.Jj.overload('java.lang.String','java.lang.String','int','int').call(sendMgr,chatId,content,msgType,0);
-   counters.sends++;
-   activeSends.set(reqId,Object.assign({},baseEntry,{maxMsgIdBefore:maxMsgIdBefore,startedAtMs:now,send_layer:layer,chatting_context_talker:chattingState,matchedMsgId:null}));
-   console.log(JSON.stringify({event:'send_invoked',request_id:reqId,chat_id:chatId,max_msg_id_before:maxMsgIdBefore,send_layer:layer,chatting_context_talker:chattingState}));
+   const isQuote=Boolean(req.msg_type==='quote' && req.quote && req.quote.server_id);
+   if(isQuote){
+    const q=req.quote;
+    const cSec=q.createtime?Number(q.createtime):Math.floor(now/1000);
+    const isChatRoom=chatId.endsWith('@chatroom');
+    const fromUsr=isChatRoom ? (q.talker||chatId) : (q.sender_id||chatId);
+    const chatUsr=isChatRoom ? (q.sender_id||'') : '';
+    const xml='<?xml version="1.0"?>\n<msg>\n\t<appmsg appid="" sdkver="0">\n\t\t<title>'
+      +escapeXml(content)+'</title>\n\t\t<action>view</action>\n\t\t<type>57</type>\n\t\t<refermsg>\n\t\t\t<type>1</type>\n\t\t\t<svrid>'
+      +escapeXml(String(q.server_id))+'</svrid>\n\t\t\t<fromusr>'
+      +escapeXml(String(fromUsr))+'</fromusr>\n\t\t\t<chatusr>'
+      +escapeXml(String(chatUsr))+'</chatusr>\n\t\t\t<displayname>'
+      +escapeXml(String(q.display_name||q.sender_id||''))+'</displayname>\n\t\t\t<content>'
+      +escapeXml(String(q.content||''))+'</content>\n\t\t\t<createtime>'
+      +cSec+'</createtime>\n\t\t</refermsg>\n\t\t<appattach />\n\t</appmsg>\n\t<fromusername>'
+      +escapeXml(account)+'</fromusername>\n\t<scene>0</scene>\n\t<appinfo><version>1</version><appname /></appinfo>\n\t<commenturl />\n</msg>';
+    const appMsg=Java.use('nx0.r').v(xml);
+    if(!appMsg)throw new Error('Failed to parse quote AppMsg XML');
+    const layer='AppMsgLogic:k0.I(type=57,svrid='+q.server_id+')';
+    putOutbox(Object.assign({},baseEntry,{status:'sending',send_layer:layer,chatting_context_talker:chattingState}));
+    sendWindowMs.push(now);
+    const pair=Java.use('com.tencent.mm.pluginsdk.model.app.k0').I(appMsg,chatId,"","","",null);
+    const localId=pair&&pair.second?String(pair.second.value):null;
+    counters.sends++;
+    activeSends.set(reqId,Object.assign({},baseEntry,{
+      maxMsgIdBefore:maxMsgIdBefore,
+      startedAtMs:now,
+      send_layer:layer,
+      chatting_context_talker:chattingState,
+      matchedMsgId:localId,
+      isQuote:true
+    }));
+    console.log(JSON.stringify({event:'send_quote_invoked',request_id:reqId,chat_id:chatId,max_msg_id_before:maxMsgIdBefore,local_id:localId,send_layer:layer,chatting_context_talker:chattingState}));
+   }else{
+    const msgType=Number(Java.use('l41.d2').C(chatId))||1;
+    const usePpc=Boolean(Java.use('f61.u1').a(chatId));
+    const rawMgr=Java.use('no3.w1').a();
+    const sendMgr=Java.cast(rawMgr,Java.use('rt5.i5'));
+    const layer='ISendMsgMgr:rt5.i5.Jj(via no3.w1.a,type='+msgType+',ppc='+usePpc+')';
+    putOutbox(Object.assign({},baseEntry,{status:'sending',send_layer:layer,chatting_context_talker:chattingState}));
+    sendWindowMs.push(now);
+    sendMgr.Jj.overload('java.lang.String','java.lang.String','int','int').call(sendMgr,chatId,content,msgType,0);
+    counters.sends++;
+    activeSends.set(reqId,Object.assign({},baseEntry,{maxMsgIdBefore:maxMsgIdBefore,startedAtMs:now,send_layer:layer,chatting_context_talker:chattingState,matchedMsgId:null,isQuote:false}));
+    console.log(JSON.stringify({event:'send_invoked',request_id:reqId,chat_id:chatId,max_msg_id_before:maxMsgIdBefore,send_layer:layer,chatting_context_talker:chattingState}));
+   }
   }catch(e){
    counters.send_errors++;
    putOutbox(Object.assign({},baseEntry,{status:'failed',chatting_context_talker:chattingState,error:String(e)}));
@@ -176,7 +215,7 @@ function pollActiveSends() {
   let matched=null;
   try{while(c.moveToNext()){
    const row={msgId:String(c.getString(0)||''),msgSvrId:c.isNull(1)?'0':String(c.getString(1)),status:String(c.getString(2)||''),createTime:String(c.getString(3)||''),content:c.isNull(4)?'':String(c.getString(4))};
-   if(item.matchedMsgId===row.msgId || (!item.matchedMsgId && !claimedMsgIds.has(row.msgId) && row.content===item.content)){
+   if(item.matchedMsgId===row.msgId || (!item.matchedMsgId && !claimedMsgIds.has(row.msgId) && (row.content===item.content || item.isQuote))){
     matched=row;break;
    }
   }}finally{c.close();}
@@ -442,7 +481,9 @@ Java.perform(function(){
     if(source && tickCount%30===0){try{scanGroupMembers();lastGroupScanMs=Date.now();}catch(e){console.log(JSON.stringify({event:'group_members_scan_failed'}));}}
    }
    dirty=false;
-   tickCount++;if(tickCount%15===0)console.log(JSON.stringify({event:'capture_heartbeat',stats:counters}));
+   tickCount++;if(tickCount%15===0){
+   console.log(JSON.stringify({event:'capture_heartbeat',stats:counters}));
+  }
   }catch(e){counters.errors++;console.log(JSON.stringify({event:'capture_error',error:String(e)}));}
   finally{busy=false;}
  });},2000);

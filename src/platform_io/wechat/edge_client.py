@@ -103,8 +103,10 @@ class WeChatEdgeClient:
             raise ValueError("Phone account/conversation/protocol mismatch")
         return data
 
-    async def send_text_via_hook(self, chat_id: str, text: str, internal_id: str) -> Dict[str, Any]:
-        """Send text in background via Frida ISendMsgMgr hook (/wechat/send_text) without requiring foreground UI."""
+    async def send_text_via_hook(
+        self, chat_id: str, text: str, internal_id: str, quote: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """Send text or quote message in background via Frida hook without requiring foreground UI."""
         if not internal_id or not text.strip():
             raise ValueError("Sending requires stable internal message ID and nonempty text")
         request_id = hashlib.sha256(
@@ -119,7 +121,12 @@ class WeChatEdgeClient:
                 request_id=request_id,
                 max_per_minute=self.max_sends_per_minute,
             )
-            response = await self.client.post(self.source + "/wechat/send_text", json=payload)
+            if quote:
+                payload["quote"] = quote
+                endpoint = "/wechat/send_quote"
+            else:
+                endpoint = "/wechat/send_text"
+            response = await self.client.post(self.source + endpoint, json=payload)
             if response.status_code == 429:
                 body = response.json()
                 raise ValueError(body.get("error") or "Edge per-minute send rate limit exceeded")
@@ -138,9 +145,17 @@ class WeChatEdgeClient:
                 "typing_delay_ms": ack.get("typing_delay_ms"),
             }
 
-    async def send_text(self, chat_id: str, text: str, internal_id: str) -> Dict[str, Any]:
+    async def send_quote(
+        self, chat_id: str, text: str, quote: Dict[str, Any], internal_id: str
+    ) -> Dict[str, Any]:
+        """Send a quote reply message via Frida hook."""
+        return await self.send_text_via_hook(chat_id, text, internal_id, quote=quote)
+
+    async def send_text(
+        self, chat_id: str, text: str, internal_id: str, quote: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
         if self.use_hook_send:
-            return await self.send_text_via_hook(chat_id, text, internal_id)
+            return await self.send_text_via_hook(chat_id, text, internal_id, quote=quote)
         from src.mobile_agent.wechat_screen_parser import WeChatScreenParser
 
         if not internal_id or not text.strip():
