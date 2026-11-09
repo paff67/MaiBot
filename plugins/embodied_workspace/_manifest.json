@@ -2,7 +2,7 @@
   "manifest_version": 2,
   "id": "maibot-team.embodied-workspace",
   "name": "具身动态工作区与全栈沙盒",
-  "version": "1.0.0",
+  "version": "1.3.0",
   "description": "提供快轨人设长文发布与慢轨 Codex/agy CLI 全栈沙盒构建、动态子域名挂载及按需唤醒后端服务",
   "author": {
     "name": "MaiBot Architect",

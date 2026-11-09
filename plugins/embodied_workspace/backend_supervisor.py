@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .cli_bridge import SANDBOX_WORKSPACE_PATH, build_bwrap_prefix, build_sandbox_env
+from .resource_quota import ResourceQuotaWrapper
 from .subdomain_router import SubdomainRoute
 
 
@@ -29,11 +30,13 @@ class BackendSupervisor:
         port_min: int = 19001,
         port_max: int = 19199,
         idle_timeout_sec: float = 900.0,
+        quota_wrapper: ResourceQuotaWrapper | None = None,
     ) -> None:
         self.workspaces_root = workspaces_root
         self.port_min = port_min
         self.port_max = port_max
         self.idle_timeout_sec = idle_timeout_sec
+        self.quota_wrapper = quota_wrapper
         self._active: dict[str, ManagedBackend] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self._janitor_task: asyncio.Task | None = None
@@ -72,14 +75,19 @@ class BackendSupervisor:
             rel_project_dir = f"{SANDBOX_WORKSPACE_PATH}/projects/{route.project_slug}"
 
             actual_cmd = [arg.replace("{PORT}", str(port)) for arg in start_cmd_template]
-            bwrap_cmd = build_bwrap_prefix(chat_ws_dir, workdir=rel_project_dir)
-            bwrap_cmd.extend(actual_cmd)
+            raw_bwrap_cmd = build_bwrap_prefix(chat_ws_dir, workdir=rel_project_dir)
+            raw_bwrap_cmd.extend(actual_cmd)
+            launch_cmd = (
+                self.quota_wrapper.wrap_command(raw_bwrap_cmd, unit_prefix=f"maibot-be-{route.token}")
+                if self.quota_wrapper
+                else raw_bwrap_cmd
+            )
 
             env = build_sandbox_env()
             env["PORT"] = str(port)
 
             proc = await asyncio.create_subprocess_exec(
-                *bwrap_cmd,
+                *launch_cmd,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
                 start_new_session=True,

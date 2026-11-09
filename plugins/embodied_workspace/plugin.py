@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import secrets
 import time
@@ -22,7 +23,10 @@ from .backend_supervisor import BackendSupervisor
 from .cli_bridge import CLIBridge, WorkspaceJobRequest
 from .fast_renderer import render_markdown_to_wechat_html
 from .gateway_server import WorkspaceGatewayServer
+from .realtime_hub import GroupRealtimeHub
+from .resource_quota import QuotaLimits, ResourceQuotaWrapper
 from .subdomain_router import SubdomainRoute, SubdomainRouter
+from .time_machine import WorkspaceTimeMachine
 from .user_truth_writer import UserScopedTruthWriter
 
 
@@ -46,6 +50,11 @@ class EmbodiedWorkspaceConfig(PluginConfigBase):
     gdrive_archive_root: str = Field(default="/mnt/gdrive/companion_vault/workspace_archives", description="Google Drive 归档目录")
     wechat_source: str = Field(default="https://100.90.156.92:8443", description="微信驱动数据源地址")
     wechat_account: str = Field(default="4d86ac1b06dd252fa3c7327eb5614865", description="微信账号目录哈希")
+    enable_cgroup_quota: bool = Field(default=True, description="是否启用 cgroups v2 进程配额限制")
+    cgroup_cpu_quota_percent: int = Field(default=150, description="CPU 配额百分比（150% = 1.5 核）")
+    cgroup_memory_max_mb: int = Field(default=1024, description="物理内存硬上限 (MB)")
+    cgroup_tasks_max: int = Field(default=256, description="最大进程/线程数")
+    cgroup_oom_score_adjust: int = Field(default=500, description="OOMScoreAdjust 优先级")
 
 
 class EmbodiedWorkspacePlugin(MaiBotPlugin):
@@ -54,6 +63,9 @@ class EmbodiedWorkspacePlugin(MaiBotPlugin):
     def __init__(self) -> None:
         super().__init__()
         self.set_plugin_config({})
+        self.quota_wrapper: ResourceQuotaWrapper | None = None
+        self.time_machine: WorkspaceTimeMachine | None = None
+        self.realtime_hub: GroupRealtimeHub | None = None
 
     @property
     def ctx(self) -> Any:
@@ -82,6 +94,19 @@ class EmbodiedWorkspacePlugin(MaiBotPlugin):
         self.archive_mgr = WorkspaceArchiveManager(
             gdrive_archive_root=Path(self.config.gdrive_archive_root),
         )
+
+        quota_limits = QuotaLimits(
+            enabled=self.config.enable_cgroup_quota,
+            cpu_quota_percent=self.config.cgroup_cpu_quota_percent,
+            memory_max_mb=self.config.cgroup_memory_max_mb,
+            tasks_max=self.config.cgroup_tasks_max,
+            oom_score_adjust=self.config.cgroup_oom_score_adjust,
+        )
+        self.quota_wrapper = ResourceQuotaWrapper(quota_limits)
+        self.time_machine = WorkspaceTimeMachine(ws_root)
+        self.realtime_hub = GroupRealtimeHub(Path(self.config.ledger_db_path))
+        self.realtime_hub.start()
+
         self.cli_bridge = CLIBridge(
             workspaces_root=ws_root,
             truth_db_path=truth_path,
@@ -90,8 +115,13 @@ class EmbodiedWorkspacePlugin(MaiBotPlugin):
             wechat_account=self.config.wechat_account,
             cli_backend=self.config.cli_backend,
             timeout_seconds=self.config.cli_timeout_seconds,
+            quota_wrapper=self.quota_wrapper,
+            time_machine=self.time_machine,
         )
-        self.supervisor = BackendSupervisor(workspaces_root=ws_root)
+        self.supervisor = BackendSupervisor(
+            workspaces_root=ws_root,
+            quota_wrapper=self.quota_wrapper,
+        )
         self.supervisor.start_janitor()
 
         self.gateway = WorkspaceGatewayServer(
@@ -101,11 +131,14 @@ class EmbodiedWorkspacePlugin(MaiBotPlugin):
             cookie_secret=self.config.cookie_secret,
             on_web_notify=self._handle_web_notify_callback,
             listen_port=self.config.gateway_port,
+            realtime_hub=self.realtime_hub,
         )
         await self.gateway.start()
         self._bg_tasks: set[asyncio.Task[Any]] = set()
 
     async def on_unload(self) -> None:
+        if hasattr(self, "realtime_hub") and self.realtime_hub:
+            await self.realtime_hub.stop()
         if hasattr(self, "gateway"):
             await self.gateway.stop()
         if hasattr(self, "supervisor"):
@@ -412,6 +445,200 @@ class EmbodiedWorkspacePlugin(MaiBotPlugin):
                 stream_id=route.stream_id,
                 intent=f"用户 {actor_wxid} 在网页《{route.title}》上完成了操作（{event_name}: {detail}{mem_note}），请自然地回应。",
             )
+
+    async def _perform_project_rollback(
+        self,
+        chat_id: str,
+        project_slug: str,
+        target_spec: str = "1",
+        fallback_stream_id: str = "",
+        fallback_creator_wxid: str = "",
+    ) -> dict[str, Any]:
+        slug = self.cli_bridge.safe_id(project_slug)
+        ws_dir = self.cli_bridge.get_chat_workspace(chat_id)
+        token = self.router.find_active_token_by_slug(chat_id, slug)
+        old_route = self.router.get_route(token) if token else None
+
+        if token:
+            await self.supervisor.stop_backend(token)
+
+        rb_res = await self.time_machine.rollback(ws_dir, slug, target_spec=target_spec)
+        if not rb_res.ok:
+            return {"ok": False, "error": rb_res.error}
+
+        meta = rb_res.restored_meta or {}
+        mode = str(meta.get("mode") or (old_route.mode if old_route else "static")).strip().lower()
+        start_cmd = (
+            [str(x) for x in meta.get("start_cmd", [])]
+            if isinstance(meta.get("start_cmd"), list)
+            else (json.loads(old_route.start_cmd_json) if old_route and old_route.start_cmd_json else [])
+        )
+        title = str(meta.get("title") or (old_route.title if old_route else slug))
+        summary = str(meta.get("summary_for_replyer") or f"已回滚至 {rb_res.target_commit}")
+
+        # [v3.1 修正] 完整保留原路由的 creator_wxid、access_policy 与 stream_id
+        creator_wxid = (old_route.creator_wxid if old_route and old_route.creator_wxid else fallback_creator_wxid)
+        access_policy = (old_route.access_policy if old_route else "creator_only")
+        stream_id = (old_route.stream_id if old_route and old_route.stream_id else fallback_stream_id)
+
+        dist_dir = ws_dir / "dist" / slug
+        project_dir = ws_dir / "projects" / slug
+        eff_token = token or self.router.generate_short_token(6)
+
+        url = self.router.upsert_route(
+            token=eff_token,
+            chat_id=chat_id,
+            stream_id=stream_id,
+            creator_wxid=creator_wxid,
+            access_policy=access_policy,
+            project_slug=slug,
+            title=title,
+            summary=summary,
+            mode=mode,
+            dist_dir=dist_dir,
+            project_dir=project_dir,
+            start_cmd=start_cmd,
+            ttl_hours=self.config.default_ttl_hours,
+        )
+        if mode == "backend" and start_cmd:
+            route = self.router.get_route(eff_token)
+            if route:
+                try:
+                    await self.supervisor.ensure_running(route, start_cmd)
+                except Exception:
+                    pass
+
+        return {
+            "ok": True,
+            "project_slug": slug,
+            "target_commit": rb_res.target_commit,
+            "restored_subject": rb_res.restored_subject,
+            "access_policy": access_policy,
+            "url": url,
+            "mode": mode,
+        }
+
+    @Tool(
+        name="manage_workspace_projects",
+        description=(
+            "【工作区目录与时光机回滚工具】用于查询当前会话已创建的所有网页项目列表(action='list')、"
+            "查看某个项目的 Git 快照历史版本(action='history')，或将改坏的项目一键回滚至之前的稳定快照(action='rollback')。"
+        ),
+        parameters=[
+            ToolParameterInfo(
+                name="action",
+                param_type=ToolParamType.STRING,
+                description="操作类型：'list'（列出当前会话项目）、'history'（查看项目快照历史）、'rollback'（执行回滚）",
+                required=True,
+            ),
+            ToolParameterInfo(
+                name="project_slug",
+                param_type=ToolParamType.STRING,
+                description="目标项目英文标识（action 为 'history' 或 'rollback' 时必填）",
+                required=False,
+                default="",
+            ),
+            ToolParameterInfo(
+                name="target_version",
+                param_type=ToolParamType.STRING,
+                description="回滚目标：传数字 '1' 表示回退 1 个版本（上一稳定版），也可传具体 short_hash",
+                required=False,
+                default="1",
+            ),
+        ],
+    )
+    async def manage_workspace_projects(
+        self,
+        action: str,
+        project_slug: str = "",
+        target_version: str = "1",
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        chat_id = self._resolve_chat_id(kwargs)
+        act = action.strip().lower()
+
+        if act == "list":
+            routes = self.router.list_chat_routes(chat_id, limit=15)
+            items = [
+                {
+                    "project_slug": r.project_slug,
+                    "title": r.title,
+                    "mode": r.mode,
+                    "access_policy": r.access_policy,
+                    "url": self.router.format_url(r.token),
+                }
+                for r in routes
+            ]
+            return {"ok": True, "projects": items}
+
+        slug = self.cli_bridge.safe_id(project_slug)
+        ws_dir = self.cli_bridge.get_chat_workspace(chat_id)
+
+        if act == "history":
+            snaps = await self.time_machine.list_snapshots(ws_dir, slug, limit=10)
+            return {
+                "ok": True,
+                "project_slug": slug,
+                "snapshots": [
+                    {
+                        "short_hash": s.short_hash,
+                        "timestamp": s.timestamp_iso,
+                        "subject": s.subject,
+                    }
+                    for s in snaps
+                ],
+            }
+
+        if act == "rollback":
+            if not project_slug.strip():
+                return {"ok": False, "error": "执行回滚必须提供 project_slug"}
+            sender_wxid = str(kwargs.get("sender_wxid") or kwargs.get("user_id") or "")
+            stream_id = str(kwargs.get("stream_id") or "")
+            return await self._perform_project_rollback(
+                chat_id, slug, target_spec=target_version,
+                fallback_stream_id=stream_id, fallback_creator_wxid=sender_wxid
+            )
+
+        return {"ok": False, "error": f"未知的 action: {action}"}
+
+    @Command(
+        name="rollback",
+        description="一键将指定工作区项目回滚至上一稳定快照版本",
+        pattern=r"^(?:/rollback|/回滚|回滚)\s+([a-zA-Z0-9_.-]+)(?:\s+(\S+))?\s*$",
+        aliases=["/rollback", "/回滚", "回滚"],
+    )
+    async def rollback_workspace_cmd(self, **kwargs: Any) -> str:
+        chat_id = self._resolve_chat_id(kwargs)
+        groups = kwargs.get("matched_groups")
+        slug = ""
+        target_spec = "1"
+        if isinstance(groups, (list, tuple)) and groups:
+            slug = str(groups[0] or "").strip()
+            if len(groups) > 1 and groups[1]:
+                target_spec = str(groups[1]).strip()
+        else:
+            raw_text = str(kwargs.get("text") or kwargs.get("command_text") or "").strip()
+            parts = raw_text.split()
+            if len(parts) >= 2:
+                slug = parts[1]
+            if len(parts) >= 3:
+                target_spec = parts[2]
+
+        if not slug:
+            return "请指定要回滚的项目标识，例如：/rollback camp-vote"
+
+        sender_wxid = str(kwargs.get("sender_wxid") or kwargs.get("user_id") or "")
+        stream_id = str(kwargs.get("stream_id") or "")
+        res = await self._perform_project_rollback(
+            chat_id, slug, target_spec=target_spec,
+            fallback_stream_id=stream_id, fallback_creator_wxid=sender_wxid
+        )
+        if res.get("ok"):
+            return (
+                f"⏪ 已将项目 `{res['project_slug']}` 回滚至快照 `{res['target_commit']}` "
+                f"（{res['restored_subject']}）！\n访问链接：{res['url']}"
+            )
+        return f"❌ 回滚失败：{res.get('error')}"
 
     @Command(
         name="claim",

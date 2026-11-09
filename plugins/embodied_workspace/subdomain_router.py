@@ -164,6 +164,8 @@ class SubdomainRouter:
                     created_at, expire_at, revoked
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
                 ON CONFLICT(token) DO UPDATE SET
+                    stream_id=COALESCE(NULLIF(excluded.stream_id, ''), subdomain_routes.stream_id),
+                    creator_wxid=COALESCE(NULLIF(excluded.creator_wxid, ''), subdomain_routes.creator_wxid),
                     title=excluded.title,
                     summary=excluded.summary,
                     access_policy=excluded.access_policy,
@@ -195,6 +197,25 @@ class SubdomainRouter:
                 (chat_id, project_slug, now),
             ).fetchone()
             return str(row["token"]) if row else None
+
+    def list_chat_routes(self, chat_id: str, limit: int = 10) -> list[SubdomainRoute]:
+        """查询当前微信会话下最近创建的活跃工作区路由列表"""
+        now = time.time()
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM subdomain_routes
+                WHERE chat_id = ? AND revoked = 0 AND expire_at > ?
+                ORDER BY created_at DESC LIMIT ?
+                """,
+                (chat_id, now, int(limit)),
+            ).fetchall()
+            results: list[SubdomainRoute] = []
+            for r in rows:
+                d = dict(r)
+                d.pop("first_visit_auto_claim", None)
+                results.append(SubdomainRoute(**d))
+            return results
 
     def get_route(self, token: str) -> SubdomainRoute | None:
         with self._connect() as conn:

@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from src.companion_vault.access_policy import authorized_file_rows
+from .resource_quota import ResourceQuotaWrapper
+from .time_machine import WorkspaceTimeMachine
 
 SANDBOX_WORKSPACE_PATH = "/tmp/workspace"
 SANDBOX_HOME_PATH = "/tmp/home"
@@ -41,6 +43,8 @@ class WorkspaceJobResult:
     dist_dir: Path | None = None
     project_dir: Path | None = None
     error_message: str = ""
+    snapshot_hash: str = ""
+    diff_stat: str = ""
 
 
 def build_bwrap_prefix(chat_ws_dir: Path, workdir: str = SANDBOX_WORKSPACE_PATH) -> list[str]:
@@ -91,6 +95,8 @@ class CLIBridge:
         wechat_account: str,
         cli_backend: str = "agy",
         timeout_seconds: int = 180,
+        quota_wrapper: ResourceQuotaWrapper | None = None,
+        time_machine: WorkspaceTimeMachine | None = None,
     ) -> None:
         self.workspaces_root = workspaces_root
         self.truth_db_path = truth_db_path
@@ -99,6 +105,8 @@ class CLIBridge:
         self.wechat_account = wechat_account
         self.cli_backend = cli_backend
         self.timeout_seconds = timeout_seconds
+        self.quota_wrapper = quota_wrapper
+        self.time_machine = time_machine
         self.workspaces_root.mkdir(parents=True, exist_ok=True)
         self._project_locks: dict[tuple[str, str], asyncio.Lock] = {}
 
@@ -220,6 +228,19 @@ class CLIBridge:
   }});
   ```
 
+- 订阅微信群实时新消息与同页面多人实时广播（Phase 3 全双工总线）：
+  ```javascript
+  window.MaiBot.subscribeRealtime((msg) => {{
+    if (msg.type === "wechat_message") {{
+      // 收到当前微信群的新消息: {{ sender, content, ts }}
+    }} else if (msg.type === "peer_broadcast" || msg.type === "web_notify") {{
+      // 收到其他正在浏览本网页的群友操作广播: {{ actor_wxid, event, data }}
+    }}
+  }});
+  // 向所有正在打开本网页的群友实时广播状态
+  window.MaiBot.broadcast("vote_updated", {{ option: "A" }});
+  ```
+
 - **微信防拦截规范**：严禁在 HTML 中使用 `<input type="password">`（如需输入码请用 `type="tel"` 或 `type="text"`），严禁出现“输入银行卡/身份证”等敏感字样。
 
 ## 4. 必须生成的回执文件 `{ws_root}/dist/{slug}/result.json`
@@ -263,20 +284,31 @@ class CLIBridge:
                 f"请严格遵守 `{ws_root}/AGENTS.md` 规范，完成后务必写入 `{ws_root}/dist/{slug}/result.json`。"
             )
 
-            cmd = build_bwrap_prefix(ws_dir, workdir=ws_root)
+            if self.time_machine and req.action == "update":
+                await self.time_machine.capture_snapshot(
+                    ws_dir, slug, job_id=f"pre_{req.job_id}", action="pre-update", summary="更新前基线保护"
+                )
+
+            raw_cmd = build_bwrap_prefix(ws_dir, workdir=ws_root)
             if self.cli_backend == "codex":
-                cmd.extend([
+                raw_cmd.extend([
                     "codex", "exec", "--full-auto",
                     "--sandbox", "workspace-write",
                     "-C", ws_root,
                     full_prompt,
                 ])
             else:
-                cmd.extend([
+                raw_cmd.extend([
                     "agy", "--headless",
                     "--workspace", ws_root,
                     "--prompt", full_prompt,
                 ])
+
+            cmd = (
+                self.quota_wrapper.wrap_command(raw_cmd, unit_prefix=f"maibot-cli-{slug}")
+                if self.quota_wrapper
+                else raw_cmd
+            )
 
             try:
                 proc = await asyncio.create_subprocess_exec(
@@ -323,6 +355,20 @@ class CLIBridge:
             if mode == "backend" and not start_cmd:
                 return WorkspaceJobResult(ok=False, error_message="后端模式未在 result.json 中声明有效的 start_cmd")
 
+            snap_hash = ""
+            diff_stat = ""
+            if self.time_machine:
+                snap = await self.time_machine.capture_snapshot(
+                    ws_dir,
+                    slug,
+                    job_id=req.job_id,
+                    action=req.action,
+                    summary=str(meta.get("title") or req.project_slug),
+                )
+                if snap:
+                    snap_hash = snap.short_hash
+                    diff_stat = await self.time_machine.get_latest_diff_stat(ws_dir, slug)
+
             return WorkspaceJobResult(
                 ok=True,
                 title=str(meta.get("title") or req.project_slug),
@@ -332,4 +378,6 @@ class CLIBridge:
                 archive_files=[str(x) for x in archive_files],
                 dist_dir=dist_dir,
                 project_dir=project_dir,
+                snapshot_hash=snap_hash,
+                diff_stat=diff_stat,
             )

@@ -1,6 +1,6 @@
 # 具身微信 MaiBot 动态工作区与全栈沙盒交付系统开发迭代规范与全景记录
 
-> **维护基准分支**：`feat/embodied-workspace-phase2`  
+> **维护基准分支**：`feat/embodied-workspace-phase3`  
 > **生产主脑节点**：`DMIT-US`（`/opt/maibot-brain`）  
 > **核心组件定位**：`plugins/embodied_workspace/`（MaiBot v2 标准插件）  
 > **文档维护规约**：**本文档为该交付系统的法定迭代档案。每次 Phase 开发（编码、联调、测试验证）完成后，必须同步增量更新本文档对应的 Phase 章节、关键实现细节、避坑记录与测试审计结果。**
@@ -23,8 +23,14 @@
   - [3. 核心设计模式与时序流](#3-核心设计模式与时序流-1)
   - [4. 生产环境工程踩坑与实战攻关全景表（P0/P1 Matrix）](#4-生产环境工程踩坑与实战攻关全景表p0p1-matrix)
   - [5. 生产节点验证与测试覆盖报告](#5-生产节点验证与测试覆盖报告-1)
-- [五、 Phase 3：演进规划与后续接入设计（规划中）](#五-phase-3演进规划与后续接入设计规划中)
-- [六、 迭代追溯索引与提交记录](#六-迭代追溯索引与提交记录)
+- [五、 Phase 3：cgroups v2 硬隔离、Git 增量时光机与全双工总线交付（已完成）](#五-phase-3cgroups-v2-硬隔离git-增量时光机与全双工总线交付已完成)
+  - [1. 阶段目标与交付范围](#1-阶段目标与交付范围-2)
+  - [2. 关键代码映射与模块改动清单](#2-关键代码映射与模块改动清单-2)
+  - [3. 核心设计模式与时序流](#3-核心设计模式与时序流-2)
+  - [4. 生产环境工程踩坑与实战攻关全景表（P0/P1 Matrix）](#4-生产环境工程踩坑与实战攻关全景表p0p1-matrix-1)
+  - [5. 生产节点验证与测试覆盖报告](#5-生产节点验证与测试覆盖报告-2)
+- [六、 Phase 4：演进规划与后续接入设计（规划中）](#六-phase-4演进规划与后续接入设计规划中)
+- [七、 迭代追溯索引与提交记录](#七-迭代追溯索引与提交记录)
 
 ---
 
@@ -375,23 +381,157 @@ pytest pytests/companion/ pytests/platform_io/test_adapter_policy.py pytests/mai
 
 ---
 
-## 五、 Phase 3：演进规划与后续接入设计（规划中）
+## 五、 Phase 3：cgroups v2 硬隔离、Git 增量时光机与全双工总线交付（已完成）
 
-在 Phase 2 完成单级泛域名、CF Pages 边缘 2A 跳板、真值库用户隔离与四级免登身份接力的基础上，Phase 3 将针对大规模并发隔离、群内实时双向数据同步与时光机快照展开：
-
-1. **cgroups v2 细粒度资源硬隔离（Resource Quota）**：
-   - 为每个工作区实例配置独立 cgroup，限制单个沙箱的 CPU 占用上限（如不超过 1.5 核）与物理内存配额（如限制不超过 1GB），防止用户代码死循环耗尽宿主机资源。
-2. **群组全双工实时同步总线（Group Realtime Pub/Sub）**：
-   - 基于现有 WebSocket 反代通道，打通微信群新消息原位推送到已打开网页的前端面板，实现网页端多人实时查看群讨论更新。
-3. **工作区 Git 增量时光机快照（Workspace Snapshot & Rollback）**：
-   - 每次慢轨执行 `action="update"` 前后自动触发本地 Git 增量 commit 与差异计算，支持用户在微信直接发送指令（如 `/rollback <slug>`）一键回滚至上一稳定版本。
+### 1. 阶段目标与交付范围
+在 Phase 2 完成单级泛域名 `paff-67.top`、Cloudflare Pages 边缘 2A 跳板、真值库 8 表 Schema 严格对齐与四级免登身份接力的基础上，Phase 3 聚焦于解决生产宿主机资源防御、长对话跨周期项目检索与生命周期管理、代码改坏一键撤销（Undo）以及微信群到浏览器端全双工实时联动四大核心能力：
+1. **cgroups v2 细粒度资源硬隔离与 OOM 优先保护**：为每个工作区 CLI 构建进程与临时后端进程接入 transient scope 作用域，限制单实例 CPU 配额（默认 150%，即 1.5 核）、物理内存上限（1024MB，禁用 Swap 膨胀）与最大进程数（`TasksMax=256`），并将 `OOMScoreAdjust` 设为 `+500`，确保极端内存压力下内核优先回收沙盒进程，绝对保全宿主与主脑核心服务。
+2. **宿主机侧独立 Git 增量时光机与安全回滚引擎**：在沙盒外部（宿主机侧）统一管理独立 Git 仓库（`--git-dir=<ws>/snapshots/<slug>.git`，工作树指向 `<ws>`），同时捕获 `projects/<slug>`（源码）与 `dist/<slug>`（产物），支持用户发送 `/rollback <slug> [版本/步数]` 或 Planner 调用 `@Tool("manage_workspace_projects")` 瞬时恢复至上一稳定快照并重启后端服务。
+3. **群组全双工 WebSocket 实时同步总线**：在网关层挂载系统保留端点 `GET /_maibot/ws`（与业务后端 WebSocket 反代隔离），实现“按需零开销轮询”——仅当网页有活跃 WebSocket 订阅者时才增量拉取 `message_ledger.db` 并推送群聊新消息至前端；同时支持网页客户端同屏多人毫秒级状态广播。
+4. **会话项目目录与生命周期管理**：向 Maisaka Planner 暴露轻量管理工具 `@Tool("manage_workspace_projects")`（支持 `list`、`history`、`rollback`），彻底解决大模型长对话后遗忘已交付网页项目标识与访问链接的问题。
 
 ---
 
-## 六、 迭代追溯索引与提交记录
+### 2. 关键代码映射与模块改动清单
+
+```
+plugins/embodied_workspace/
+├── _manifest.json             # [升级] 版本号升至 1.3.0
+├── resource_quota.py          # [Phase 3 新增] cgroups v2 (systemd-run --scope) 与 prlimit 配额包装器
+├── time_machine.py            # [Phase 3 新增] 宿主机侧独立 Git 增量快照引擎（支持 ls-tree 动态过滤检出）
+├── realtime_hub.py            # [Phase 3 新增] 群组全双工 WebSocket 实时总线（生产 messages 表动态映射）
+├── subdomain_router.py        # [Phase 3 升级] 新增 list_chat_routes()，upsert_route 强化 ON CONFLICT 非空继承
+├── cli_bridge.py              # [Phase 3 升级] 接入 ResourceQuotaWrapper 与 WorkspaceTimeMachine 自动快照，文档追加实时总线
+├── backend_supervisor.py      # [Phase 3 升级] 临时后端进程启动命令接入 ResourceQuotaWrapper cgroups v2 配额限制
+├── gateway_server.py          # [Phase 3 升级] 挂载 /_maibot/ws 实时总线端点，升级 /_maibot/sdk.js 暴露 subscribeRealtime/broadcast
+└── plugin.py                  # [Phase 3 升级] 装配 quota/time_machine/realtime_hub，注册 manage_workspace_projects 与 /rollback
+pytests/companion/
+└── test_embodied_workspace_phase3.py # [Phase 3 新增] 4 项高强度生产验收测试（覆盖隐患 1/2/3/5）
+```
+
+---
+
+### 3. 核心设计模式与时序流
+
+#### (1) cgroups v2 细粒度资源硬隔离与降级机制（`resource_quota.py`）
+* **动态环境探测**：通过 `_detect_systemd_scope_mode` 检测宿主机 D-Bus 与 systemd 可用性：
+  * Root 权限：使用 `systemd-run --scope --quiet --collect`，追加 `CPUQuota=150%`、`MemoryMax=1024M`、`MemorySwapMax=0`、`TasksMax=256` 以及 `OOMScoreAdjust=500`。
+  * 非 Root 用户：自动切换为 `systemd-run --user --scope`，并自动省略 `OOMScoreAdjust`（避免内核权限不足导致启动失败）。
+  * 受限环境 / CI：自动降级为 `prlimit --nproc=256` 或原样直通，确保测试用例 100% 兼容。
+
+#### (2) 宿主机侧独立 Git 增量时光机双目录快照与原子回滚（`time_machine.py`）
+* **双目录原子捕获**：快照仓库外置于 `<chat_ws>/snapshots/<slug>.git`，每次代码执行前自动创建 `pre-update` 保护基线，执行成功后提交 `[update]` 快照并计算 `git diff --shortstat`。
+* **单目录演进容错回滚**：回滚时通过 `git ls-tree --name-only <target_commit> -- <subpath>` 嗅探目标提交中真实存在的目录树；仅对存在的路径执行检出，不存在的物理目录通过 `shutil.rmtree` 彻底清理，彻底解决了从全栈版本回滚至纯静态版本时 Git 抛出 `pathspec did not match` 的 P0 级致命缺陷。
+
+#### (3) 群组全双工 WebSocket 实时同步总线与按需安全轮询（`realtime_hub.py`）
+* **零订阅零开销（Zero Subscriber, Zero Query）**：当群聊工作区页面无在线 WebSocket 连接时，后台轮询协程完全不触碰 SQLite 磁盘，绝不争抢主脑 I/O 资源。
+* **纯只读挂载与真实表结构对齐**：使用 `file:...mode=ro&uri=true` 连接生产 `message_ledger.db`，优先映射生产表的真实字段 `body`（正文）与 `updated_at_ms`（时间戳），并兼容旧版测试库字段。
+* **双向协同广播**：前端 SDK 提供 `window.MaiBot.subscribeRealtime(cb)` 与 `window.MaiBot.broadcast(event, data)`，支持同页面多端无延迟协同与微信群消息实时原位推送。
+
+#### (4) DMIT-US 宿主机 Nginx WebSocket 反代配置规范
+在生产节点 `/etc/nginx/sites-available/` 下对应 `*.paff-67.top` 的 upstream 代理块中，必须显式配置 HTTP 1.1 与 Upgrade 协议头：
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:18790;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+    proxy_buffering off;
+}
+```
+
+---
+
+### 4. 生产环境工程踩坑与实战攻关全景表（P0/P1 Matrix）
+
+| 缺陷编号 | 严重等级 | 生产环境触发根因 | Phase 3 (v3.1) 生产级修正方案与落地验证 |
+| :---: | :---: | :--- | :--- |
+| **P0-11** | **P0** | **从全栈版本回滚至纯静态版本时 Git pathspec 崩溃**：项目在 v1 阶段仅生成 `dist/<slug>`，演进到 v2 阶段生成了 `projects/<slug>`。当执行回滚至 v1 时，执行 `git checkout <v1> -- projects/<slug> dist/<slug>` 会因目标 commit 不存在 `projects` 目录抛出 `error: pathspec 'projects/...' did not match any file(s) known to git`（exit code 1）导致回滚中断。 | 在 `time_machine.py` 中检出前通过 `git ls-tree --name-only <target_commit> -- <sub>` 嗅探目标版本实际包含的目录：仅将真实存在的目录加入检出清单；目标版本中不存在的物理目录则通过 `shutil.rmtree` 彻底清理，确保不留存脏后端源码。 |
+| **P1-12** | **P1** | **生产 `message_ledger.db` 字段失配导致推送正文为空**：生产表 `messages`（由 `src/platform_io/wechat/message_ingestor.py` 创建）的真实正文字段为 `body` 与 `raw_content`，时间戳为 `updated_at_ms`。若仅探测 `raw_message` 与 `content`，在生产库上会回退为 `''`。 | 在 `realtime_hub.py` 的 `_fetch_new_chat_messages` 中优先匹配生产字段：`body -> raw_message -> content -> raw_content`，时间戳优先匹配 `updated_at_ms -> timestamp -> create_time`，并在推送负载中同时携带 `ts` 与 `timestamp`。 |
+| **P1-13** | **P1** | **回滚路由重建时丢失 `creator_wxid` 与 `access_policy`**：回滚重新注册路由（`upsert_route`）时若未携带原路由元数据，会退化为默认的 `creator_only` 与空 `creator_wxid`，导致多人实名协作模式（`member_collect`）页面回滚后被锁定为独占。 | 回滚前通过 `self.router.get_route(token)` 读取原路由，显式继承 `creator_wxid`、`access_policy` 与 `stream_id`；同时在 `subdomain_router.py` 的 SQL `ON CONFLICT(token) DO UPDATE` 中加入 `COALESCE(NULLIF(excluded.stream_id, ''), ...)` 非空保护。 |
+| **P1-14** | **P1** | **宿主机 Nginx 反向代理层丢弃 WebSocket Upgrade 头**：若 Nginx 未显式声明 `Upgrade` 与 `Connection` 映射，公网客户端对 `wss://<token>.paff-67.top/_maibot/ws` 的连接将被 Nginx 阻断并返回 `400 Bad Request`。 | 在部署规约中固化 Nginx 协议升级转发指令（`proxy_http_version 1.1;`、`proxy_set_header Upgrade $http_upgrade;`、`proxy_set_header Connection "upgrade";`），保证长连接全双工穿透。 |
+| **P2-15** | **P2** | **非 root 模式下 `systemd-run --user` 传入 `OOMScoreAdjust` 报错**：Linux 内核对非特权用户调整 `OOMScoreAdjust` 施加权限限制，若直接在 `--user` 模式注入 `--property=OOMScoreAdjust=500` 会直接阻断子进程启动。 | 在 `ResourceQuotaWrapper` 的 `wrap_command` 中执行权限分支隔离：仅在 `mode == "system"`（root 权限）下附加 `OOMScoreAdjust`，在普通用户模式下自动剔除该参数，兼顾安全与兼容性。 |
+
+---
+
+### 5. 生产节点验证与测试覆盖报告
+
+#### (1) Phase 3 专属测试套件（`test_embodied_workspace_phase3.py`，4 项全通过）
+* **`test_resource_quota_system_vs_user_mode`**：验证 system 模式精确包含 150% CPUQuota、1024M MemoryMax、TasksMax=256 与 OOMScoreAdjust=500；验证 user 模式剔除 OOMScoreAdjust 并优雅运行；验证配额关闭时原样透传。
+* **`test_time_machine_single_dir_evolution_and_rollback`**：完整测试纯静态（v1）-> 全栈后端（v2）演进，回滚时单目录检出不抛异常、app.py 被安全清除、index.html 恢复为 v1，且路由表 `access_policy='member_collect'` 与 `creator_wxid` 完美保留。
+* **`test_realtime_hub_production_ledger_schema_and_broadcast`**：使用生产 `messages` 表结构建表，验证插入 `body` 与 `updated_at_ms` 后通过 WebSocket 双端秒级收到推送；验证 A 端广播 B 端同步；验证心跳 ping-pong 响应。
+* **`test_manage_workspace_projects_catalog_isolation`**：验证跨群聊项目列表严格隔离、不越权泄露，以及通过 `@Tool("manage_workspace_projects")` 查看项目历史快照。
+
+```
+pytests/companion/test_embodied_workspace_phase3.py::test_resource_quota_system_vs_user_mode PASSED [ 25%]
+pytests/companion/test_embodied_workspace_phase3.py::test_time_machine_single_dir_evolution_and_rollback PASSED [ 50%]
+pytests/companion/test_embodied_workspace_phase3.py::test_realtime_hub_production_ledger_schema_and_broadcast PASSED [ 75%]
+pytests/companion/test_embodied_workspace_phase3.py::test_manage_workspace_projects_catalog_isolation PASSED [100%]
+============================== 4 passed in 1.21s ===============================
+```
+
+#### (2) 动态工作区全阶段联合验收（Phase 1 + Phase 2 + Phase 3，15 项全通过）
+```
+============================= test session starts ==============================
+platform linux -- Python 3.13.5, pytest-8.3.5, pluggy-1.5.0 -- /usr/bin/python3
+cachedir: .pytest_cache
+rootdir: /opt/maibot-brain
+configfile: pyproject.toml
+plugins: anyio-4.16.0, asyncio-0.25.1
+collecting ... collected 15 items
+
+pytests/companion/test_embodied_workspace.py::test_manifest_and_plugin_factory PASSED [  6%]
+pytests/companion/test_embodied_workspace.py::test_bwrap_workspace_and_home_isolation PASSED [ 13%]
+pytests/companion/test_embodied_workspace.py::test_rbac_stage_authorized_files PASSED [ 20%]
+pytests/companion/test_embodied_workspace.py::test_fast_track_ipc_and_auto_upgrade PASSED [ 26%]
+pytests/companion/test_embodied_workspace.py::test_backend_auto_wake_and_scale_to_zero PASSED [ 33%]
+pytests/companion/test_embodied_workspace.py::test_protect_subdomain_url_hook PASSED [ 40%]
+pytests/companion/test_embodied_workspace_phase2.py::test_single_level_domain_and_reserved_filtering PASSED [ 46%]
+pytests/companion/test_embodied_workspace_phase2.py::test_user_scoped_truth_writer_isolation PASSED [ 53%]
+pytests/companion/test_embodied_workspace_phase2.py::test_private_chat_prefetch_immunity_and_rbac PASSED [ 60%]
+pytests/companion/test_embodied_workspace_phase2.py::test_command_kwargs_and_cross_device_auth PASSED [ 66%]
+pytests/companion/test_embodied_workspace_phase2.py::test_archive_manager_fuse_direct_write PASSED [ 73%]
+pytests/companion/test_embodied_workspace_phase3.py::test_resource_quota_system_vs_user_mode PASSED [ 80%]
+pytests/companion/test_embodied_workspace_phase3.py::test_time_machine_single_dir_evolution_and_rollback PASSED [ 86%]
+pytests/companion/test_embodied_workspace_phase3.py::test_realtime_hub_production_ledger_schema_and_broadcast PASSED [ 93%]
+pytests/companion/test_embodied_workspace_phase3.py::test_manage_workspace_projects_catalog_isolation PASSED [100%]
+============================== 15 passed in 2.09s ==============================
+```
+
+#### (3) 主脑全量关联回归网关（130 项全通过）
+```bash
+pytest pytests/companion/ pytests/platform_io/test_adapter_policy.py pytests/maisaka/test_reasoning_engine.py -q
+python3 -m compileall -q plugins/embodied_workspace
+```
+输出结果：
+```
+........................................................................ [ 55%]
+..........................................................               [100%]
+130 passed, 10 warnings in 12.77s
+```
+
+---
+
+## 六、 Phase 4：演进规划与后续接入设计（规划中）
+
+在 Phase 1（双轨分流与沙盒交付）、Phase 2（单级泛域名、CF Pages 跳板、8 表隔离与免登接力）与 Phase 3（cgroups 硬隔离、Git 时光机与全双工总线）均已在 `DMIT-US` 生产节点闭环上线的前提下，后续 Phase 4 将面向更加复杂的具身多模态与长效工作流：
+
+1. **分布式沙盒多节点集群（Multi-Host Execution Pool）**：
+   - 当 `DMIT-US` 负载过高时，网关支持通过 WireGuard 内网调度将重型编译与全栈容器无缝分发至计算专用节点。
+2. **具身微信原生小程序无感桥接（MiniProgram Trampoline）**：
+   - 探索将 `https://<token>.paff-67.top` 包装为临时微信小程序 Web-view 容器，实现一键微信原生产业链卡片转发与多人群协作。
+
+---
+
+## 七、 迭代追溯索引与提交记录
 
 | 阶段 | 分支名称 | 关键提交 Hash | 变更概述 | 验收人 / 执行 Agent |
 | :---: | :---: | :---: | :--- | :---: |
 | **Phase 1** | `feat/embodied-workspace-phase1` | `90aac6bcce5a6d91d97c1a4960f388738311feef` | 完成快慢双轨分流、bwrap 命名空间沙盒、双库 RBAC 鉴权、Auto-Wake/Scale-to-Zero 网关与 6 项自动化测试。 | `agy` (Antigravity) |
-| **Phase 2** | `feat/embodied-workspace-phase2` | `1339b742a` | 单级泛域名、CF Pages 边缘 2A 跳板、真值库 8 表 Schema 严格对齐、四级无感身份接力（抗预取）、FUSE 归档直写与 5 项专项测试。 | `agy` (Antigravity) |
-| **Phase 3** | *待创建* | *待定* | *cgroups v2 硬配额、群组 WebSocket 实时广播总线与 Git 增量时光机快照* | *待定* |
+| **Phase 2** | `feat/embodied-workspace-phase2` | `c82ba349d` | 单级泛域名、CF Pages 边缘 2A 跳板、真值库 8 表 Schema 严格对齐、四级无感身份接力（抗预取）、FUSE 归档直写与 5 项专项测试。 | `agy` (Antigravity) |
+| **Phase 3** | `feat/embodied-workspace-phase3` | `e87de93fd` | cgroups v2 硬隔离包装器、宿主独立 Git 时光机双目录快照与回滚、群组全双工 WebSocket 实时总线、会话目录管理工具与 4 项专项测试。 | `agy` (Antigravity) |

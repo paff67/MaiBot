@@ -13,6 +13,7 @@ import aiohttp
 from aiohttp import WSMsgType, web
 
 from .backend_supervisor import BackendSupervisor
+from .realtime_hub import GroupRealtimeHub
 from .subdomain_router import SubdomainRoute, SubdomainRouter
 from .user_truth_writer import UserScopedTruthWriter
 
@@ -139,9 +140,37 @@ MAIBOT_SDK_JS = r"""(function() {
     };
   }
 
+  let _rtSocket = null;
+  const _rtListeners = [];
+  function ensureRealtimeSocket() {
+    if (_rtSocket && (_rtSocket.readyState === 0 || _rtSocket.readyState === 1)) return _rtSocket;
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    _rtSocket = new WebSocket(`${proto}//${location.host}/_maibot/ws`);
+    _rtSocket.onmessage = (ev) => {
+      try {
+        const data = JSON.parse(ev.data);
+        _rtListeners.forEach(fn => { try { fn(data); } catch (e) {} });
+      } catch (e) {}
+    };
+    _rtSocket.onclose = () => { setTimeout(() => { if (_rtListeners.length > 0) ensureRealtimeSocket(); }, 3000); };
+    return _rtSocket;
+  }
+
   window.MaiBot = {
     getState: () => state,
     openAuth: () => showAuthModal(null),
+    subscribeRealtime: function(callback) {
+      if (typeof callback === "function") {
+        _rtListeners.push(callback);
+        ensureRealtimeSocket();
+      }
+    },
+    broadcast: function(event, data) {
+      const ws = ensureRealtimeSocket();
+      const payload = JSON.stringify({ action: "broadcast", event: event, data: data });
+      if (ws.readyState === 1) ws.send(payload);
+      else ws.addEventListener("open", () => ws.send(payload), { once: true });
+    },
     notify: async function(payload) {
       const send = async () => fetch("/_maibot/notify", {
         method: "POST", headers: { "Content-Type": "application/json" }, credentials: "include",
@@ -209,6 +238,7 @@ class WorkspaceGatewayServer:
         cookie_secret: str = "maibot-embodied-workspace-hmac-secret-2026",
         on_web_notify: Any = None,
         listen_port: int = 18790,
+        realtime_hub: GroupRealtimeHub | None = None,
     ) -> None:
         self.router = router
         self.supervisor = supervisor
@@ -216,6 +246,7 @@ class WorkspaceGatewayServer:
         self.identity = IdentityVerifier(cookie_secret, router.base_domain)
         self.on_web_notify = on_web_notify
         self.listen_port = listen_port
+        self.realtime_hub = realtime_hub
         self._runner: web.AppRunner | None = None
 
     async def start(self) -> None:
@@ -279,6 +310,14 @@ class WorkspaceGatewayServer:
             return await self._handle_auth_endpoints(request, route)
         if request.path == "/_maibot/notify" and request.method == "POST":
             return await self._handle_maibot_notify(request, route)
+        if request.path == "/_maibot/ws" and self.realtime_hub is not None:
+            actor_wxid = self.identity.verify_cookie(request.cookies.get("maibot_wxid"))
+            if not actor_wxid and not route.chat_id.endswith("@chatroom") and route.creator_wxid:
+                actor_wxid = route.creator_wxid
+            if route.chat_id.endswith("@chatroom") and route.access_policy == "creator_only":
+                if route.creator_wxid and actor_wxid != route.creator_wxid:
+                    return web.json_response({"ok": False, "error": "仅创建者可订阅该独占页面的实时总线"}, status=403)
+            return await self.realtime_hub.handle_ws_connection(request, route, actor_wxid)
 
         if route.mode == "backend":
             return await self._proxy_to_backend(request, route)
@@ -395,6 +434,20 @@ class WorkspaceGatewayServer:
                 await self.on_web_notify(route, actor_wxid, event_name, detail, applied_changes, allowed_proactive)
             except TypeError:
                 await self.on_web_notify(route, event_name, detail, allowed_proactive)
+
+        if self.realtime_hub is not None:
+            await self.realtime_hub.broadcast_to_token(
+                route.token,
+                {
+                    "type": "web_notify",
+                    "actor_wxid": actor_wxid,
+                    "event": event_name,
+                    "detail": detail,
+                    "applied_memory_changes": applied_changes,
+                    "ts": time.time(),
+                },
+            )
+
         return web.json_response(
             {
                 "ok": True,
