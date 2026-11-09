@@ -228,6 +228,7 @@ async def test_private_chat_prefetch_immunity_and_rbac(tmp_path: Path):
 @pytest.mark.asyncio
 async def test_command_kwargs_and_cross_device_auth(tmp_path: Path):
     plugin = create_plugin()
+    plugin.config.gateway_port = 0
     plugin.config.workspaces_root = str(tmp_path / "workspaces")
     plugin.config.router_db_path = str(tmp_path / "routes.db")
     plugin.config.truth_db_path = str(tmp_path / "truth.db")

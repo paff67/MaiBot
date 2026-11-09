@@ -48,7 +48,7 @@ class EmbodiedWorkspaceConfig(PluginConfigBase):
     ledger_db_path: str = Field(default="/opt/maibot-brain/data/message_ledger.db", description="消息账本路径")
     router_db_path: str = Field(default="/opt/maibot-brain/data/workspaces/subdomain_routes.db", description="路由数据库路径")
     gdrive_archive_root: str = Field(default="/mnt/gdrive/companion_vault/workspace_archives", description="Google Drive 归档目录")
-    wechat_source: str = Field(default="https://100.90.156.92:8443", description="微信驱动数据源地址")
+    wechat_source: str = Field(default="http://100.87.39.37:8765", description="微信驱动数据源地址")
     wechat_account: str = Field(default="4d86ac1b06dd252fa3c7327eb5614865", description="微信账号目录哈希")
     enable_cgroup_quota: bool = Field(default=True, description="是否启用 cgroups v2 进程配额限制")
     cgroup_cpu_quota_percent: int = Field(default=150, description="CPU 配额百分比（150% = 1.5 核）")
@@ -143,6 +143,15 @@ class EmbodiedWorkspacePlugin(MaiBotPlugin):
             await self.gateway.stop()
         if hasattr(self, "supervisor"):
             await self.supervisor.stop_all()
+
+    async def on_config_update(self, scope: str, config_data: dict[str, Any], version: str) -> None:
+        """配置热更新回调：同步配置并通知底层真值写入器等组件。"""
+        _ = version
+        if scope == "self" and isinstance(config_data, dict):
+            self.set_plugin_config(config_data)
+            if hasattr(self, "truth_writer") and self.truth_writer:
+                self.truth_writer.wechat_source = self.config.wechat_source
+                self.truth_writer.wechat_account = self.config.wechat_account
 
     @staticmethod
     def _resolve_chat_id(kwargs: dict[str, Any]) -> str:

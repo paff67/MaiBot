@@ -72,19 +72,24 @@ class ResourceQuotaWrapper:
             cmd = ["systemd-run"]
             if mode == "user":
                 cmd.append("--user")
+
+            mem_high_mb = int(self.limits.memory_max_mb * 0.85)
             cmd.extend([
                 "--scope",
                 "--quiet",
                 "--collect",
                 f"--property=CPUQuota={self.limits.cpu_quota_percent}%",
+                f"--property=MemoryHigh={mem_high_mb}M",
                 f"--property=MemoryMax={self.limits.memory_max_mb}M",
                 "--property=MemorySwapMax=0",
                 f"--property=TasksMax={self.limits.tasks_max}",
             ])
-            # [v3.1 修正] 仅在 root (system) 模式下设置正向 OOMScoreAdjust
-            if mode == "system":
-                cmd.append(f"--property=OOMScoreAdjust={self.limits.oom_score_adjust}")
             cmd.append("--")
+
+            # 使用 choom 调整进程级 OOM 分数（避免 scope 属性报错）
+            if os.geteuid() == 0 and self.limits.oom_score_adjust > 0 and shutil.which("choom"):
+                cmd.extend(["choom", "-n", str(self.limits.oom_score_adjust), "--"])
+
             cmd.extend(base_cmd)
             return cmd
 

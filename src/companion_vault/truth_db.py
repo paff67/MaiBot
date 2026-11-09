@@ -241,24 +241,48 @@ class CompanionTruthDB:
             "</自身账号与提及判定准则>"
         )
 
-    def _build_group_desensitized_roster(self, limit: int = 50) -> list[str]:
+    def _build_group_desensitized_roster(
+        self,
+        chat_id: str = "",
+        active_sender_ids: set[str] | None = None,
+        limit: int = 150,
+    ) -> list[str]:
         """
         [v1.1 修正 P1 - 严格遵守 RBAC 红线]
-        群聊场景下显式声明仅查询 5 个安全公可字段：person_id, person_name, wechat_remark, platform_ids, trust_role。
-        严禁查询或输出 impression（角色印象）、birthday（生日）及 tags（私密标签）！
+        群聊场景下显式声明仅查询 5 个安全公开字段：person_id, person_name, wechat_remark, platform_ids, trust_role。
+        优先对齐群内真实成员与活跃发言人，严禁查询或输出 impression（角色印象）、birthday（生日）及 tags（私密标签）！
         """
-        rows = self.conn.execute(
+        active_set = set(active_sender_ids or [])
+        group_member_ids: set[str] = set()
+        if chat_id:
+            try:
+                cur = self.conn.execute("SELECT user_id FROM group_members WHERE group_id = ?", (chat_id,))
+                group_member_ids = {str(r[0]).strip() for r in cur.fetchall() if r[0]}
+            except Exception:
+                pass
+
+        all_candidate_rows = self.conn.execute(
             """
             SELECT person_id, person_name, wechat_remark, platform_ids, trust_role
             FROM person_info
-            ORDER BY CASE WHEN trust_role = 'OWNER' THEN 0 ELSE 1 END, person_id ASC
-            LIMIT ?
-            """,
-            (int(limit),),
+            """
         ).fetchall()
 
+        def sort_priority(r: Any) -> tuple[int, str]:
+            pid = str(r["person_id"] or "").strip()
+            role = str(r["trust_role"] or "").strip()
+            if role == "OWNER":
+                return (0, pid)
+            if pid in active_set:
+                return (1, pid)
+            if pid in group_member_ids:
+                return (2, pid)
+            return (3, pid)
+
+        sorted_rows = sorted(all_candidate_rows, key=sort_priority)[:int(limit)]
+
         lines: list[str] = []
-        for r in rows:
+        for r in sorted_rows:
             person_id = str(r["person_id"] or "").strip()
             person_name = str(r["person_name"] or "").strip() or "未知"
             wechat_remark = str(r["wechat_remark"] or "").strip()
@@ -304,7 +328,10 @@ class CompanionTruthDB:
                 "person_id", "person_name", "wechat_remark", "trust_role", "one_line_intro",
             )))
         else:
-            roster_lines = self._build_group_desensitized_roster()
+            roster_lines = self._build_group_desensitized_roster(
+                chat_id=chat_id,
+                active_sender_ids=active_sender_ids,
+            )
             roster_body = "\n".join(roster_lines) if roster_lines else "（暂无记录）"
             blocks.append(f"<重要角色索引>\n{roster_body}\n</重要角色索引>")
         events = self._catalog_rows(

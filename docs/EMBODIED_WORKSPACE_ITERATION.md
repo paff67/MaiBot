@@ -755,3 +755,185 @@ sequenceDiagram
 - `maibot-main.service`：运行健康，WebSocket、Planner 与各模块就绪；
 - `maibot-message-ingest.service`：实时稳定轮询，Cursor（当前已推进至 `38203`）毫秒级入库；
 - 小米 10 边缘节点：Frida 注入稳定，内存与 CPU 负载极低，无任何崩溃或重启。
+
+---
+
+## 九、 DMIT-US 生产真机全链路实测与 P0 修补报告（v2.0 闭环验收）
+
+> **维护基准分支**：`feat/embodied-workspace-phase3`  
+> **验证执行环境**：云端主脑 `DMIT-US`（`/opt/maibot-brain`，Ubuntu 24.04 LTS / Python 3.13.5）+ 手机边缘节点（小米 10）  
+> **交付状态**：阶段 1 至阶段 4 全部通过（5 项 Phase 3 单元测试 + 86 项全量 companion 回归测试 100% 全绿）
+
+---
+
+### 1. P0 缺陷根因剖析与本地修补对照
+
+在生产实机部署与集成前，代码审计与回归套件暴露了两处 P0 运行时阻断缺陷，已在本地开发分支彻底修复：
+
+| 缺陷编号 | 影响级别 | 现场崩溃/阻断现象 | 根因剖析与生产级修正方案 |
+| :--- | :--- | :--- | :--- |
+| **修补 1** | **P0 强约束阻断** | `maibot-main` 启动报 `TypeError: 插件 maibot-team.embodied-workspace 必须实现 on_config_update()` | `src/plugin_runtime/runner/plugin_loader.py#L672` 在加载插件时强校验 `type(instance).on_config_update is not MaiBotPlugin.on_config_update`。<br>在 `plugins/embodied_workspace/plugin.py` 中补齐 `on_config_update(self, scope, config_data, version)` 契约实现，支持动态重载与底层 `truth_writer` 的地址热同步；并将 `wechat_source` 默认值对齐现网边缘中继 `"http://100.87.39.37:8765"`。 |
+| **修补 2** | **P0 cgroups 失败** | `systemd-run --scope` 退出码 1：`Unknown assignment: OOMScoreAdjust=500` | `systemd 257` 中，`.scope` 作用域单元仅支持 `systemd.resource-control` 属性，不支持服务专用的 `systemd.exec(5)` 属性 `OOMScoreAdjust`。<br>在 `plugins/embodied_workspace/resource_quota.py` 中移除该属性，引入 `MemoryHigh=870M` 弹性流控，并在 root 环境下使用 `choom -n 500 --` 外部调整进程级 OOM 分数，实现 100% 成功注入配额。 |
+| **测试加固** | **测试环境隔离** | 单元测试并发执行时抛出 `OSError: [Errno 98] Address already in use: 18790` | 生产服务正在占用 18790 端口。在 `pytests/companion/test_embodied_workspace_phase3.py` 与 `phase2.py` 的测试配置中显式指定 `gateway_port: 0`，利用内核动态分配临时端口，彻底消除端口冲突。 |
+
+---
+
+### 2. 阶段 1：静态编译、Nginx 反代与网关端口健康检查（Live Phase 1）
+
+#### (1) 字节码语法编译核验
+在 `DMIT-US` 执行全目录字节码预编译：
+```bash
+python3 -m compileall -q src/platform_io/wechat src/companion_vault src/plugin_runtime plugins/embodied_workspace
+```
+输出结果：**0 错误，0 警告，全部源文件编译通过**。
+
+#### (2) Nginx Stream 443 泛域名反代与热重载
+`DMIT-US` 采用 443 端口 Stream `ssl_preread` 架构。在 `/etc/nginx/maibot.conf` 中追加了泛域名反代 server 块：
+```nginx
+server {
+    listen 80;
+    server_name ~^(?<subdomain>[a-z0-9_-]+)\.paff-67\.top$;
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+server {
+    listen 127.0.0.1:4443 ssl;
+    server_name ~^(?<subdomain>[a-z0-9_-]+)\.paff-67\.top$;
+
+    ssl_certificate /etc/nginx/ssl/cloudflare_origin.crt;
+    ssl_certificate_key /etc/nginx/ssl/cloudflare_origin.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    include /etc/nginx/cloudflare_ips.conf;
+    client_max_body_size 128m;
+
+    location / {
+        proxy_pass http://127.0.0.1:18790;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_read_timeout 3600;
+        proxy_send_timeout 3600;
+    }
+}
+```
+执行 `nginx -t` 语法检测通过，执行 `systemctl reload nginx` 平滑生效。
+
+#### (3) 主脑服务重启与端口监听确认
+执行 `systemctl restart maibot-main.service`，实测结果：
+- **监听端口状态**：
+  ```
+  LISTEN 0 128 127.0.0.1:18790 0.0.0.0:* users:(("python3",pid=199290,fd=11))
+  ```
+- **系统日志确认**（`journalctl -u maibot-main.service`）：
+  ```
+  [扩展插件] 已启动：pid=199290，RPC=/tmp/maibot-plugin-199277-f42466fd.sock，已加载=1（maibot-team.embodied-workspace），失败=0
+  [IPC插件系统] 已启动 2 个独立插件运行时：核心插件；扩展插件
+  All systems initialized. 许妍 has been awakened successfully.
+  ```
+- 确认无 `on_config_update` 异常，工作区网关与 `GroupRealtimeHub` 顺利启动。
+
+---
+
+### 3. 阶段 2：微信群聊 @提及 识别穿透与角色身份投影只读核验（Live Phase 2）
+
+使用独立只读脚本 `/tmp/live_verify_at_and_identity.py`（连接 `mode=ro` SQLite），执行实机数据断言：
+
+```
+=== 阶段 2：微信群聊 @提及 识别穿透与角色身份投影只读核验 ===
+
+[1/3] 验证联系人身份解耦 (wxid_ma7dkr0z5nnb22)...
+  ✓ 数据库原始记录: person_name=ì _eun, wechat_remark=R
+  ✓ 身份投影富化结果: sender_nickname=ì _eun, sender_cardname=R
+
+[2/3] 验证群聊真实入站消息 @提及 结构化拆分 (msg_id=143250)...
+  ✓ 原始消息: chat_id=45009933541@chatroom, raw_content='wxid_6zag2e8h0bpq22:\n@ì _eun\u2005'
+  ✓ 投影层中间段列表: [{'type': 'at', 'data': {'user_id': 'wxid_ma7dkr0z5nnb22', 'user_nickname': 'ì _eun(备注:R)'}}]
+  ✓ 成功反序列化 AtComponent: target_user_id=wxid_ma7dkr0z5nnb22, target_user_nickname=ì _eun(备注:R)
+
+[3/3] 验证群聊真值脱敏注入 (chat_id=45009933541@chatroom)...
+  ✓ 系统注入目录包含自身准则与群成员脱敏名册，且无私密信息泄露
+
+>>> 阶段 2 所有只读核验全部通过 (ALL CHECKS PASSED) <<<
+```
+
+- **脱敏名册核验**：群成员与活跃发言人优先排列在 `<重要角色索引>` 头部，仅公开 `person_id`、`person_name`、`wechat_remark`、`trust_role` 字段，绝对杜绝 `impression`、`birthday` 私密标签泄露。
+
+---
+
+### 4. 阶段 3：Phase 1~3 动态工作区核心机能四重实机核验（Live Phase 3）
+
+执行端到端实机探测脚本 `/tmp/live_verify_phase3.py`，四重核心机能 100% 达成：
+
+```
+=== 阶段 3：Phase 1~3 动态工作区核心机能四重核验 ===
+
+[1/4] 验证 cgroups v2 细粒度资源硬隔离...
+  ✓ memory.max = 1073741824
+  ✓ cpu.max = 150000 100000
+  ✓ oom_score_adj = 500
+  ✓ cgroups v2 配额生效核验通过
+
+[2/4] 验证泛域名 Nginx 反代与工作区元数据交付...
+  ✓ /_maibot/meta 返回: {'ok': True, 'title': 'Probe6 交付实测', 'summary': '用于生产泛域名反代与元数据透传验证', 'mode': 'static'}
+  ✓ 根路径 Cookie 鉴权与页面交付成功 (HTTP 200, index.html 内容匹配)
+
+[3/4] 验证 WebSocket 实时信令总线 (ping-pong 与 peer_broadcast)...
+  ✓ WS 首包握手: {'type': 'connected', 'token': 'probe6', 'project_slug': 'test_probe_project', 'actor_wxid': 'wxid_6zag2e8h0bpq22', 'online_count': 1}
+  ✓ WS Ping-Pong 应答: {'type': 'pong', 'ts': 1794219150.2546303}
+  ✓ WS Peer Broadcast 应答: {'type': 'peer_broadcast', 'actor_wxid': 'wxid_6zag2e8h0bpq22', 'event': 'state_sync', 'data': {'status': 'testing_phase3', 'progress': 100}, 'ts': 1794219150.2548842}
+  ✓ WebSocket 全双工实时通信核验通过
+
+[4/4] 验证 Google Drive FUSE 归档与 SHA256 一致性...
+  ✓ 归档模块返回文件: ['export_data.csv', 'index.html']
+  ✓ Google Drive 目标文件夹: /mnt/gdrive/companion_vault/workspace_archives/group_probe_chatroom/2026-11-09_probe6
+  ✓ manifest.json 记录数: 2
+  ✓ SHA256 校验通过: export_data.csv -> c15a2459df53...
+  ✓ SHA256 校验通过: index.html -> 99eb3abb6771...
+  ✓ 已清理 Google Drive 临时测试归档
+  ✓ 已清理临时工作区与测试路由
+
+>>> 阶段 3 四重核心机能核验全部通过 (ALL CHECKS PASSED) <<<
+```
+
+- **cgroups v2 探测**：通过 `/proc/self/cgroup` 寻址 scope 路径，精确读取到 `1073741824`（1024MB 硬上限）与 `150000 100000`（150% CPU 配额），进程级 `oom_score_adj` 精确锁定为 `500`。
+- **SNI 443 反代**：curl `--resolve probe6.paff-67.top:443:127.0.0.1` 成功触发 Nginx stream preread 路由至 127.0.0.1:4443，完成 TLS 握手并反代至 18790 网关，元数据与 HTML 页面准确交付。
+- **全双工 WebSocket**：跨会话鉴权接入，成功处理连接首包、高频 `ping/pong` 探活与群状态 `peer_broadcast` 广播。
+- **Google Drive 存储**：文件自动写入 FUSE 挂载点，`manifest.json` 完整记录文件尺寸与 SHA256 校验和，验证后完成安全清理，零残留。
+
+---
+
+### 5. 阶段 4：边缘驱动健康与零堆积归档核验（Live Phase 4）
+
+#### (1) 边缘游标健康度
+查询生产 SQLite 账本库：
+```sql
+SELECT driver_id, source, account, chat_id, seq FROM wechat_driver_cursors;
+```
+实测输出：
+- `driver_id`: `wechat.root.4d86ac1b06dd252fa3c7327eb5614865.722dd3c3d1fcc024f34c0330`
+- `source`: `http://100.87.39.37:8765`
+- `seq`: 持续推进至 **`38203`**
+- 守护进程状态：`maibot-message-ingest.service` 处于 **active (running)**，每 3 秒稳定轮询边缘节点，错误计数为 **0**。
+
+#### (2) 隔离区死信排查
+查询生产死信隔离区表：
+```sql
+SELECT COUNT(*) FROM wechat_driver_quarantine;
+```
+实测计数：**`0`**（系统运行平稳，零消息丢弃、零死信积压）。
+
+---
+
+### 6. 实测结论与交付总览
+
+至此，**具身微信 MaiBot 动态工作区系统（Phase 1~3）与微信群聊 @提及 穿透/身份投影重构**在生产云端节点 `DMIT-US` 与边缘手机节点（小米 10）完成生产级全链路闭环验证：
+1. **P0 缺陷全部消除**：插件生命周期契约对齐，资源配额参数合规。
+2. **全协议覆盖**：HTTP / HTTPS / WebSocket / Cloudflare 泛域名四重网络栈畅通无阻。
+3. **零隐私外溢**：严格遵守真值库 RBAC 红线，群聊名册与私密档案彻底解耦。
+4. **测试套件 100% 通过**：全量 86 项 companion 自动化测试全部绿色通行。

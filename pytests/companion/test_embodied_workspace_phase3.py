@@ -32,7 +32,7 @@ def test_resource_quota_system_vs_user_mode():
     )
     wrapper = ResourceQuotaWrapper(limits)
 
-    # 1. 模拟 root (system) 模式：必须包含 OOMScoreAdjust=500 与 CPU/Memory 硬限制
+    # 1. 模拟 root (system) 模式：验证 MemoryHigh/MemoryMax 与无非法 OOMScoreAdjust 属性
     wrapper._systemd_mode = "system"
     base_cmd = ["bwrap", "--ro-bind", "/", "/", "--", "echo", "hello"]
     cmd_system = wrapper.wrap_command(base_cmd, unit_prefix="test-unit")
@@ -40,10 +40,11 @@ def test_resource_quota_system_vs_user_mode():
     assert "--scope" in cmd_system
     assert "--collect" in cmd_system
     assert "--property=CPUQuota=150%" in cmd_system
+    assert f"--property=MemoryHigh={int(1024 * 0.85)}M" in cmd_system
     assert "--property=MemoryMax=1024M" in cmd_system
     assert "--property=MemorySwapMax=0" in cmd_system
     assert "--property=TasksMax=256" in cmd_system
-    assert "--property=OOMScoreAdjust=500" in cmd_system
+    assert not any("OOMScoreAdjust" in arg for arg in cmd_system)
     assert cmd_system[-len(base_cmd):] == base_cmd
 
     # 2. 模拟非 root (user) 模式：包含 --user 且绝对不包含 OOMScoreAdjust（避免内核权限拒绝）
@@ -53,6 +54,7 @@ def test_resource_quota_system_vs_user_mode():
     assert cmd_user[1] == "--user"
     assert "--scope" in cmd_user
     assert "--property=CPUQuota=150%" in cmd_user
+    assert f"--property=MemoryHigh={int(1024 * 0.85)}M" in cmd_user
     assert "--property=TasksMax=256" in cmd_user
     assert not any("OOMScoreAdjust" in arg for arg in cmd_user)
     assert cmd_user[-len(base_cmd):] == base_cmd
@@ -60,6 +62,43 @@ def test_resource_quota_system_vs_user_mode():
     # 3. 禁用配额时原样返回
     wrapper.limits.enabled = False
     assert wrapper.wrap_command(base_cmd) == base_cmd
+
+
+@pytest.mark.asyncio
+async def test_embodied_workspace_on_config_update(tmp_path: Path):
+    """验证插件实现 on_config_update 并能热更新 truth_writer 的配置"""
+    plugin = create_plugin()
+    mock_ctx = AsyncMock()
+    mock_ctx.call_capability = AsyncMock(return_value={"ok": True})
+    plugin.ctx = mock_ctx
+    plugin.set_plugin_config({
+        "plugin": {"config_version": "1.0.0"},
+        "workspaces_root": str(tmp_path / "workspaces"),
+        "router_db_path": str(tmp_path / "routes.db"),
+        "truth_db_path": str(tmp_path / "truth.db"),
+        "ledger_db_path": str(tmp_path / "ledger.db"),
+        "base_domain": "paff-67.top",
+        "gateway_port": 0,
+        "wechat_source": "http://100.87.39.37:8765",
+    })
+    await plugin.on_load()
+    assert plugin.truth_writer.wechat_source == "http://100.87.39.37:8765"
+
+    # 执行热更新
+    new_cfg = {
+        "plugin": {"config_version": "1.0.1"},
+        "workspaces_root": str(tmp_path / "workspaces"),
+        "router_db_path": str(tmp_path / "routes.db"),
+        "truth_db_path": str(tmp_path / "truth.db"),
+        "ledger_db_path": str(tmp_path / "ledger.db"),
+        "base_domain": "paff-67.top",
+        "wechat_source": "http://100.87.39.37:9999",
+        "wechat_account": "new_hash_123",
+    }
+    await plugin.on_config_update(scope="self", config_data=new_cfg, version="1.0.1")
+    assert plugin.truth_writer.wechat_source == "http://100.87.39.37:9999"
+    assert plugin.truth_writer.wechat_account == "new_hash_123"
+    await plugin.on_unload()
 
 
 # ---------------------------------------------------------------------------
@@ -115,6 +154,7 @@ async def test_time_machine_single_dir_evolution_and_rollback(tmp_path: Path):
         "truth_db_path": str(tmp_path / "truth.db"),
         "ledger_db_path": str(tmp_path / "ledger.db"),
         "base_domain": "paff-67.top",
+        "gateway_port": 0,
     })
     await plugin.on_load()
 
@@ -330,6 +370,7 @@ async def test_manage_workspace_projects_catalog_isolation(tmp_path: Path):
         "truth_db_path": str(tmp_path / "truth.db"),
         "ledger_db_path": str(tmp_path / "ledger.db"),
         "base_domain": "paff-67.top",
+        "gateway_port": 0,
     })
     await plugin.on_load()
 
