@@ -270,10 +270,13 @@ class PluginMessageUtils:
             item_data = item.get("data", {})
             if not isinstance(item_data, dict):
                 item_data = {}
+            target_uid = str(item_data.get("target_user_id") or item_data.get("user_id") or "")
+            target_nick = item_data.get("target_user_nickname") or item_data.get("user_nickname")
+            target_card = item_data.get("target_user_cardname") or item_data.get("user_cardname")
             return AtComponent(
-                target_user_id=str(item_data.get("target_user_id") or ""),
-                target_user_nickname=PluginMessageUtils._normalize_optional_string(item_data.get("target_user_nickname")),
-                target_user_cardname=PluginMessageUtils._normalize_optional_string(item_data.get("target_user_cardname")),
+                target_user_id=target_uid,
+                target_user_nickname=PluginMessageUtils._normalize_optional_string(target_nick),
+                target_user_cardname=PluginMessageUtils._normalize_optional_string(target_card),
             )
 
         if item_type == "reply":

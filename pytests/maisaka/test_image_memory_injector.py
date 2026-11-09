@@ -16,6 +16,7 @@ async def test_image_memory_injector_uses_current_occurrence_and_expands_memory(
         raw_message=SimpleNamespace(components=[component]),
     )
 
+    monkeypatch.setattr(image_injector_module.global_config.a_memorix.image_memory, "enabled", True)
     monkeypatch.setattr(
         image_injector_module,
         "iter_message_image_components",
@@ -61,6 +62,7 @@ async def test_image_memory_injector_uses_current_occurrence_and_expands_memory(
 async def test_image_memory_injector_does_not_hide_service_timeout(monkeypatch) -> None:
     component = SimpleNamespace(binary_hash="sha256-current")
     message = SimpleNamespace(message_id="message-1", raw_message=SimpleNamespace(components=[component]))
+    monkeypatch.setattr(image_injector_module.global_config.a_memorix.image_memory, "enabled", True)
     monkeypatch.setattr(
         image_injector_module,
         "iter_message_image_components",

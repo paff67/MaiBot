@@ -381,7 +381,7 @@ def test_route_c_ledger_consumer_and_truth_enrichment(tmp_path):
         assert len(envelopes) == 1
         user_info = envelopes[0].payload["message_info"]["user_info"]
         assert user_info["user_id"] == "wxid_test"
-        assert user_info["user_nickname"] == "明哥"
+        assert user_info["user_nickname"] == "小明"
         assert user_info["user_cardname"] == "明哥"
 
     try:

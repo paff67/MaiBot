@@ -217,9 +217,58 @@ class CompanionTruthDB:
             f"SELECT {columns} FROM {table} WHERE {condition} ORDER BY {order}"
         )]
 
+    def _render_self_identity_anchor(self, self_wxid: str = "wxid_w5d0efdxczt322") -> str:
+        """[修复断点 4] 明确告知模型自身底层微信 ID 与他指排他规则"""
+        return (
+            "<自身账号与提及判定准则>\n"
+            f"- 你的唯一本名/群名片：许妍（别名：妍妍、小妍） | 你的底层微信ID：{self_wxid}\n"
+            f"- 提及(@)严格判定规则：仅当消息包含指向 '{self_wxid}' 的 @提及 或明确文本 '@许妍'/'@妍妍'/'@小妍' 时，才是在 @ 你本人。\n"
+            "- 当消息中出现 '@其他名字'（例如 '@ì _eun' 等）时，那是群成员在 @ 群内的其他群友（可通过下方<重要角色索引>核对其微信昵称与备注名的对应关系），绝不是你的底层代号，切勿将他人的微信昵称误认为自己！\n"
+            "</自身账号与提及判定准则>"
+        )
+
+    def _build_group_desensitized_roster(self, limit: int = 50) -> list[str]:
+        """
+        [v1.1 修正 P1 - 严格遵守 RBAC 红线]
+        群聊场景下显式声明仅查询 5 个安全公可字段：person_id, person_name, wechat_remark, platform_ids, trust_role。
+        严禁查询或输出 impression（角色印象）、birthday（生日）及 tags（私密标签）！
+        """
+        rows = self.conn.execute(
+            """
+            SELECT person_id, person_name, wechat_remark, platform_ids, trust_role
+            FROM person_info
+            ORDER BY CASE WHEN trust_role = 'OWNER' THEN 0 ELSE 1 END, person_id ASC
+            LIMIT ?
+            """,
+            (int(limit),),
+        ).fetchall()
+
+        lines: list[str] = []
+        for r in rows:
+            person_id = str(r["person_id"] or "").strip()
+            person_name = str(r["person_name"] or "").strip() or "未知"
+            wechat_remark = str(r["wechat_remark"] or "").strip()
+            trust_role = str(r["trust_role"] or "GROUP_MEMBER").strip()
+            lines.append(
+                f"[角色ID: {person_id}] 备注名: {wechat_remark or '无'} | 微信昵称: {person_name} | 身份: {trust_role}"
+            )
+        return lines
+
     def build_planner_catalog_injection(
-        self, *, is_group_chat: bool, sender_trust_role: str, include_unscoped_media_and_events: bool = True,
+        self,
+        *,
+        is_group_chat: bool,
+        sender_trust_role: str,
+        include_unscoped_media_and_events: bool = True,
+        chat_id: str = "",
+        active_sender_ids: set[str] | None = None,
     ) -> str:
+        """
+        [v1.1 修正 P1] 保留全向向下兼容签名（chat_id 与 active_sender_ids 均带默认值），
+        确保现网 test_quote_context.py、test_memory_consolidation.py 等测试模块零改动通过。
+        """
+        blocks: list[str] = [self._render_self_identity_anchor()]
+
         owner = not is_group_chat and sender_trust_role == "OWNER"
         visibility = "1=1" if owner else "visibility = 'PUBLIC'"
         # 全局屏幕和位置没有 visibility 字段，不能作为公共状态披露。
@@ -230,15 +279,20 @@ class CompanionTruthDB:
                 f"SELECT * FROM quests_events WHERE status = 'ongoing' AND {visibility} ORDER BY quest_code"
             )],
         }
-        blocks = ["<全局与实时状态>\n" + json.dumps(state, ensure_ascii=False) + "\n</全局与实时状态>"]
-        # 人物印象与平台身份没有公共可见性标记，仅在 OWNER 私聊中展示与点亮。
-        people = self._catalog_rows(
-            "person_info", "person_id, person_name, wechat_remark, trust_role, one_line_intro",
-            "1=1", "person_id",
-        ) if owner else []
-        blocks.append(_render_catalog("重要角色索引", people, (
-            "person_id", "person_name", "wechat_remark", "trust_role", "one_line_intro",
-        )))
+        blocks.append("<全局与实时状态>\n" + json.dumps(state, ensure_ascii=False) + "\n</全局与实时状态>")
+
+        if owner:
+            people = self._catalog_rows(
+                "person_info", "person_id, person_name, wechat_remark, trust_role, one_line_intro",
+                "1=1", "person_id",
+            )
+            blocks.append(_render_catalog("重要角色索引", people, (
+                "person_id", "person_name", "wechat_remark", "trust_role", "one_line_intro",
+            )))
+        else:
+            roster_lines = self._build_group_desensitized_roster()
+            roster_body = "\n".join(roster_lines) if roster_lines else "（暂无记录）"
+            blocks.append(f"<重要角色索引>\n{roster_body}\n</重要角色索引>")
         events = self._catalog_rows(
             "chronicle_events", "code_index, time_span, summary, trigger_when, related_files, tk_estimate",
             f"status = 'active' AND {visibility} AND code_index NOT IN (SELECT code_index FROM memory_provenance)", "CAST(SUBSTR(code_index, 3) AS INTEGER) DESC, code_index DESC",

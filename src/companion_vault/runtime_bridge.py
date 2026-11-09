@@ -63,6 +63,7 @@ async def build_planner_truth_catalog_async(
                 is_group_chat=is_group_chat,
                 sender_trust_role=_resolve_trust_role(db, "", user_id, platform),
                 include_unscoped_media_and_events=(platform != "wechat"),
+                chat_id=chat_id,
             )
             if platform == "wechat" and anchor_message_id:
                 from .wechat_recall import memory_scope

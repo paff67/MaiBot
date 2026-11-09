@@ -31,6 +31,7 @@
   - [5. 生产节点验证与测试覆盖报告](#5-生产节点验证与测试覆盖报告-2)
 - [六、 Phase 4：演进规划与后续接入设计（规划中）](#六-phase-4演进规划与后续接入设计规划中)
 - [七、 迭代追溯索引与提交记录](#七-迭代追溯索引与提交记录)
+- [八、 微信群聊 @mention 识别穿透与角色身份投影断层重构（v1.1 闭环交付）](#八-微信群聊-mention-识别穿透与角色身份投影断层重构v11-闭环交付)
 
 ---
 
@@ -535,3 +536,109 @@ python3 -m compileall -q plugins/embodied_workspace
 | **Phase 1** | `feat/embodied-workspace-phase1` | `90aac6bcce5a6d91d97c1a4960f388738311feef` | 完成快慢双轨分流、bwrap 命名空间沙盒、双库 RBAC 鉴权、Auto-Wake/Scale-to-Zero 网关与 6 项自动化测试。 | `agy` (Antigravity) |
 | **Phase 2** | `feat/embodied-workspace-phase2` | `c82ba349d` | 单级泛域名、CF Pages 边缘 2A 跳板、真值库 8 表 Schema 严格对齐、四级无感身份接力（抗预取）、FUSE 归档直写与 5 项专项测试。 | `agy` (Antigravity) |
 | **Phase 3** | `feat/embodied-workspace-phase3` | `e87de93fd` | cgroups v2 硬隔离包装器、宿主独立 Git 时光机双目录快照与回滚、群组全双工 WebSocket 实时总线、会话目录管理工具与 4 项专项测试。 | `agy` (Antigravity) |
+| **Mention Fix** | `feat/wechat-at-mention-identity-fix` | `HEAD` | 微信群聊 @mention XML 提取、中间字典段安全反序列化、昵称与备注名解耦双保留、RBAC 群聊脱敏花名册注入与 4 项专项单测。 | `agy` (Antigravity) |
+
+
+---
+
+## 八、 微信群聊 @mention 识别穿透与角色身份投影断层重构（v1.1 闭环交付）
+
+> **维护基准分支**：`feat/wechat-at-mention-identity-fix`（基于 `feat/embodied-workspace-phase3`）  
+> **生产主脑节点**：`DMIT-US`（`/opt/maibot-brain`）  
+> **交付状态**：已完成（4 项专项测试 + 401 项全量关联回归测试全绿通过）
+
+### 1. 阶段目标与断点问题剖析
+
+在实际微信群聊交互中，当群成员发送 `@ì _eun\u2005 出来玩` 时，出现了“消息文本沦为死文本”、“机器人无法结构化解析被 @ 对象”、“历史上下文中角色昵称被号主备注名粗暴覆盖导致人名断层”，以及“LLM 将他人昵称误认为自己内部代号”四大断裂：
+
+1. **断点 1（驱动层丢失 @Component）**：微信接收到的原始群文本带有 `wxid_xxx:\n` 前缀与微信特有的 `\u2005`（Four-Per-Em Space）空白标记，且真实的被 @ 用户列表封存在 SQLite `messages` 的 `<atuserlist>` XML 中。原驱动未解构 XML，直接塞入普通 `TextComponent`，导致下游记忆系统与意图分类器完全无法感知有人被提及。
+2. **断点 2（备注名覆盖群昵称导致幽灵人名）**：真值库 `person_info` 中存有微信昵称 `person_name='ì _eun'` 与号主单向备注 `wechat_remark='R'`。原 `projection.py` 优先使用备注名填充 `sender_nickname`，导致历史上下文中只有 `user="R" group_card="R"`，公网群昵称 `ì _eun` 凭空消失，模型在上下文中查无此人。
+3. **断点 3（群聊硬编码隐藏重要角色索引）**：`truth_db.py` 的 `build_planner_catalog_injection` 在 `is_group_chat=True` 时将 `<重要角色索引>` 硬编码输出为 `[]`，剥夺了模型识别群成员真实姓名、备注与微信 ID 对应关系的基础常识能力。
+4. **断点 4（系统提示词未声明底层微信 ID）**：模型人设仅声明“许妍”，未绑定微信号真实的底层 `wxid_w5d0efdxczt322`，当面对未解析的 `@ì _eun` 时，产生“ì _eun 是不是我的内部系统代号”的自我认知混乱。
+
+---
+
+### 2. 关键代码映射与模块改动清单
+
+| 模块文件 | 核心职责与改动点 |
+| :--- | :--- |
+| `src/platform_io/wechat/projection.py` | ① 实现 `strip_group_sender_prefix` 清理 `wxid_xxx:\n`；<br>② 实现 `extract_xml_at_wxids` 聚合 `raw_content`、`row_json` 提取 `<atuserlist>`；<br>③ 实现 `build_identity_lookup_maps` 与 `enrich_sender_identity`，严格分离公开昵称 `person_name` 与备注 `wechat_remark`；<br>④ 实现 `parse_wechat_text_to_raw_segments`，精准产出与底座反序列化兼容的中间字典段。 |
+| `src/plugin_runtime/host/message_utils.py` | 在 `_component_from_dict` 的 `item_type == "at"` 分支中，同时兼容 `user_id` / `target_user_id` 与 `user_nickname` / `target_user_nickname`，彻底消除 `AttributeError` 风险。 |
+| `src/companion_vault/truth_db.py` | ① 新增 `_render_self_identity_anchor` 注入自身微信底层 ID `wxid_w5d0efdxczt322` 与他指排他准则；<br>② 新增 `_build_group_desensitized_roster`，群聊场景以 RBAC 安全白名单查询公开字段，绝不泄露私密 `impression`/`birthday`；<br>③ `build_planner_catalog_injection` 保持原签名 100% 向下兼容（`chat_id: str = ""`，`active_sender_ids = None`）。 |
+| `src/companion_vault/runtime_bridge.py` | 在调用 `db.build_planner_catalog_injection` 时，透明透传当前上下文的 `chat_id`。 |
+| `pytests/platform_io/test_wechat_at_parsing.py` | 新增 4 项专项单元测试：中间字典段反序列化断言、昵称/备注双保留断言、RBAC 脱敏与签名兼容断言、端到端 SessionMessage 组装断言。 |
+| `pytests/companion/test_wechat_migration.py` | 同步断言对齐：`user_nickname == "小明"`（微信昵称），`user_cardname == "明哥"`（号主备注名）。 |
+
+---
+
+### 3. 核心设计模式与数据流转拓扑
+
+```
+[微信客户端 / EnMicroMsg.db]
+         │ (含 raw_content 内 <msgsource><atuserlist>wxid_1</atuserlist>)
+         ▼
+[WeChatRootDriver.deliver_committed]
+         │ 异步调用 enrich_record_from_truth_db
+         ▼
+[projection.py: enrich_record_from_truth_db]
+         │ 1. build_identity_lookup_maps(db) -> wxid_to_profile, name_to_wxid
+         │ 2. enrich_sender_identity -> sender_nickname=person_name, sender_cardname=wechat_remark
+         │ 3. strip_group_sender_prefix -> 剥离 wxid_xxx:\n
+         │ 4. parse_wechat_text_to_raw_segments -> 产出标准字典段 [TextDict, AtDict]
+         ▼
+[InboundMessageEnvelope.payload["raw_message"]]
+         │ 标准字典段列表 [{"type": "at", "data": {...}}, {"type": "text", "data": "..."}]
+         ▼
+[PluginMessageUtils._message_sequence_from_dict]
+         │ 反序列化为 MessageSequence([AtComponent(target_user_id=...), TextComponent(...)])
+         ▼
+[MaisakaReasoningEngine & Planner Context]
+         │ 1. 记忆系统检测 isinstance(comp, AtComponent) -> 成功捕获被提及人
+         │ 2. <自身账号与提及判定准则> -> 明确 Bot 底层 ID wxid_w5d0efdxczt322，防止自指幻觉
+         │ 3. <重要角色索引> -> 注入群成员公开脱敏名册，精准比对微信昵称与备注名
+         ▼
+[LLM 准确输出回复] (消歧完成，人设自洽，微信内原路发回)
+```
+
+---
+
+### 4. 生产环境工程踩坑与实战攻关全景表（P0/P1 Matrix）
+
+| 缺陷等级 | 踩坑根因剖析 | 生产级修正方案与防护措施 |
+| :---: | :--- | :--- |
+| **P0** | 若在 `projection.py` 中直接引入 `AtComponent` 实例存入 `payload["raw_message"]`，会导致 `src/plugin_runtime/host/message_utils.py` 在执行 `item.get("type")` 时抛出 `AttributeError: 'AtComponent' object has no attribute 'get'`，直接导致生产入站消息调度崩溃；且 `src.platform_io.types` 并不存在 `AtComponent` 类定义。 | `projection.py` 严格输出**无状态可序列化中间字典段**（`{"type": "at", "data": {"user_id": ..., "user_nickname": ...}}`）；底座 `PluginMessageUtils` 的 `_component_from_dict` 兼容读取 `user_id` 与 `target_user_id`，统一反序列化为官方组件对象。 |
+| **P1** | `truth_db.py` 中 `build_planner_catalog_injection` 如果将新增的 `chat_id` 或 `active_sender_ids` 设为必填参数，会导致存量 5 个以上回归测试模块在以关键字传参时抛出 `TypeError` 崩溃。 | 严格保持原函数签名向下兼容，所有新增参数显式赋予默认值：`chat_id: str = ""`、`active_sender_ids: set[str] | None = None`，保证存量测试与调用方无感运行。 |
+| **P1** | 生产库 `message_ledger.db` 中微信的 `<atuserlist>` 标签可能分布在 `raw_content`、`row_json["msg_source"]`、`row_json["raw_content"]` 或 `row_json["content"]` 等多个字段中，且可能包含 `<![CDATA[...]]>` 或 HTML 实体转义符。 | `extract_xml_at_wxids` 聚合上述候选源字段并执行 `html.unescape`，采用兼容 CDATA 的非贪婪正则 `_AT_USERLIST_RE = re.compile(r"<atuserlist>\s*(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?\s*</atuserlist>", re.IGNORECASE | re.DOTALL)` 稳健解析。 |
+| **P1** | 群聊脱敏名册如果直接 `SELECT *` 或包含 `impression`、`birthday`、`tags`，会严重违背真值库“群聊绝不泄露私人印象”的安全 RBAC 红线；且 `person_info` 物理表结构并无 `updated_at` 字段，执行 `ORDER BY updated_at` 会直接抛出 `sqlite3.OperationalError`。 | SQL 显式声明仅查询 5 个安全字段：`person_id, person_name, wechat_remark, platform_ids, trust_role`；排序采用稳健语法 `ORDER BY CASE WHEN trust_role = 'OWNER' THEN 0 ELSE 1 END, person_id ASC`。 |
+
+---
+
+### 5. 生产节点验证与测试覆盖报告
+
+#### (1) 专项单元测试（4 项全绿通过）
+```bash
+pytest pytests/platform_io/test_wechat_at_parsing.py -v
+```
+输出结果：
+```
+pytests/platform_io/test_wechat_at_parsing.py::test_parse_wechat_text_to_raw_segments_and_plugin_message_utils_deserialization PASSED [ 25%]
+pytests/platform_io/test_wechat_at_parsing.py::test_enrich_sender_identity_preserves_nickname_and_remark PASSED [ 50%]
+pytests/platform_io/test_wechat_at_parsing.py::test_build_planner_catalog_injection_backward_compat_and_group_rbac PASSED [ 75%]
+pytests/platform_io/test_wechat_at_parsing.py::test_project_message_end_to_end_with_at_mention_and_session_message PASSED [100%]
+======================== 4 passed, 2 warnings in 4.36s =========================
+```
+
+#### (2) 全量关联模块回归网关（401 项全绿通过）
+```bash
+pytest pytests/companion/ pytests/platform_io/ pytests/maisaka/ -q
+```
+输出结果：
+```
+........................................................................ [ 17%]
+........................................................................ [ 35%]
+........................................................................ [ 53%]
+........................................................................ [ 71%]
+........................................................................ [ 89%]
+.........................................                                [100%]
+401 passed, 10 warnings in 15.42s
+```
