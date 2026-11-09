@@ -309,18 +309,24 @@ class CompanionTruthDB:
         total_spent = 0.0
         tier_code = "STANDARD"
         active_slot = "flash_primary"
+        active_job_summary = ""
         try:
             cols = {
                 str(r["name"])
                 for r in self.conn.execute("PRAGMA table_info(global_state)").fetchall()
             }
             if "fairy_remote_balance_usd" in cols:
+                select_cols = [
+                    "fairy_remote_balance_usd",
+                    "fairy_unsettled_cost_usd",
+                    "fairy_total_spent_usd",
+                    "fairy_compute_tier",
+                    "active_sister",
+                ]
+                if "fairy_active_job_summary" in cols:
+                    select_cols.append("fairy_active_job_summary")
                 row = self.conn.execute(
-                    """
-                    SELECT fairy_remote_balance_usd, fairy_unsettled_cost_usd,
-                           fairy_total_spent_usd, fairy_compute_tier, active_sister
-                    FROM global_state WHERE row_id = 1
-                    """
+                    f"SELECT {', '.join(select_cols)} FROM global_state WHERE row_id = 1"
                 ).fetchone()
                 if row:
                     remote_bal = float(row["fairy_remote_balance_usd"] or 5.0)
@@ -328,6 +334,8 @@ class CompanionTruthDB:
                     total_spent = float(row["fairy_total_spent_usd"] or 0.0)
                     tier_code = str(row["fairy_compute_tier"] or "STANDARD")
                     active_slot = str(row["active_sister"] or "flash_primary")
+                    if "fairy_active_job_summary" in cols:
+                        active_job_summary = str(row["fairy_active_job_summary"] or "").strip()
         except Exception:
             pass
 
@@ -341,16 +349,21 @@ class CompanionTruthDB:
         tier_label = tier_label_map.get(tier_code, "日常标准态")
         is_owner_private = (not is_group_chat) and (sender_trust_role.upper() == "OWNER")
 
+        active_job_line = f"- 后台慢轨长程任务：{active_job_summary}\n" if active_job_summary else ""
+
         if is_owner_private:
             return (
                 "<算力工况与工作区状态 (Owner私聊视图)>\n"
                 f"- 算力工况档位：{tier_label} ({tier_code}) | 当前模型槽位：{active_slot}\n"
                 f"- 实时算力可用余额：${effective_bal:.2f} USD | 累计消耗总额：${total_spent:.2f} USD\n"
+                f"{active_job_line}"
                 "</算力工况与工作区状态>"
             )
+        group_job_line = "- 后台慢轨任务：正在执行长程调研/构建中\n" if active_job_summary else ""
         return (
             "<工作区运行状态>\n"
             f"- 算力工况档位：{tier_label} ({tier_code}) | 当前模型槽位：{active_slot}\n"
+            f"{group_job_line}"
             "</工作区运行状态>"
         )
 

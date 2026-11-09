@@ -118,7 +118,8 @@ class CLIBridge:
         wechat_source: str,
         wechat_account: str,
         cli_backend: str = "agy",
-        timeout_seconds: int = 180,
+        timeout_seconds: int = 10800,
+        progress_report_interval_seconds: int = 180,
         quota_wrapper: ResourceQuotaWrapper | None = None,
         time_machine: WorkspaceTimeMachine | None = None,
     ) -> None:
@@ -129,6 +130,7 @@ class CLIBridge:
         self.wechat_account = wechat_account
         self.cli_backend = cli_backend
         self.timeout_seconds = timeout_seconds
+        self.progress_report_interval_seconds = progress_report_interval_seconds
         self.quota_wrapper = quota_wrapper
         self.time_machine = time_machine
         self.workspaces_root.mkdir(parents=True, exist_ok=True)
@@ -360,7 +362,56 @@ class CLIBridge:
 """
         (ws_dir / "AGENTS.md").write_text(content, encoding="utf-8")
 
-    async def run_cli_job(self, req: WorkspaceJobRequest) -> WorkspaceJobResult:
+    @staticmethod
+    def inspect_project_progress(
+        project_dir: Path,
+        dist_dir: Path,
+        recent_lines: list[str],
+        elapsed_sec: int,
+    ) -> str:
+        """根据沙箱目录产物与最新日志摘要客观提炼当前任务进度。"""
+        if (dist_dir / "index.html").exists():
+            return "已生成初版页面 (index.html)，正在完善样式排版与检查交付项"
+
+        if project_dir.exists():
+            entries = [
+                p for p in project_dir.iterdir()
+                if p.name not in ("build.log", ".git") and not p.name.startswith(".")
+            ]
+            if entries:
+                entries.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+                newest = entries[0]
+
+                data_files = [p for p in entries if p.suffix.lower() in (".json", ".csv", ".xml", ".parquet")]
+                script_files = [p for p in entries if p.suffix.lower() in (".py", ".sh", ".js", ".ts")]
+                doc_files = [p for p in entries if p.suffix.lower() in (".md", ".txt", ".html")]
+
+                if doc_files and doc_files[0].stat().st_size > 0:
+                    return f"正在撰写长文正文与结构排版（最新产物：{doc_files[0].name}）"
+
+                if data_files and data_files[0].stat().st_size > 0:
+                    size_kb = max(1, data_files[0].stat().st_size // 1024)
+                    return f"已采集关键研究素材（已生成 {data_files[0].name} 约 {size_kb}KB），正在进行数据清洗与交叉提炼"
+
+                if script_files:
+                    return f"正在编写并执行数据检索与调研脚本（最新脚本：{script_files[0].name}）"
+
+                return f"正在工作区进行代码与资料处理（最新文件：{newest.name}）"
+
+        if recent_lines:
+            last_line = recent_lines[-1]
+            clean_line = re.sub(r"\x1b\[[0-9;]*m", "", last_line).strip()
+            if clean_line:
+                return f"正在后台执行研究任务（最新动态：{clean_line[:80]}）"
+
+        elapsed_min = max(1, elapsed_sec // 60)
+        return f"沙箱正在执行中（已运行 {elapsed_min} 分钟），正在进行任务规划与网络检索"
+
+    async def run_cli_job(
+        self,
+        req: WorkspaceJobRequest,
+        progress_callback: Callable[[str, int], Awaitable[None]] | None = None,
+    ) -> WorkspaceJobResult:
         ws_dir = self.get_chat_workspace(req.chat_id)
         slug = self.safe_id(req.project_slug)
         lock_key = (self.safe_id(req.chat_id), slug)
@@ -421,7 +472,7 @@ class CLIBridge:
                 proc = await asyncio.create_subprocess_exec(
                     *cmd,
                     stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
                     start_new_session=True,
                     env=build_sandbox_env(),
                 )
@@ -433,14 +484,71 @@ class CLIBridge:
             except Exception as exc:
                 return WorkspaceJobResult(ok=False, error_message=f"启动沙箱执行失败: {exc}")
 
+            build_log = project_dir / "build.log"
+            recent_lines: list[str] = []
+
+            async def _stream_reader() -> None:
+                try:
+                    with open(build_log, "a", encoding="utf-8", errors="ignore") as lf:
+                        while True:
+                            line = await proc.stdout.readline()
+                            if not line:
+                                break
+                            text = line.decode("utf-8", errors="ignore")
+                            lf.write(text)
+                            lf.flush()
+                            clean = text.strip()
+                            if clean:
+                                recent_lines.append(clean)
+                                if len(recent_lines) > 50:
+                                    recent_lines.pop(0)
+                except Exception:
+                    pass
+
+            reader_task = asyncio.create_task(_stream_reader())
+
+            async def _progress_monitor_loop() -> None:
+                start_time = time.monotonic()
+                last_report_time = start_time
+                last_reported_status = ""
+                initial_delay = min(self.progress_report_interval_seconds, 60)
+                await asyncio.sleep(initial_delay)
+                while proc.returncode is None:
+                    now = time.monotonic()
+                    elapsed_sec = int(now - start_time)
+                    if (now - last_report_time) >= self.progress_report_interval_seconds:
+                        status = self.inspect_project_progress(project_dir, dist_dir, recent_lines, elapsed_sec)
+                        if status and status != last_reported_status:
+                            last_reported_status = status
+                            last_report_time = now
+                            if progress_callback:
+                                try:
+                                    await progress_callback(status, elapsed_sec)
+                                except Exception:
+                                    pass
+                    await asyncio.sleep(15)
+
+            monitor_task = asyncio.create_task(_progress_monitor_loop()) if progress_callback else None
+
             try:
-                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=self.timeout_seconds)
+                await asyncio.wait_for(proc.wait(), timeout=self.timeout_seconds)
             except asyncio.TimeoutError:
                 try:
                     os.killpg(proc.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
                 return WorkspaceJobResult(ok=False, error_message=f"构建超时（超过 {self.timeout_seconds} 秒）")
+            finally:
+                if monitor_task:
+                    monitor_task.cancel()
+                    try:
+                        await monitor_task
+                    except asyncio.CancelledError:
+                        pass
+                try:
+                    await reader_task
+                except Exception:
+                    pass
 
             result_file = dist_dir / "result.json"
             index_file = dist_dir / "index.html"
@@ -457,7 +565,7 @@ class CLIBridge:
             archive_files = meta.get("archive_files") if isinstance(meta.get("archive_files"), list) else []
 
             if mode == "static" and not index_file.exists():
-                tail = stderr.decode("utf-8", errors="ignore")[-300:]
+                tail = "\n".join(recent_lines[-10:])[-300:]
                 return WorkspaceJobResult(ok=False, error_message=f"静态模式未产出 index.html (code={proc.returncode}): {tail}")
             if mode == "backend" and not start_cmd:
                 return WorkspaceJobResult(ok=False, error_message="后端模式未在 result.json 中声明有效的 start_cmd")

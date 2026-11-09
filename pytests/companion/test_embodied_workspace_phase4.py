@@ -316,4 +316,100 @@ def test_truth_db_twins_background_and_public_private_isolation(tmp_path: Path):
         assert forbidden not in owner_injection
         assert forbidden not in group_injection
 
+    # 4. 验证运行中慢轨长程任务的动态状态投影
+    with truth_db.conn:
+        truth_db.conn.execute(
+            """
+            ALTER TABLE global_state ADD COLUMN fairy_active_job_summary TEXT DEFAULT ''
+            """
+        )
+        truth_db.conn.execute(
+            """
+            UPDATE global_state SET fairy_active_job_summary = '项目【doc-jensen】已运行 3 分钟：已生成调研脚本与数据集'
+            WHERE row_id = 1
+            """
+        )
+
+    owner_injection_active = truth_db.build_planner_catalog_injection(
+        is_group_chat=False,
+        sender_trust_role="OWNER",
+    )
+    assert "- 后台慢轨长程任务：项目【doc-jensen】已运行 3 分钟：已生成调研脚本与数据集" in owner_injection_active
+
+    group_injection_active = truth_db.build_planner_catalog_injection(
+        is_group_chat=True,
+        sender_trust_role="GROUP_MEMBER",
+        chat_id="test_room@chatroom",
+    )
+    assert "- 后台慢轨任务：正在执行长程调研/构建中" in group_injection_active
+
     truth_db.close()
+
+
+@pytest.mark.asyncio
+async def test_3_hours_timeout_and_progress_monitoring_and_hook_compatibility(tmp_path: Path):
+    ws_root = tmp_path / "workspaces"
+    truth_db_path = tmp_path / "truth.db"
+    truth_db = CompanionTruthDB(str(truth_db_path))
+    truth_db.close()
+
+    plugin = create_plugin()
+    plugin.config.workspaces_root = str(ws_root)
+    plugin.config.truth_db_path = str(truth_db_path)
+    plugin.config.base_domain = "paff-67.top"
+
+    # 1. 验证默认超时为 3 小时 (10800 秒)
+    assert plugin.config.cli_timeout_seconds == 10800
+    bridge = CLIBridge(
+        workspaces_root=ws_root,
+        truth_db_path=truth_db_path,
+        ledger_db_path=tmp_path / "ledger.db",
+        wechat_source="http://100.87.39.37:8765",
+        wechat_account="test_acc",
+    )
+    assert bridge.timeout_seconds == 10800
+
+    # 2. 验证 inspect_project_progress 进度提炼逻辑
+    proj_dir = ws_root / "test_chat" / "projects" / "test_proj"
+    dist_dir = ws_root / "test_chat" / "dist" / "test_proj"
+    proj_dir.mkdir(parents=True, exist_ok=True)
+    dist_dir.mkdir(parents=True, exist_ok=True)
+
+    # (a) 初始状态只有脚本
+    (proj_dir / "fetch_news.py").write_text("print('hello')", encoding="utf-8")
+    status1 = bridge.inspect_project_progress(proj_dir, dist_dir, [], 30)
+    assert "正在编写并执行数据检索与调研脚本" in status1
+
+    # (b) 数据集抓取完成
+    (proj_dir / "raw_search.json").write_text("{" * 2048, encoding="utf-8")
+    status2 = bridge.inspect_project_progress(proj_dir, dist_dir, [], 60)
+    assert "已采集关键研究素材" in status2
+    assert "raw_search.json" in status2
+
+    # (c) 初版页面产出
+    (dist_dir / "index.html").write_text("<h1>Report</h1>", encoding="utf-8")
+    status3 = bridge.inspect_project_progress(proj_dir, dist_dir, [], 90)
+    assert "已生成初版页面 (index.html)" in status3
+
+    # 3. 验证 protect_subdomain_url_hook 兼容 Runner kwargs 调用（不再报 missing event 异常）
+    runner_kwargs_res = await plugin.protect_subdomain_url_hook(
+        response="任务已完成，访问：https://abc123xyz789.paff-67.top",
+        session_id="sess_01",
+        reply_message_id="msg_01",
+        enable_chinese_typo=True,
+        enable_splitter=True,
+    )
+    assert runner_kwargs_res["action"] == "continue"
+    assert runner_kwargs_res["modified_kwargs"]["enable_chinese_typo"] is False
+    assert runner_kwargs_res["modified_kwargs"]["enable_splitter"] is False
+
+    # 4. 验证 protect_subdomain_url_hook 兼容旧版单一 dict 传参
+    legacy_dict_res = await plugin.protect_subdomain_url_hook(
+        {
+            "response": "任务已完成，访问：https://abc123xyz789.paff-67.top",
+            "enable_chinese_typo": True,
+            "enable_splitter": True,
+        }
+    )
+    assert legacy_dict_res["enable_chinese_typo"] is False
+    assert legacy_dict_res["enable_splitter"] is False

@@ -43,7 +43,8 @@ class EmbodiedWorkspaceConfig(PluginConfigBase):
     gateway_port: int = Field(default=18790, description="本地网关监听端口")
     default_ttl_hours: int = Field(default=24, description="默认链接有效期（小时）")
     cli_backend: str = Field(default="agy", description="执行引擎：agy 或 codex")
-    cli_timeout_seconds: int = Field(default=180, description="代码执行超时时间（秒）")
+    cli_timeout_seconds: int = Field(default=10800, description="代码执行超时时间（秒，默认 3 小时 = 10800 秒）")
+    progress_report_interval_seconds: int = Field(default=180, description="慢轨长任务期间快轨巡检与回报的最小间隔秒数（默认 180 秒）")
     workspaces_root: str = Field(default="/opt/maibot-brain/data/workspaces", description="会话工作区根目录")
     truth_db_path: str = Field(default="/opt/maibot-brain/data/companion_truth.db", description="真值库路径")
     ledger_db_path: str = Field(default="/opt/maibot-brain/data/message_ledger.db", description="消息账本路径")
@@ -69,6 +70,7 @@ class EmbodiedWorkspacePlugin(MaiBotPlugin):
         self.realtime_hub: GroupRealtimeHub | None = None
         self.compute_economy: ComputeEconomyManager | None = None
         self._notified_job_ids: set[str] = set()
+        self._active_jobs: dict[str, dict[str, Any]] = {}
 
     @property
     def ctx(self) -> Any:
@@ -124,6 +126,7 @@ class EmbodiedWorkspacePlugin(MaiBotPlugin):
             wechat_account=self.config.wechat_account,
             cli_backend=self.config.cli_backend,
             timeout_seconds=self.config.cli_timeout_seconds,
+            progress_report_interval_seconds=self.config.progress_report_interval_seconds,
             quota_wrapper=self.quota_wrapper,
             time_machine=self.time_machine,
         )
@@ -360,6 +363,23 @@ class EmbodiedWorkspacePlugin(MaiBotPlugin):
             kwargs["source_message_id"] = source_message_id
         await self.ctx.call_capability("maisaka.context.append", **kwargs)
 
+    def _update_truth_db_active_job(self, summary: str) -> None:
+        try:
+            truth_path = Path(self.config.truth_db_path)
+            if not truth_path.exists():
+                return
+            with sqlite3.connect(str(truth_path)) as conn:
+                cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(global_state)").fetchall()}
+                if "fairy_active_job_summary" not in cols:
+                    conn.execute("ALTER TABLE global_state ADD COLUMN fairy_active_job_summary TEXT DEFAULT ''")
+                conn.execute(
+                    "UPDATE global_state SET fairy_active_job_summary = ? WHERE row_id = 1",
+                    (summary.strip(),),
+                )
+                conn.commit()
+        except Exception:
+            pass
+
     async def _run_slow_job_and_notify(self, req: WorkspaceJobRequest) -> None:
         if req.job_id in self._notified_job_ids:
             return
@@ -369,7 +389,56 @@ class EmbodiedWorkspacePlugin(MaiBotPlugin):
         if existing_token:
             await self.supervisor.stop_backend(existing_token)
 
-        res = await self.cli_bridge.run_cli_job(req)
+        self._active_jobs[req.job_id] = {
+            "project_slug": slug,
+            "task_type": req.task_type,
+            "task_prompt": req.task_prompt,
+            "chat_id": req.chat_id,
+            "target_id": req.target_id,
+            "stream_id": req.stream_id,
+            "started_at": time.time(),
+            "latest_status": "任务已派发，正在初始化沙箱环境与依赖...",
+        }
+        self._update_truth_db_active_job(f"项目【{slug}】正在执行：{req.task_prompt[:40]}")
+
+        async def on_progress(status: str, elapsed_sec: int) -> None:
+            elapsed_min = max(1, elapsed_sec // 60)
+            elapsed_desc = f"{elapsed_min} 分钟"
+            if req.job_id in self._active_jobs:
+                self._active_jobs[req.job_id]["latest_status"] = f"已运行 {elapsed_desc}：{status}"
+
+            self._update_truth_db_active_job(f"项目【{slug}】已运行 {elapsed_desc}：{status}")
+
+            progress_note = (
+                f"[Fairy工作区进度巡检] task_id={req.job_id} | 项目={slug} | 已耗时={elapsed_desc}\n"
+                f"当前客观进展：{status}"
+            )
+            await self._append_context_note(
+                req.stream_id,
+                progress_note,
+                target_id=req.target_id,
+                source_message_id=req.source_message_id,
+            )
+            intent = (
+                f"Fairy 慢轨工作区正在为用户执行后台长程任务（项目: {slug}，已运行 {elapsed_desc}）。\n"
+                f"当前客观进展：{status}。\n"
+                f"请结合你的人设与当前对话情境，以自然、生活化、符合陪伴默契的方式主动向用户汇报一下目前的执行进度，"
+                f"告知后台正在有序推进中，让他安心等待，语气轻松自然，不要机械生硬。"
+            )
+            await self.ctx.call_capability(
+                "maisaka.proactive.trigger",
+                stream_id=req.stream_id,
+                target_id=req.target_id,
+                source_message_id=req.source_message_id,
+                intent=intent,
+            )
+
+        try:
+            res = await self.cli_bridge.run_cli_job(req, progress_callback=on_progress)
+        finally:
+            self._active_jobs.pop(req.job_id, None)
+            self._update_truth_db_active_job("")
+
         quote_anchor = f"[引用: {req.source_message_id}]\n" if req.source_message_id else ""
         if res.ok and res.dist_dir and res.project_dir:
             token = existing_token or self.router.generate_short_token(6)
@@ -706,14 +775,36 @@ class EmbodiedWorkspacePlugin(MaiBotPlugin):
         return f"未找到当前会话下可撤销的链接标识：{clean_token}"
 
     @HookHandler("maisaka.reply.before_post_process")
-    async def protect_subdomain_url_hook(self, event: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
-        _ = kwargs
-        text = str(event.get("response") or "")
+    async def protect_subdomain_url_hook(
+        self,
+        event: dict[str, Any] | None = None,
+        *,
+        response: str = "",
+        session_id: str = "",
+        reply_message_id: str = "",
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        _ = session_id, reply_message_id
+        target = event if isinstance(event, dict) else kwargs
+        text = str(target.get("response") or response or "")
         short_host = self.config.short_link_base_url.replace("https://", "").replace("http://", "").strip("/")
-        if self.config.base_domain in text or (short_host and short_host in text):
-            event["enable_chinese_typo"] = False
-            event["enable_splitter"] = False
-        return event
+        matched = bool(self.config.base_domain in text or (short_host and short_host in text))
+
+        if isinstance(event, dict):
+            if matched:
+                event["enable_chinese_typo"] = False
+                event["enable_splitter"] = False
+            return event
+
+        if matched:
+            return {
+                "action": "continue",
+                "modified_kwargs": {
+                    "enable_chinese_typo": False,
+                    "enable_splitter": False,
+                },
+            }
+        return {"action": "continue"}
 
 
 def create_plugin() -> EmbodiedWorkspacePlugin:
