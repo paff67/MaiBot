@@ -7,6 +7,7 @@ import re
 import shutil
 import signal
 import sqlite3
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -540,14 +541,16 @@ class CLIBridge:
                 return WorkspaceJobResult(ok=False, error_message=f"构建超时（超过 {self.timeout_seconds} 秒）")
             finally:
                 if monitor_task:
-                    monitor_task.cancel()
                     try:
+                        monitor_task.cancel()
                         await monitor_task
-                    except asyncio.CancelledError:
+                    except (asyncio.CancelledError, RuntimeError, Exception):
                         pass
                 try:
+                    if not reader_task.done():
+                        reader_task.cancel()
                     await reader_task
-                except Exception:
+                except (asyncio.CancelledError, RuntimeError, Exception):
                     pass
 
             result_file = dist_dir / "result.json"
