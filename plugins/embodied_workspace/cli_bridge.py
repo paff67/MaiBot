@@ -61,6 +61,21 @@ def build_bwrap_prefix(chat_ws_dir: Path, workdir: str = SANDBOX_WORKSPACE_PATH)
         "--setenv", "XDG_CACHE_HOME", f"{SANDBOX_HOME_PATH}/.cache",
         "--setenv", "XDG_CONFIG_HOME", f"{SANDBOX_HOME_PATH}/.config",
     ]
+
+    # 透传宿主机已安装的 Antigravity 插件、配置与授权
+    gemini_config_path = Path("/root/.gemini/config")
+    gemini_settings_path = Path("/root/.gemini/antigravity-cli/settings.json")
+    if gemini_config_path.is_dir():
+        cmd.extend([
+            "--dir", f"{SANDBOX_HOME_PATH}/.gemini/config",
+            "--ro-bind", str(gemini_config_path), f"{SANDBOX_HOME_PATH}/.gemini/config",
+        ])
+    if gemini_settings_path.is_file():
+        cmd.extend([
+            "--dir", f"{SANDBOX_HOME_PATH}/.gemini/antigravity-cli",
+            "--ro-bind", str(gemini_settings_path), f"{SANDBOX_HOME_PATH}/.gemini/antigravity-cli/settings.json",
+        ])
+
     for masked in ("/opt/maibot-brain", "/etc/maibot-mtls", "/etc/maibot-media.env"):
         p = Path(masked)
         if p.is_dir():
@@ -82,6 +97,10 @@ def build_sandbox_env() -> dict[str, str]:
     env["HOME"] = SANDBOX_HOME_PATH
     env["XDG_CACHE_HOME"] = f"{SANDBOX_HOME_PATH}/.cache"
     env["XDG_CONFIG_HOME"] = f"{SANDBOX_HOME_PATH}/.config"
+    if "GOOGLE_GEMINI_BASE_URL" not in env:
+        env["GOOGLE_GEMINI_BASE_URL"] = "https://api.0-0.pro"
+    if "GEMINI_API_KEY" not in env:
+        env["GEMINI_API_KEY"] = "sk-OGOA7rsiaALlVaZV-JMwBMIwe603yvB6mQraWDW1XI4"
     return env
 
 
@@ -299,9 +318,10 @@ class CLIBridge:
                 ])
             else:
                 raw_cmd.extend([
-                    "agy", "--headless",
-                    "--workspace", ws_root,
-                    "--prompt", full_prompt,
+                    "agy",
+                    "--dangerously-skip-permissions",
+                    "--model", "gemini-4-argon-high",
+                    "-p", full_prompt,
                 ])
 
             cmd = (
