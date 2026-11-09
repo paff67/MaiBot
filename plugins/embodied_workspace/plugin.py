@@ -21,6 +21,7 @@ from pydantic import Field
 from .archive_manager import WorkspaceArchiveManager
 from .backend_supervisor import BackendSupervisor
 from .cli_bridge import CLIBridge, WorkspaceJobRequest
+from .compute_economy import ComputeEconomyManager
 from .fast_renderer import render_markdown_to_wechat_html
 from .gateway_server import WorkspaceGatewayServer
 from .realtime_hub import GroupRealtimeHub
@@ -66,6 +67,8 @@ class EmbodiedWorkspacePlugin(MaiBotPlugin):
         self.quota_wrapper: ResourceQuotaWrapper | None = None
         self.time_machine: WorkspaceTimeMachine | None = None
         self.realtime_hub: GroupRealtimeHub | None = None
+        self.compute_economy: ComputeEconomyManager | None = None
+        self._notified_job_ids: set[str] = set()
 
     @property
     def ctx(self) -> Any:
@@ -80,6 +83,12 @@ class EmbodiedWorkspacePlugin(MaiBotPlugin):
     async def on_load(self) -> None:
         ws_root = Path(self.config.workspaces_root)
         truth_path = Path(self.config.truth_db_path)
+
+        self._notified_job_ids = set()
+        self.compute_economy = ComputeEconomyManager(
+            truth_db_path=truth_path,
+        )
+        self.compute_economy.start_background_sync()
 
         self.router = SubdomainRouter(
             db_path=Path(self.config.router_db_path),
@@ -137,6 +146,8 @@ class EmbodiedWorkspacePlugin(MaiBotPlugin):
         self._bg_tasks: set[asyncio.Task[Any]] = set()
 
     async def on_unload(self) -> None:
+        if hasattr(self, "compute_economy") and self.compute_economy:
+            await self.compute_economy.stop_background_sync()
         if hasattr(self, "realtime_hub") and self.realtime_hub:
             await self.realtime_hub.stop()
         if hasattr(self, "gateway"):
@@ -149,6 +160,8 @@ class EmbodiedWorkspacePlugin(MaiBotPlugin):
         _ = version
         if scope == "self" and isinstance(config_data, dict):
             self.set_plugin_config(config_data)
+            if hasattr(self, "compute_economy") and self.compute_economy:
+                self.compute_economy.truth_db_path = Path(self.config.truth_db_path)
             if hasattr(self, "truth_writer") and self.truth_writer:
                 self.truth_writer.wechat_source = self.config.wechat_source
                 self.truth_writer.wechat_account = self.config.wechat_account
@@ -174,36 +187,6 @@ class EmbodiedWorkspacePlugin(MaiBotPlugin):
         parts = raw_text.split(maxsplit=1)
         return parts[1].strip() if len(parts) > 1 else ""
 
-    @Tool(
-        name="publish_document_page",
-        description=(
-            "【快轨·长文排版页】当需要向用户交付长篇文章、深度报告、攻略、故事或包含复杂 Markdown/数学公式/流程图的内容时调用。"
-            "保留你的人设文风并直接生成移动端网页，1~2 秒内同步返回极简短链。"
-            "若任务需要写代码、制作交互式图表/小游戏、处理微信附件(FMxxxx)或修改已有网页，严禁调用本工具，请改用 run_agent_workspace。"
-        ),
-        parameters=[
-            ToolParameterInfo(
-                name="title",
-                param_type=ToolParamType.STRING,
-                description="页面标题（将显示在微信链接卡片与网页顶部）",
-                required=True,
-            ),
-            ToolParameterInfo(
-                name="writing_instruction",
-                param_type=ToolParamType.STRING,
-                description="长文写作要求、核心论点与大纲（非空，1~500000 字符）",
-                required=True,
-            ),
-            ToolParameterInfo(
-                name="reference_text",
-                param_type=ToolParamType.STRING,
-                description="可选补充参考材料或上下文摘录",
-                required=False,
-                default="",
-            ),
-        ],
-        timeout_ms=240000,
-    )
     async def publish_document_page(
         self,
         title: str,
@@ -211,84 +194,41 @@ class EmbodiedWorkspacePlugin(MaiBotPlugin):
         reference_text: str = "",
         **kwargs: Any,
     ) -> dict[str, Any]:
-        chat_id = self._resolve_chat_id(kwargs)
-        creator_wxid = str(kwargs.get("user_id") or "").strip()
-        stream_id = str(kwargs.get("stream_id") or kwargs.get("session_id") or kwargs.get("chat_id") or chat_id).strip()
-
-        fm_matches = re.findall(r"\bFM\d{4,}\b", f"{writing_instruction} {reference_text}".upper())
-        if fm_matches:
-            return await self.run_agent_workspace(
-                task_prompt=f"标题：{title}\n需求：{writing_instruction}\n参考：{reference_text}",
-                project_slug="doc-with-attachment",
-                action="create",
-                access_policy="creator_only",
-                file_codes=",".join(sorted(set(fm_matches))),
-                **kwargs,
-            )
-
-        gen_res = await self.ctx.call_capability(
-            "maisaka.reply.generate",
-            timeout_ms=180000,
-            stream_id=stream_id,
-            reference=writing_instruction,
-            format_instruction=f"请撰写一篇标题为《{title}》的完整长文 Markdown。\n补充参考材料：{reference_text}",
-        )
-        markdown_body = str((gen_res or {}).get("text") or "").strip()
-        if not markdown_body:
-            err_detail = (gen_res or {}).get("error") or "长文生成结果为空"
-            return {"ok": False, "error": str(err_detail)}
-
+        """向后兼容转发接口：将快轨长文排版统一收敛至 run_agent_workspace(task_type='document')"""
         token = self.router.generate_short_token(6)
-        slug = f"note-{token}"
-        ws_dir = self.cli_bridge.get_chat_workspace(chat_id)
-        dist_dir = ws_dir / "dist" / slug
-        project_dir = ws_dir / "projects" / slug
-        dist_dir.mkdir(parents=True, exist_ok=True)
-        project_dir.mkdir(parents=True, exist_ok=True)
-
-        html_doc = render_markdown_to_wechat_html(title=title, markdown_text=markdown_body)
-        (dist_dir / "index.html").write_text(html_doc, encoding="utf-8")
-
-        url = self.router.upsert_route(
-            token=token,
-            chat_id=chat_id,
-            stream_id=stream_id,
-            creator_wxid=creator_wxid,
-            access_policy="creator_only",
+        slug = f"doc-{token}"
+        ref_part = f"\n参考材料：{reference_text}" if reference_text else ""
+        task_prompt = f"撰写并排版文章《{title}》\n需求：{writing_instruction}{ref_part}"
+        return await self.run_agent_workspace(
+            task_prompt=task_prompt,
             project_slug=slug,
-            title=title,
-            summary=writing_instruction[:80],
-            mode="static",
-            dist_dir=dist_dir,
-            project_dir=project_dir,
-            ttl_hours=self.config.default_ttl_hours,
+            action="create",
+            access_policy="creator_only",
+            task_type="document",
+            context_notes=f"标题: {title} | 补充参考: {reference_text}",
+            **kwargs,
         )
-        return {
-            "ok": True,
-            "mode": "fast_track_sync",
-            "url": url,
-            "title": title,
-            "planner_hint": f"长文页面已生成：{url} ，请直接调用 reply 工具用简短自然的气泡将链接发给用户。",
-        }
 
     @Tool(
         name="run_agent_workspace",
         description=(
-            "【慢轨·全功能代码与全栈网页工作区】当需要执行 Python/Node 代码、制作交互式 HTML/图表/小游戏、构建带后端的多人投票/收集表、"
+            "【全能慢轨·代码与全栈网页/长文工作区】当需要撰写/排版长文文档(task_type='document')、"
+            "执行 Python/Node 代码、制作交互式 HTML/图表/小游戏(task_type='webapp')、"
+            "构建带后端的多人投票/收集表(task_type='backend')、"
             "分析当前会话的微信附件(FMxxxx)、或对之前生成的项目进行多轮修改(action='update')时调用。"
-            "本工具立即返回 task_id（非阻塞），后台完成后会自动唤醒你把极简短链发给用户。"
+            "本工具立即返回 task_id（非阻塞），后台完成后会自动唤醒你把结果链接发给用户。"
         ),
         parameters=[
             ToolParameterInfo(
                 name="task_prompt",
                 param_type=ToolParamType.STRING,
-                description="给后台 agy 编程 Agent 的详细需求描述",
+                description="给后台 Fairy 编程 Agent 的详细需求描述",
                 required=True,
             ),
             ToolParameterInfo(
                 name="project_slug",
                 param_type=ToolParamType.STRING,
-                description="项目英文短标识（如 'camp-vote'；修改已有项目时传入相同标识）",
+                description="项目英文短标识（如 'doc-tokyo-guide' 或 'camp-vote'；修改已有项目时传入相同标识）",
                 required=True,
             ),
             ToolParameterInfo(
@@ -306,6 +246,20 @@ class EmbodiedWorkspacePlugin(MaiBotPlugin):
                 default="creator_only",
             ),
             ToolParameterInfo(
+                name="task_type",
+                param_type=ToolParamType.STRING,
+                description="交付类型：'document'（长文撰写与杂志级排版） | 'webapp'（交互单页与图表应用） | 'backend'（受控临时后端应用）",
+                required=False,
+                default="webapp",
+            ),
+            ToolParameterInfo(
+                name="context_notes",
+                param_type=ToolParamType.STRING,
+                description="补充说明或对话背景备注（供写入 TASK_CONTEXT.md）",
+                required=False,
+                default="",
+            ),
+            ToolParameterInfo(
                 name="file_codes",
                 param_type=ToolParamType.STRING,
                 description="需读取的微信附件编号，英文逗号分隔如 'FM0012,FM0015'",
@@ -320,12 +274,18 @@ class EmbodiedWorkspacePlugin(MaiBotPlugin):
         project_slug: str,
         action: str = "create",
         access_policy: str = "creator_only",
+        task_type: str = "webapp",
+        context_notes: str = "",
         file_codes: str = "",
         **kwargs: Any,
     ) -> dict[str, Any]:
         chat_id = self._resolve_chat_id(kwargs)
         creator_wxid = str(kwargs.get("user_id") or "").strip()
-        stream_id = str(kwargs.get("stream_id") or "")
+        stream_id = str(kwargs.get("stream_id") or kwargs.get("session_id") or kwargs.get("chat_id") or chat_id).strip()
+        target_id = str(kwargs.get("target_id") or kwargs.get("group_id") or kwargs.get("user_id") or chat_id).strip()
+        source_message_id = str(kwargs.get("source_message_id") or kwargs.get("msg_id") or "").strip()
+        if not source_message_id and hasattr(self, "cli_bridge") and self.cli_bridge:
+            source_message_id = self.cli_bridge.resolve_latest_source_message_id(chat_id, creator_wxid)
 
         if self.cli_bridge.is_project_locked(chat_id, project_slug):
             return {
@@ -343,18 +303,27 @@ class EmbodiedWorkspacePlugin(MaiBotPlugin):
             return {"ok": False, "error": f"附件权限校验或准备失败：{exc}"}
 
         job_id = f"job_{int(time.time())}_{secrets.token_hex(3)}"
+        effective_task_type = task_type if task_type in ("document", "webapp", "backend") else "webapp"
         req = WorkspaceJobRequest(
             job_id=job_id,
             stream_id=stream_id,
             chat_id=chat_id,
+            target_id=target_id,
+            source_message_id=source_message_id,
             creator_wxid=creator_wxid,
             access_policy="member_collect" if access_policy == "member_collect" else "creator_only",
             project_slug=project_slug,
             action=action,
+            task_type=effective_task_type,
             task_prompt=task_prompt,
+            context_notes=context_notes,
             staged_files=staged,
             ttl_hours=self.config.default_ttl_hours,
         )
+
+        if hasattr(self, "compute_economy") and self.compute_economy:
+            self.compute_economy.record_local_cost(0.02)
+
         task = asyncio.create_task(self._run_slow_job_and_notify(req))
         self._bg_tasks.add(task)
         task.add_done_callback(self._bg_tasks.discard)
@@ -362,27 +331,46 @@ class EmbodiedWorkspacePlugin(MaiBotPlugin):
         return {
             "ok": True,
             "mode": "slow_track_async",
+            "executor": "Fairy",
             "task_id": job_id,
             "project_slug": project_slug,
-            "access_policy": req.access_policy,
-            "planner_hint": "后台 Agent 已开始构建。请先调用 reply 简短告诉用户你正在写代码/处理数据，稍后完成后会自动发链接。",
+            "task_type": req.task_type,
+            "planner_hint": (
+                f"任务已交由 Fairy 在后台工作区异步执行（task_id={job_id}，当前尚未产出结果）。"
+                "请立即调用 reply 工具，基于你自身的人设、当前对话语境与相关记忆，对用户进行一个简单的不固定回复；"
+                "待 Fairy 后台执行完成后，系统将自动唤醒你向用户交付结果。"
+            ),
         }
 
-    async def _append_context_note(self, stream_id: str, note: str) -> None:
-        await self.ctx.call_capability(
-            "maisaka.context.append",
-            stream_id=stream_id,
-            segments=[{"type": "text", "content": note}],
-            visible_text=note,
-        )
+    async def _append_context_note(
+        self,
+        stream_id: str,
+        note: str,
+        target_id: str = "",
+        source_message_id: str = "",
+    ) -> None:
+        kwargs: dict[str, Any] = {
+            "stream_id": stream_id,
+            "segments": [{"type": "text", "content": note}],
+            "visible_text": note,
+        }
+        if target_id:
+            kwargs["target_id"] = target_id
+        if source_message_id:
+            kwargs["source_message_id"] = source_message_id
+        await self.ctx.call_capability("maisaka.context.append", **kwargs)
 
     async def _run_slow_job_and_notify(self, req: WorkspaceJobRequest) -> None:
+        if req.job_id in self._notified_job_ids:
+            return
+
         slug = self.cli_bridge.safe_id(req.project_slug)
         existing_token = self.router.find_active_token_by_slug(req.chat_id, slug) if req.action == "update" else None
         if existing_token:
             await self.supervisor.stop_backend(existing_token)
 
         res = await self.cli_bridge.run_cli_job(req)
+        quote_anchor = f"[引用: {req.source_message_id}]\n" if req.source_message_id else ""
         if res.ok and res.dist_dir and res.project_dir:
             token = existing_token or self.router.generate_short_token(6)
             url = self.router.upsert_route(
@@ -424,16 +412,32 @@ class EmbodiedWorkspacePlugin(MaiBotPlugin):
 
             archive_note = f"\n已归档至 Google Drive 独立目录文件：{', '.join(archived_files)}" if archived_files else ""
             note = (
-                f"[工作区任务完成] task_id={req.job_id} | 模式={res.mode} | 权限={req.access_policy}\n"
+                f"{quote_anchor}[Fairy工作区任务完成] task_id={req.job_id} | 类型={req.task_type} | 模式={res.mode}\n"
+                f"目标会话(target_id)：{req.target_id}\n"
                 f"标题：{res.title}\n摘要：{res.summary_for_replyer}\n链接：{url}{archive_note}"
             )
-            intent = f"后台任务 {req.job_id} 已完成（{res.summary_for_replyer}），请用自然语气把链接 {url} 发给用户。"
+            intent = (
+                f"Fairy 已完成后台任务 {req.job_id}（摘要：{res.summary_for_replyer}）。"
+                f"请基于你的人设与当前会话语境，将结果链接 {url} 自然地交付给用户。"
+            )
         else:
-            note = f"[工作区任务失败] task_id={req.job_id} | 原因：{res.error_message}"
-            intent = f"后台任务 {req.job_id} 失败（{res.error_message}），请简短向用户说明原因。"
+            note = f"{quote_anchor}[Fairy工作区任务失败] task_id={req.job_id} | 原因：{res.error_message}"
+            intent = f"Fairy 后台任务 {req.job_id} 执行失败（{res.error_message}），请结合你的人设向用户简短说明情况。"
 
-        await self._append_context_note(req.stream_id, note)
-        await self.ctx.call_capability("maisaka.proactive.trigger", stream_id=req.stream_id, intent=intent)
+        self._notified_job_ids.add(req.job_id)
+        await self._append_context_note(
+            req.stream_id,
+            note,
+            target_id=req.target_id,
+            source_message_id=req.source_message_id,
+        )
+        await self.ctx.call_capability(
+            "maisaka.proactive.trigger",
+            stream_id=req.stream_id,
+            target_id=req.target_id,
+            source_message_id=req.source_message_id,
+            intent=intent,
+        )
 
     async def _handle_web_notify_callback(
         self,

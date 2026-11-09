@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from src.companion_vault.access_policy import authorized_file_rows
+from .editorial_kit import ensure_maibot_kit_assets
 from .resource_quota import ResourceQuotaWrapper
 from .time_machine import WorkspaceTimeMachine
 
@@ -23,13 +24,17 @@ class WorkspaceJobRequest:
     job_id: str
     stream_id: str
     chat_id: str
-    creator_wxid: str
-    access_policy: str        # "creator_only" | "member_collect"
-    project_slug: str
-    action: str               # "create" | "update"
-    task_prompt: str
-    staged_files: list[Path]
-    ttl_hours: int
+    target_id: str = ""
+    source_message_id: str = ""
+    creator_wxid: str = ""
+    access_policy: str = "creator_only"        # "creator_only" | "member_collect"
+    project_slug: str = "app"
+    action: str = "create"               # "create" | "update"
+    task_type: str = "webapp"            # "document" | "webapp" | "backend"
+    task_prompt: str = ""
+    context_notes: str = ""
+    staged_files: list[Path] = field(default_factory=list)
+    ttl_hours: int = 24
 
 
 @dataclass
@@ -211,62 +216,142 @@ class CLIBridge:
             staged.append(dest_path)
         return staged
 
-    def _write_agents_md(self, ws_dir: Path, slug: str, access_policy: str) -> None:
+    def resolve_latest_source_message_id(self, chat_id: str, sender_wxid: str = "") -> str:
+        """从 message_ledger.db 只读反查触发本次慢轨任务的最新入站 msg_id"""
+        if not self.ledger_db_path.exists():
+            return ""
+        try:
+            conn = sqlite3.connect(f"file:{self.ledger_db_path}?mode=ro", uri=True)
+            conn.row_factory = sqlite3.Row
+            try:
+                cols = {
+                    str(r["name"])
+                    for r in conn.execute("PRAGMA table_info(messages)").fetchall()
+                }
+                if "msg_id" not in cols:
+                    return ""
+                if sender_wxid and "sender_id" in cols:
+                    row = conn.execute(
+                        "SELECT msg_id FROM messages WHERE chat_id = ? AND sender_id = ? ORDER BY rowid DESC LIMIT 1",
+                        (chat_id, sender_wxid),
+                    ).fetchone()
+                    if row and row["msg_id"]:
+                        return str(row["msg_id"])
+                row = conn.execute(
+                    "SELECT msg_id FROM messages WHERE chat_id = ? ORDER BY rowid DESC LIMIT 1",
+                    (chat_id,),
+                ).fetchone()
+                return str(row["msg_id"]) if (row and row["msg_id"]) else ""
+            finally:
+                conn.close()
+        except Exception:
+            return ""
+
+    def _fetch_recent_chat_excerpt(self, chat_id: str, limit: int = 15) -> str:
+        """只读提取当前会话最近 15 条消息摘要写入 TASK_CONTEXT.md，严守跨会话隔离"""
+        if not self.ledger_db_path.exists():
+            return "（无近期对话记录）"
+        try:
+            conn = sqlite3.connect(f"file:{self.ledger_db_path}?mode=ro", uri=True)
+            conn.row_factory = sqlite3.Row
+            try:
+                cols = {
+                    str(r["name"])
+                    for r in conn.execute("PRAGMA table_info(messages)").fetchall()
+                }
+                if not cols:
+                    return "（无近期对话记录）"
+                sender_col = "sender_name" if "sender_name" in cols else ("sender_id" if "sender_id" in cols else "''")
+                text_col = (
+                    "body" if "body" in cols
+                    else ("raw_message" if "raw_message" in cols
+                    else ("content" if "content" in cols else "''"))
+                )
+                dir_col = "direction" if "direction" in cols else "''"
+                rows = conn.execute(
+                    f"""
+                    SELECT {sender_col} AS sender, {dir_col} AS direction, {text_col} AS body
+                    FROM messages
+                    WHERE chat_id = ? AND {text_col} != ''
+                    ORDER BY rowid DESC LIMIT ?
+                    """,
+                    (chat_id, int(limit)),
+                ).fetchall()
+                lines: list[str] = []
+                for r in reversed(rows):
+                    role = "Bot" if str(r["direction"]) == "outbound" else str(r["sender"] or "User")
+                    body = str(r["body"] or "").replace("\n", " ").strip()[:280]
+                    lines.append(f"- [{role}]: {body}")
+                return "\n".join(lines) if lines else "（无近期对话记录）"
+            finally:
+                conn.close()
+        except Exception:
+            return "（读取近期对话记录失败）"
+
+    def _write_task_context_md(self, ws_dir: Path, req: WorkspaceJobRequest) -> None:
+        recent_chat = self._fetch_recent_chat_excerpt(req.chat_id, limit=15)
+        content = f"""# Workspace Task Context (TASK_CONTEXT.md)
+
+- **job_id**: `{req.job_id}`
+- **task_type**: `{req.task_type}` (`document` | `webapp` | `backend`)
+- **action**: `{req.action}`
+- **project_slug**: `{req.project_slug}`
+- **access_policy**: `{req.access_policy}`
+
+## 1. 补充说明与上下文备注 (`context_notes`)
+{req.context_notes or "（无额外备注）"}
+
+## 2. 当前会话近期对话摘录（供理解任务背景与上下文指代）
+{recent_chat}
+
+## 3. 核心任务需求 (`task_prompt`)
+{req.task_prompt}
+"""
+        (ws_dir / "TASK_CONTEXT.md").write_text(content, encoding="utf-8")
+
+    def _write_agents_md(self, ws_dir: Path, slug: str, access_policy: str, task_type: str = "webapp") -> None:
         ws_root = SANDBOX_WORKSPACE_PATH
-        content = f"""# MaiBot Session Workspace Agent Contract (Phase 2)
+        content = f"""# MaiBot Embodied Workspace Agent Contract (Slow Track Builder)
 
-你运行在当前微信会话的专属隔离工作区 `{ws_root}` 中。当前页面权限策略为：`{access_policy}`。
+你运行在当前微信会话的隔离工作区 `{ws_root}` 中，负责执行全部慢轨交付任务（长文撰写与排版、静态交互网页构建、数据分析及受控全栈应用）。
+当前任务类型：`{task_type}` | 页面权限策略：`{access_policy}`。
 
-## 1. 目录与 Google Drive 自动归档约定
-- `{ws_root}/inbox/`：当前会话已授权的微信附件原件（只读）。
-- `{ws_root}/projects/{slug}/`：源码、Python 脚本、SQLite 数据库与后端工程目录（持久化保留，支持多轮增量迭代）。
-- `{ws_root}/dist/{slug}/`：静态网页构建产物输出目录。
-- `{ws_root}/dist/{slug}/files/`：**Google Drive 自动归档目录**。任何放入此目录的衍生文件（如生成的 Excel、PDF、高清图表 PNG），任务结束时会被宿主自动归档至 Google Drive 独立文件夹并在网页提供下载。
+## 一、 上下文读取与目录结构
+1. **请先读取 `{ws_root}/TASK_CONTEXT.md`**：获取当前会话近期对话摘录、补充说明与核心任务需求。
+2. **目录约定**：
+   - `{ws_root}/inbox/`：当前会话已授权的微信附件原件（只读）。
+   - `{ws_root}/projects/{slug}/`：源码、Python 数据处理脚本、Markdown 原稿与后端工程目录（持久化保留，支持多轮增量迭代与 Git 快照回滚）。
+   - `{ws_root}/dist/{slug}/`：最终静态或前端交付物输出目录（入口固定为 `{ws_root}/dist/{slug}/index.html`）。
+   - `{ws_root}/dist/{slug}/files/`：**Google Drive 自动归档目录**。放入此目录的衍生文件（如长文 `.md` 原稿、Excel/PDF、图表 PNG）会在任务结束时自动归档至 Google Drive `workspace_archives/` 独立目录。
+   - `{ws_root}/.maibot_kit/`（及 `{ws_root}/dist/{slug}/_kit/`）：预置的杂志级排版样式表 `editorial_theme.css` 与交互增强脚本 `editorial_kit.js`。
 
-## 2. 动静双模交付契约（二选一）
-### 模式 A：纯静态模式 (`"mode": "static"`，默认优先)
-- 必须生成 `{ws_root}/dist/{slug}/index.html`。
-### 模式 B：受控临时后端模式 (`"mode": "backend"`)
-- 适用于多人实时互动（投票、排行榜、信息收集表）、网页上传文件服务端处理或 WebSocket 应用。
-- **严禁自行用 `nohup` 或 `&` 后台启动服务**。请将后端写在 `{ws_root}/projects/{slug}/`，并在 `{ws_root}/dist/{slug}/result.json` 中声明 `start_cmd`（端口使用占位符 `{{PORT}}`）。
+## 二、 三类交付物的构建与渲染规范
 
-## 3. 前端身份 SDK (`window.MaiBot`) 与实名真值库回调
-宿主网关会自动向所有 HTML 页面注入 `/_maibot/sdk.js`（无需你手写登录弹窗，未登录用户调用时 SDK 会自动弹出微信口令/PIN 登录框）：
-- 获取当前访问者身份：`const user = window.MaiBot.getState(); // {{ wxid, nickname, isCreator }}`
-- 触发微信回调并更新访问者本人名下的真值库记忆：
-  ```javascript
-  await window.MaiBot.notify({{
-    event: "提交了露营报名与忌口",
-    detail: "带天幕，不吃香菜",
-    trigger_reply: true,
-    memory_patch: {{
-      current_status: "准备周末露营",
-      preference_item: {{ "饮食忌口": "不吃香菜" }},
-      quest_title: "周末露营携带天幕"
-    }}
-  }});
-  ```
+### 1. 长文本与深度排版 (`task_type == "document"`)
+当任务是撰写或整理长文章、攻略、报告、复盘或文档时：
+- **双格式产出**：将完整的 Markdown 原稿保存至 `{ws_root}/dist/{slug}/files/{slug}.md`，同时生成排版精美的 `{ws_root}/dist/{slug}/index.html`。
+- **样式与组件引用**：在 `index.html` 中可直接引用 `<link rel="stylesheet" href="./_kit/editorial_theme.css">` 与 `<script src="./_kit/editorial_kit.js" defer></script>`（自动提供顶部阅读进度条、代码块一键复制与多章节浮动目录 TOC）。
+- **富文本支持**：数学公式使用 KaTeX CDN 渲染，流程图/时序图使用 Mermaid CDN 渲染，并在页面底部提供 `./files/{slug}.md` 原稿下载入口。
 
-- 订阅微信群实时新消息与同页面多人实时广播（Phase 3 全双工总线）：
-  ```javascript
-  window.MaiBot.subscribeRealtime((msg) => {{
-    if (msg.type === "wechat_message") {{
-      // 收到当前微信群的新消息: {{ sender, content, ts }}
-    }} else if (msg.type === "peer_broadcast" || msg.type === "web_notify") {{
-      // 收到其他正在浏览本网页的群友操作广播: {{ actor_wxid, event, data }}
-    }}
-  }});
-  // 向所有正在打开本网页的群友实时广播状态
-  window.MaiBot.broadcast("vote_updated", {{ option: "A" }});
-  ```
+### 2. 交互式单页与数据可视化 (`task_type == "webapp"`)
+- 生成 `{ws_root}/dist/{slug}/index.html`，所有资源使用相对路径或公共 CDN（Tailwind / ECharts / Chart.js）。
+- 若涉及附件数据处理，先在 `{ws_root}/projects/{slug}/` 下编写并运行 Python 脚本得出真实计算结果，再注入前端展示，严禁捏造虚假数据。
 
-- **微信防拦截规范**：严禁在 HTML 中使用 `<input type="password">`（如需输入码请用 `type="tel"` 或 `type="text"`），严禁出现“输入银行卡/身份证”等敏感字样。
+### 3. 受控临时后端应用 (`task_type == "backend"`)
+- **严禁自行使用 `nohup` 或 `&` 在后台常驻进程**。
+- 将后端代码（FastAPI / Node）写在 `{ws_root}/projects/{slug}/`，并在 `{ws_root}/dist/{slug}/result.json` 中声明 `"mode": "backend"` 与 `"start_cmd": ["python3", "-m", "uvicorn", "app:app", "--host", "127.0.0.1", "--port", "{{PORT}}"]`。
 
-## 4. 必须生成的回执文件 `{ws_root}/dist/{slug}/result.json`
+## 三、 移动端适配与宿主前端 SDK (`window.MaiBot`)
+1. 页面必须适配 `375px~430px` 手机视口（无横向溢出滚动条），包含 `<meta name="viewport" content="width=device-width, initial-scale=1.0">` 与 `<title>`；**严禁使用 `<input type="password">`**（如需输入码请用 `type="tel"` 或 `type="text"`）。
+2. 所有 HTML 页面已由网关自动注入 `/_maibot/sdk.js`：
+   - 实名回调与记忆更新：`await window.MaiBot.notify({{ event: "...", detail: "...", trigger_reply: true, memory_patch: {{...}} }})`
+   - 群聊全双工实时消息与同屏广播：`window.MaiBot.subscribeRealtime((msg) => {{...}})` 与 `window.MaiBot.broadcast(event, data)`
+
+## 四、 必须生成的回执文件 `{ws_root}/dist/{slug}/result.json`
 ```json
 {{
-  "title": "简短中文页面标题",
-  "summary_for_replyer": "两句话总结核心结论或已实现的功能（供微信卡片摘要与许妍回复使用）",
+  "title": "页面中文标题",
+  "summary_for_replyer": "两句话概括核心内容、分析结论或已实现的功能",
   "mode": "static",
   "start_cmd": [],
   "archive_files": []
@@ -288,7 +373,9 @@ class CLIBridge:
             dist_dir.mkdir(parents=True, exist_ok=True)
             (dist_dir / "files").mkdir(parents=True, exist_ok=True)
 
-            self._write_agents_md(ws_dir, slug, req.access_policy)
+            ensure_maibot_kit_assets(ws_dir, dist_dir)
+            self._write_task_context_md(ws_dir, req)
+            self._write_agents_md(ws_dir, slug, req.access_policy, req.task_type)
 
             ws_root = SANDBOX_WORKSPACE_PATH
             files_note = (
@@ -296,11 +383,11 @@ class CLIBridge:
                 if req.staged_files else "无关联微信附件。"
             )
             full_prompt = (
-                f"操作类型: {req.action} | 权限模式: {req.access_policy} | "
+                f"任务类型: {req.task_type} | 操作类型: {req.action} | 权限模式: {req.access_policy} | "
                 f"项目目录: `{ws_root}/projects/{slug}` | 产物目录: `{ws_root}/dist/{slug}`\n"
                 f"{files_note}\n\n"
                 f"用户需求:\n{req.task_prompt}\n\n"
-                f"请严格遵守 `{ws_root}/AGENTS.md` 规范，完成后务必写入 `{ws_root}/dist/{slug}/result.json`。"
+                f"请严格遵守 `{ws_root}/TASK_CONTEXT.md` 与 `{ws_root}/AGENTS.md` 规范，完成后务必写入 `{ws_root}/dist/{slug}/result.json`。"
             )
 
             if self.time_machine and req.action == "update":

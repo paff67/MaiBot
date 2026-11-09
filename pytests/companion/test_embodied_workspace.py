@@ -185,12 +185,7 @@ async def test_fast_track_ipc_and_auto_upgrade(tmp_path: Path):
     await plugin.on_load()
 
     try:
-        # 1. 正常快轨长文生成
-        mock_ctx.call_capability.return_value = {
-            "success": True,
-            "text": "# 攻略标题\n这是攻略正文内容。",
-        }
-
+        # 1. 兼容转发调用 publish_document_page 统一进入慢轨 document 任务
         res = await plugin.publish_document_page(
             title="东京旅游攻略",
             writing_instruction="写一份详细行程安排",
@@ -200,17 +195,12 @@ async def test_fast_track_ipc_and_auto_upgrade(tmp_path: Path):
         )
 
         assert res["ok"] is True
-        assert res["mode"] == "fast_track_sync"
-        assert "url" in res
-        mock_ctx.call_capability.assert_awaited_once_with(
-            "maisaka.reply.generate",
-            timeout_ms=180000,
-            stream_id="stream_001",
-            reference="写一份详细行程安排",
-            format_instruction="请撰写一篇标题为《东京旅游攻略》的完整长文 Markdown。\n补充参考材料：涉谷、新宿、秋叶原",
-        )
+        assert res["mode"] == "slow_track_async"
+        assert res["executor"] == "Fairy"
+        assert res["task_type"] == "document"
+        assert "task_id" in res
 
-        # 2. 包含 FMxxxx 时自动升级至慢轨
+        # 2. 模拟 mock 验证
         plugin.run_agent_workspace = AsyncMock(return_value={"ok": True, "mode": "slow_track_async", "task_id": "job_mock"})
         upgrade_res = await plugin.publish_document_page(
             title="数据分析报告",
