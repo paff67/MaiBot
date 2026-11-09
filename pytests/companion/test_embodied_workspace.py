@@ -204,6 +204,7 @@ async def test_fast_track_ipc_and_auto_upgrade(tmp_path: Path):
         assert "url" in res
         mock_ctx.call_capability.assert_awaited_once_with(
             "maisaka.reply.generate",
+            timeout_ms=180000,
             stream_id="stream_001",
             reference="写一份详细行程安排",
             format_instruction="请撰写一篇标题为《东京旅游攻略》的完整长文 Markdown。\n补充参考材料：涉谷、新宿、秋叶原",

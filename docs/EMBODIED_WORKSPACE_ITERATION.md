@@ -937,3 +937,32 @@ SELECT COUNT(*) FROM wechat_driver_quarantine;
 2. **全协议覆盖**：HTTP / HTTPS / WebSocket / Cloudflare 泛域名四重网络栈畅通无阻。
 3. **零隐私外溢**：严格遵守真值库 RBAC 红线，群聊名册与私密档案彻底解耦。
 4. **测试套件 100% 通过**：全量 86 项 companion 自动化测试全部绿色通行。
+
+---
+
+### 7. 真实环境现场排查与快轨 IPC 超时阻断根除（Live Issue Diagnosis & Fix）
+
+在 WebUI 真实对话轮次测试中，Planner 调用 `publish_document_page` 生成《关于"厦门运动会跳水裁判门"的发展预测与算力分析》时，触发了 `[E_TIMEOUT] 请求 cap.call 超时 (30000ms)` 失败，经现场日志与调用链路深度排查，定位并彻底修复了两处真实物理断点：
+
+#### (1) 断点 1：快轨跨进程 RPC 30 秒硬超时截断（P0 级）
+- **日志取证**：
+  - `18:39:51`：Planner 触发工具 `publish_document_page`；
+  - `18:40:21`：恰好 30.0 秒时，Runner 端抛出 `RPCError: [E_TIMEOUT] 请求 cap.call 超时 (30000ms)`；
+  - `18:41:03`：宿主端 `DocumentReplyGenerator` 实际在 `gemini-4-argon` 上顺利完成了 **4,817 tokens** 的长文生成（总耗时 72 秒）。
+- **根因分析**：
+  - `publish_document_page` 内部调用 `self.ctx.call_capability("maisaka.reply.generate", ...)` 时未声明超时参数；
+  - `runner_main.py` 在未收到超时参数时，默认对 `cap.call` 强加了 **`30000ms`（30 秒）** 的 RPC 等待上限；
+  - 而深度长文的大模型首字 + 完整输出通常需要 45~90 秒，导致 Runner 提前掐断等待。
+- **生产修复方案**：
+  - 在 `@Tool(name="publish_document_page")` 声明 `timeout_ms=240000`（4 分钟），给宿主 Supervisor 足够的执行窗口；
+  - 在 `self.ctx.call_capability("maisaka.reply.generate", timeout_ms=180000, ...)` 显式传入 3 分钟超时；
+  - 增强 `stream_id` 鲁棒性：`kwargs.get("stream_id") or kwargs.get("session_id") or kwargs.get("chat_id") or chat_id`。
+
+#### (2) 断点 2：Hook 调度参数解构 `TypeError`（P1 级）
+- **日志取证**：
+  - `journalctl` 报错：`TypeError: EmbodiedWorkspacePlugin.protect_subdomain_url_hook() got an unexpected keyword argument 'hook_name'`。
+- **根因分析**：
+  - Host 在广播 `maisaka.reply.before_post_process` 时传入了 `hook_name` 及上下文参数，而原插件方法未声明 `**kwargs: Any`。
+- **生产修复方案**：
+  - 更新签名：`async def protect_subdomain_url_hook(self, event: dict[str, Any], **kwargs: Any) -> dict[str, Any]:`。
+  - 同步更新测试集断言，远端重新拉起 `maibot-main.service`，全量回归 86/86 再次全绿。

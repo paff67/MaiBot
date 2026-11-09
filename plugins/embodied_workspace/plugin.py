@@ -202,6 +202,7 @@ class EmbodiedWorkspacePlugin(MaiBotPlugin):
                 default="",
             ),
         ],
+        timeout_ms=240000,
     )
     async def publish_document_page(
         self,
@@ -212,7 +213,7 @@ class EmbodiedWorkspacePlugin(MaiBotPlugin):
     ) -> dict[str, Any]:
         chat_id = self._resolve_chat_id(kwargs)
         creator_wxid = str(kwargs.get("user_id") or "").strip()
-        stream_id = str(kwargs.get("stream_id") or "")
+        stream_id = str(kwargs.get("stream_id") or kwargs.get("session_id") or kwargs.get("chat_id") or chat_id).strip()
 
         fm_matches = re.findall(r"\bFM\d{4,}\b", f"{writing_instruction} {reference_text}".upper())
         if fm_matches:
@@ -227,6 +228,7 @@ class EmbodiedWorkspacePlugin(MaiBotPlugin):
 
         gen_res = await self.ctx.call_capability(
             "maisaka.reply.generate",
+            timeout_ms=180000,
             stream_id=stream_id,
             reference=writing_instruction,
             format_instruction=f"请撰写一篇标题为《{title}》的完整长文 Markdown。\n补充参考材料：{reference_text}",
@@ -700,7 +702,8 @@ class EmbodiedWorkspacePlugin(MaiBotPlugin):
         return f"未找到当前会话下可撤销的链接标识：{clean_token}"
 
     @HookHandler("maisaka.reply.before_post_process")
-    async def protect_subdomain_url_hook(self, event: dict[str, Any]) -> dict[str, Any]:
+    async def protect_subdomain_url_hook(self, event: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+        _ = kwargs
         text = str(event.get("response") or "")
         short_host = self.config.short_link_base_url.replace("https://", "").replace("http://", "").strip("/")
         if self.config.base_domain in text or (short_host and short_host in text):
