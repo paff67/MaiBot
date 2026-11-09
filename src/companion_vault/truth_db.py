@@ -218,12 +218,26 @@ class CompanionTruthDB:
         )]
 
     def _render_self_identity_anchor(self, self_wxid: str = "wxid_w5d0efdxczt322") -> str:
-        """[修复断点 4] 明确告知模型自身底层微信 ID 与他指排他规则"""
+        """[动态人设与身份排他准则] 明确告知模型自身底层微信 ID、核心人设名与别名，并严格排他"""
+        try:
+            from src.config.config import global_config
+            bot_name = str(getattr(global_config.bot, "nickname", "") or "许妍").strip()
+            aliases = [str(a).strip() for a in (getattr(global_config.bot, "alias_names", []) or []) if str(a).strip()]
+        except Exception:
+            bot_name = "许妍"
+            aliases = ["妍妍", "小妍"]
+
+        alias_str = "、".join(aliases) if aliases else ""
+        alias_prompt = f"（别名：{alias_str}）" if alias_str else ""
+        at_tokens = [f"'@{bot_name}'"] + [f"'@{a}'" for a in aliases]
+        at_rules = " 或 ".join(at_tokens)
+
         return (
             "<自身账号与提及判定准则>\n"
-            f"- 你的唯一本名/群名片：许妍（别名：妍妍、小妍） | 你的底层微信ID：{self_wxid}\n"
-            f"- 提及(@)严格判定规则：仅当消息包含指向 '{self_wxid}' 的 @提及 或明确文本 '@许妍'/'@妍妍'/'@小妍' 时，才是在 @ 你本人。\n"
+            f"- 你的唯一核心名字/当前人设：{bot_name}{alias_prompt} | 你的底层微信ID：{self_wxid}\n"
+            f"- 提及(@)严格判定规则：仅当消息包含指向 '{self_wxid}' 的 @提及 或明确文本 {at_rules} 时，才是在 @ 你本人。\n"
             "- 当消息中出现 '@其他名字'（例如 '@ì _eun' 等）时，那是群成员在 @ 群内的其他群友（可通过下方<重要角色索引>核对其微信昵称与备注名的对应关系），绝不是你的底层代号，切勿将他人的微信昵称误认为自己！\n"
+            "- 如果群内有群友昵称与你相似或重名，以底层微信ID及下方<重要角色索引>为准，严禁将他人发言视作对你的指令。\n"
             "</自身账号与提及判定准则>"
         )
 

@@ -210,3 +210,36 @@ PY'
    ```bash
    ssh DMIT-US 'systemctl restart maibot-main maibot-message-ingest maibot-message-media && systemctl is-active maibot-main maibot-message-ingest maibot-message-media'
    ```
+
+---
+
+## 七、 常见生产排障 SOP 与典型故障根因分析
+
+### 1. 故障案例：引用回复工具（`reply`）耗时 30s+ 且前端报【执行失败】
+- **现象特征**：
+  WebUI / 监控中显示 Planner 成功思考并决定调用 `reply` 工具，但工具执行卡住约 35 秒，最终显示 `【执行失败】 35.10s`，群聊中未能发送出任何消息。
+- **根本机理拆解**：
+  1. **引用保护逻辑升级**：
+     即使 Planner 传入 `set_quote: false`，若 Planner 思考耗时较长（例如 15~20s），在此期间群内若有其他成员发言（新消息插入），系统触发 `target_has_moved_on` 保护逻辑，将 `effective_set_quote` 强制升级为 `True`，尝试以微信原生 AppMsg 57 引用回复方式发包。
+  2. **手机端 Frida Hook 崩溃**：
+     微信底层方法为 `k0.I(appMsg, appId, appName, toUser, mediaTagName, data)`。若误将 `chatId` 传给 `appId`（参数 2）而 `toUser`（参数 4）传空，或 XML 中 `<fromusername>` 未传真实 `wxid`：
+     - 微信异步协程 `ru.d` 会在准备阶段报错 `prepare retCode: -520012`；
+     - 接着在入库更新阶段报错 `updateMsg retCode: -520009`（`UpdateMsgError`）；
+     - 消息彻底无法写入 `EnMicroMsg.db` 的 `message` 表。
+  3. **超时级联中断**：
+     手机端 Frida 轮询 15 秒未等到本地入库，将任务标记为 `status='submitted_unconfirmed'` 并返回 `DeliveryStatus.PENDING`。云端 `SendService` 将其视作未送达，从而使工具调用在 35 秒时报错中断。
+- **排障诊断与修复 SOP**：
+  1. 检查手机端 XLog：使用 Frida 挂钩 `com.tencent.mars.xlog.Log`，观察是否有 `send_app_msg_quote` 相关的 `-520012` 或 `-520009` 日志；
+  2. 校验 `message_capture.js`：确保调用签名为 `k0.I(appMsg, "", "", chatId, "", null)`，且 `<fromusername>` 从 `userinfo WHERE id=2` 动态获取；
+  3. 确认修复后重载：重启 `frida-inject` 守护进程，并在群聊中重试，确认微信返回 `send_result_type=Success`（耗时仅约 600ms）。
+
+### 2. 故障案例：群聊中机器人“认错人”或将艾特群友误判为艾特自己
+- **现象特征**：
+  群聊中某用户艾特另外一位群友（如 `@R`），机器人却插话回答或在思考中说“群友艾特了我，但我不知道为什么艾特我”。
+- **根本机理拆解**：
+  1. **账号昵称不对称**：实体机登录的微信号全局昵称（如 `paff`）若与群内真人重名，且该群未设置“我在本群的昵称”（群名片）；
+  2. **Prompt 缺乏强排他映射**：Prompt 中如果写死了旧的人设名字或缺少底层 `wxid` 排他声明，大语言模型在注意力发散时，容易将上下文中出现的同名群友发言误以为是指向自己。
+- **排障诊断与修复 SOP**：
+  1. **检查群名片**：在手机微信中进入群聊天信息，查看“我在本群的昵称”。若为空，建议设置并与 `bot_config.toml` 中的 `nickname` 保持完全一致；
+  2. **检查真值库索引**：在 `DMIT-US` 查询 `companion_truth.db` 的 `person_info` 表，核实群内所有成员的 `person_name`、`wechat_remark` 与 `platform_ids`（wxid）映射关系是否健全；
+  3. **人设热更与别名同步**：系统已实装动态别名机制，在修改 `bot_config.toml` 中的 `nickname` 或 `alias_names` 后，主程序毫秒级热更生效，Prompt 自动注入带有 `<重要角色索引>` 与强排他准则的身份上下文，彻底消除误判。

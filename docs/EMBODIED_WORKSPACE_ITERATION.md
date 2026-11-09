@@ -642,3 +642,116 @@ pytest pytests/companion/ pytests/platform_io/ pytests/maisaka/ -q
 .........................................                                [100%]
 401 passed, 10 warnings in 15.42s
 ```
+
+
+---
+
+### 6. 轨道 B：微信 8.0.79 引用消息（AppMsg 57 / k0.I）参数错位、协程报错与秒级降级兜底实战攻坚
+
+#### (1) 四大核心隐患与根因剖析
+1. **P0 参数错位引发 Kotlin 协程崩溃**：
+   微信 8.0.79 底层 `com.tencent.mm.pluginsdk.model.app.k0.I` 的真实方法签名是：
+   ```java
+   public static Pair<Integer, Long> I(
+       nx0.r appMsg,
+       String appId,        // 必须为 ""
+       String appName,      // 必须为 ""
+       String toUser,       // 目标接收人 chatId（好友或群聊）
+       String mediaTagName, // 必须为 ""
+       byte[] data          // 必须为 null
+   )
+   ```
+   旧实现中将 `chatId` 误填为第 2 个参数 `appId`，而 `toUser` 传空。微信内部负责 AppMsg 发送的 Kotlin 异步协程任务 `ru.d`（继承自 `ev.j`）在 `prepare` 阶段因接收方为空返回 `retCode: -520012`；随后在更新消息状态入库 `updateMsg` 阶段报错 `retCode: -520009`（`UpdateMsgError`），上报系统埋点 `report32784`，消息被微信底层彻底丢弃且无法写入数据库。
+2. **P0 登录微信 ID 错填为 32 位 MD5 目录名**：
+   引用 XML `<fromusername>` 错误填充了手机端存储目录的 32 位 MD5 散列值 `account`，而非登录微信账号的真实 ID（如 `wxid_w5d0efdxczt322`）。
+3. **P1 Pair(0, null) 类型转换陷阱阻断轮询兜底**：
+   `k0.I` 在主线程将异步任务入队后立即返回 `Pair(0, null)`，其 `pair.second` 为 `null`。旧 JS 脚本将 `pair.second` 转换为字符串 `"null"`，导致 `activeSends` 中的 `matchedMsgId = "null"`。轮询检查判断 `!item.matchedMsgId` 时因字符串 `"null"` 判定为真，无法进入异步入库兜底匹配，最终等待 15 秒超时标记为 `submitted_unconfirmed`。
+4. **P1 引用表类型 type=822083633 与 WCDB 空格转义 &#x20; 匹配失效**：
+   微信 8.0.79 对引用卡片在 `message` 表中写入的真实类型为 `822083633`（`0x31000031`），且消息正文中的空格被转码为 `&#x20;`，导致基于字面量 `row.content.indexOf(item.content)` 的判定全部失效。
+
+#### (2) 生产级修复与降级机制架构时序图
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Cloud as 云端主脑 (DMIT-US / SendService)
+    participant Edge as 手机端 HTTP 服务 (edge_server.py)
+    participant Frida as 微信 Frida 守护进程 (message_capture.js)
+    participant WCDB as 微信本地数据库 (EnMicroMsg.db)
+    participant WCSvr as 微信云端服务器 (Tencent WeChat Server)
+
+    Cloud->>Edge: POST /wechat/send_quote (text, quote元数据)
+    Edge->>Edge: 计算拟人输入延迟 (typing_delay_ms)
+    Edge->>Frida: 写入 Spool 文件 (send_spool_<reqId>.json)
+    
+    rect rgb(240, 248, 255)
+    note over Frida,WCDB: 校验被引用目标与参数组装
+    Frida->>WCDB: 检查被引用 msgSvrId 是否在本地库存在
+    alt 目标不存在 (例如已被撤回或未同步)
+        Frida->>Frida: 触发即时降级 (fallback_text_from_quote)
+        Frida->>WCDB: 调用 ISendMsgMgr (rt5.i5.Jj) 纯文本出站
+    else 目标有效
+        Frida->>Frida: 从 userinfo(id=2) 读取 selfWxid 组装 AppMsg 57
+        Frida->>Frida: 调用 k0.I(appMsg, "", "", chatId, "", null)
+        Frida->>Frida: 提取 safeLocalId (严格防止 "null" 转换)
+    end
+    end
+
+    Frida->>WCDB: 写入出站记录 (type=822083633 / type=1)
+    WCDB->>WCSvr: 异步网络发送
+    WCSvr-->>WCDB: 网络 ACK 回执 (status=2, 生成有效 msgSvrId)
+    
+    loop 轮询出站账本 (pollActiveSends)
+        Frida->>WCDB: 水位线扫描 (匹配 type in [822083633,49,1], HTML反转义, svrid)
+        WCDB-->>Frida: 命中已确认行 (status=2)
+        Frida->>Frida: 更新 send_outbox 为 confirmed
+    end
+
+    Edge->>Edge: 检查 send_outbox 状态
+    Edge-->>Cloud: 200 OK (status=confirmed, msg_id, msg_svr_id)
+```
+
+---
+
+### 7. 真机端到端全链路实测核验报告（DMIT-US + 小米 10）
+
+在云端主脑 `DMIT-US`（`/opt/maibot-brain`）与边缘手机节点（小米 10）完成代码同步、服务重启（`maibot-main`、`maibot-message-ingest`、Frida 守护进程）后，严格执行了以下三项端到端真机实测：
+
+#### (1) 生产库只读回放核验（`?mode=ro`）
+- **测试环境**：连接 `/opt/maibot-brain/data/companion_truth.db?mode=ro` 与 `message_ledger.db?mode=ro`。
+- **动态人设与提示词注入验证**：
+  - 动态读取别名：`{'许妍', '小妍', '妍妍'}`，与配置文件实时同步；
+  - 严格排他规则生成：
+    ```markdown
+    <自身账号与提及判定准则>
+    - 你的唯一核心名字/当前人设：许妍（别名：妍妍、小妍） | 你的底层微信ID：wxid_w5d0efdxczt322
+    - 提及(@)严格判定规则：仅当消息包含指向 'wxid_w5d0efdxczt322' 的 @提及 或明确文本 '@许妍' 或 '@妍妍' 或 '@小妍' 时，才是在 @ 你本人。
+    - 当消息中出现 '@其他名字'（例如 '@ì _eun' 等）时，那是群成员在 @ 群内的其他群友，切勿误认！
+    ```
+  - RBAC 隐私红线核查：群聊上下文名册仅投影 5 项脱敏字段，`impression` 与 `birthday` 出现次数为 **0**，无任何隐私泄露。
+- **历史真实群聊消息回放**：
+  - 针对真实历史群聊消息 `Msg 143250: wxid_6zag2e8h0bpq22:\n@ì _eun\u2005` 进行解析；
+  - 正确剥离群前缀 `wxid_6zag2e8h0bpq22:\n`；
+  - 正确解析艾特目标为 `wxid_ma7dkr0z5nnb22`，生成可序列化字典段 `[{'type': 'at', 'data': {'user_id': 'wxid_ma7dkr0z5nnb22', 'user_nickname': 'ì _eun(备注:R)'}}]`；
+  - 成功反序列化为官方组件对象 `AtComponent`。
+
+#### (2) 手机端引用发送与降级兜底实测
+- **测试用例 1：正常引用回复（Valid Quote Target）**
+  - **请求参数**：引用群聊真实消息 `svrid: 8330925920178374321`，发送文本 `[实测核验] 8.0.79引用回复瞬时确认`。
+  - **实测指标**：
+    - HTTP 状态码：`200 OK`
+    - 端到端耗时：**4.11s**（包含 906ms 拟人输入延迟与跨境 Tailscale 往返）
+    - 返回结构：`{'ok': True, 'sent': True, 'status': 'confirmed', 'msg_id': '143261', 'msg_svr_id': '8407849650823817759', 'send_layer': 'AppMsgLogic:k0.I(type=57,svrid=8330925920178374321)'}`
+    - 物理验证：手机微信群聊内即时显示带有原生 AppMsg 57 引用卡片的气泡，服务器 ACK 毫秒级生成。
+- **测试用例 2：目标不存在秒级降级纯文本（Graceful Fallback）**
+  - **请求参数**：传入不存在的伪造引用 `svrid: 9999999999999999999`，发送文本 `[实测核验] 降级纯文本测试`。
+  - **实测指标**：
+    - HTTP 状态码：`200 OK`
+    - 端到端耗时：**4.65s**（包含 580ms 拟人输入延迟）
+    - 返回结构：`{'ok': True, 'sent': True, 'status': 'confirmed', 'msg_id': '143263', 'msg_svr_id': '3420642032261631439', 'send_layer': 'fallback_text_from_quote'}`
+    - 降级验证：Frida 脚本反查目标不存在后，未发生 15 秒超时等待，立即自动路由至 `rt5.i5.Jj` 发出纯文本消息，群聊气泡顺利上屏。
+
+#### (3) 实时微信群服务监听状态
+- `maibot-main.service`：运行健康，WebSocket、Planner 与各模块就绪；
+- `maibot-message-ingest.service`：实时稳定轮询，Cursor（当前已推进至 `38203`）毫秒级入库；
+- 小米 10 边缘节点：Frida 注入稳定，内存与 CPU 负载极低，无任何崩溃或重启。

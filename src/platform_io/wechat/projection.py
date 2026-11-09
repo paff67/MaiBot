@@ -11,22 +11,41 @@ import sqlite3
 
 from .message_quotes import latest_quote, parse_quote, safe_body
 
-# 匹配微信群聊消息行首的 "<wxid>:\n" 前缀
+# 1. 匹配微信群聊消息行首的 "<wxid>:\n" 前缀
 _GROUP_SENDER_PREFIX_RE = re.compile(r"^([a-zA-Z0-9_@-]{4,64}):\n")
-# 匹配微信原生 @提及（以 \u2005 Four-Per-Em Space 结尾，或行尾/空白边界）
+# 2. 匹配微信原生 @提及（以 \u2005 Four-Per-Em Space 结尾，或空白/行尾边界）
 _WECHAT_AT_TOKEN_RE = re.compile(r"@([^\u2005\n@]{1,40})(?:\u2005|(?=\s|$))")
-# [v1.1 修正] 兼容 CDATA 包裹与多行空白的非贪婪 <atuserlist> 正则
+# 3. 兼容 CDATA 包裹与多行空白的非贪婪 <atuserlist> 正则
 _AT_USERLIST_RE = re.compile(
     r"<atuserlist>\s*(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?\s*</atuserlist>",
     re.IGNORECASE | re.DOTALL,
 )
 
-BOT_SELF_WXID = "wxid_w5d0efdxczt322"
-BOT_SELF_ALIASES = {"许妍", "妍妍", "小妍"}
+DEFAULT_SELF_WXID = "wxid_w5d0efdxczt322"
+BOT_SELF_WXID = DEFAULT_SELF_WXID
+
+
+def get_dynamic_bot_aliases() -> set[str]:
+    """从 global_config.bot 动态读取当前人设名称与别名，彻底解除硬编码（保持模块轻量延迟加载）"""
+    aliases: set[str] = set()
+    try:
+        from src.config.config import global_config
+        bot_cfg = getattr(global_config, "bot", None)
+        if bot_cfg:
+            nick = str(getattr(bot_cfg, "nickname", "") or "").strip()
+            if nick:
+                aliases.add(nick)
+            for a in getattr(bot_cfg, "alias_names", []) or []:
+                clean_a = str(a or "").strip()
+                if clean_a:
+                    aliases.add(clean_a)
+    except Exception:
+        pass
+    return aliases or {"许妍", "妍妍", "小妍"}
 
 
 def strip_group_sender_prefix(raw_text: str, sender_id: str = "", is_group: bool = False) -> str:
-    """剥离微信 EnMicroMsg.db 群聊消息体头部的 'wxid_xxx:\\n' 前缀"""
+    """剥离微信 EnMicroMsg.db 群聊消息体头部的 'wxid_xxx:\n' 前缀"""
     if not raw_text:
         return ""
     m = _GROUP_SENDER_PREFIX_RE.match(raw_text)
@@ -42,10 +61,7 @@ def extract_xml_at_wxids(
     raw_content: str = "",
     row_json: str | dict[str, Any] | None = None,
 ) -> list[str]:
-    """
-    [v1.1 修正] 从生产 message_ledger.db 的 raw_content 以及 row_json 的
-    msg_source / raw_content / content 多源字段中提取 <atuserlist> 内的精确 wxid 列表。
-    """
+    """从 message_ledger.db 的 raw_content 及 row_json (msg_source/raw_content/content) 多源提取 <atuserlist>"""
     candidates: list[str] = []
     if raw_content:
         candidates.append(str(raw_content))
@@ -82,31 +98,38 @@ def extract_xml_at_wxids(
 
 def build_identity_lookup_maps(
     truth_conn: sqlite3.Connection | None,
-    self_wxid: str = BOT_SELF_WXID,
+    self_wxid: str = DEFAULT_SELF_WXID,
 ) -> tuple[dict[str, dict[str, str]], dict[str, str]]:
     """
-    从 companion_truth.db 的 person_info 构建只读身份映射（严禁读取 impression/birthday/tags）：
+    从 companion_truth.db 的 person_info 构建只读身份映射：
     1. wxid_to_profile: {wxid: {"person_id", "person_name", "wechat_remark", "trust_role"}}
-    2. name_to_wxid: {转小写的昵称或备注: wxid}（含机器人自身别名映射）
+    2. name_to_wxid: {转小写的昵称或备注: wxid}（含动态读取的机器人自身人设名与别名映射）
     """
     wxid_to_profile: dict[str, dict[str, str]] = {}
     name_to_wxid: dict[str, str] = {}
 
-    for alias in BOT_SELF_ALIASES:
+    for alias in get_dynamic_bot_aliases():
         name_to_wxid[alias.lower()] = self_wxid
 
     if truth_conn is None:
         return wxid_to_profile, name_to_wxid
 
     try:
-        rows = truth_conn.execute(
+        cursor = truth_conn.execute(
             "SELECT person_id, person_name, wechat_remark, platform_ids, trust_role FROM person_info"
-        ).fetchall()
+        )
+        col_names = [d[0] for d in cursor.description] if cursor.description else []
+        rows = cursor.fetchall()
     except sqlite3.Error:
         return wxid_to_profile, name_to_wxid
 
     for r in rows:
-        row_dict = dict(r) if not isinstance(r, dict) else r
+        if isinstance(r, dict):
+            row_dict = r
+        elif isinstance(r, sqlite3.Row):
+            row_dict = dict(r)
+        else:
+            row_dict = dict(zip(col_names, r))
         try:
             pids = json.loads(str(row_dict.get("platform_ids") or "{}"))
         except Exception:
@@ -143,9 +166,9 @@ def enrich_sender_identity(
     wxid_to_profile: dict[str, dict[str, str]],
 ) -> None:
     """
-    [修复断点 2] 严格区分微信公开昵称 (person_name) 与号主单向备注 (wechat_remark)：
-    - sender_nickname: 优先使用真实的微信昵称 person_name（如 'ì _eun'）；
-    - sender_cardname: 承载号主备注 wechat_remark（如 'R'），使消息头渲染为 <message user="ì _eun" group_card="R">。
+    解耦微信公开昵称 (person_name) 与号主单向备注 (wechat_remark)：
+    - sender_nickname: 优先使用 person_name（如 'ì _eun'），确保群友 @ì _eun 时名字在上下文中可对齐；
+    - sender_cardname: 承载 wechat_remark（如 'R'），使消息头渲染为 <message user="ì _eun" group_card="R">。
     """
     profile = wxid_to_profile.get(sender_wxid, {})
     person_name = profile.get("person_name", "").strip()
@@ -167,10 +190,9 @@ def parse_wechat_text_to_raw_segments(
     xml_at_wxids: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """
-    [v1.1 修正 P0] 产出与 PluginMessageUtils._message_sequence_from_dict 100% 兼容的中间字典结构：
+    产出与 PluginMessageUtils._message_sequence_from_dict 兼容的中间字典列表：
     - 文本段: {"type": "text", "data": "..."}
     - 提及段: {"type": "at", "data": {"user_id": "...", "user_nickname": "..."}}
-    底座反序列化时将自动转换为 src.common.data_models.message_component_data_model.AtComponent。
     """
     cleaned = strip_group_sender_prefix(raw_text, sender_id=sender_id, is_group=is_group)
     if not cleaned:
@@ -184,10 +206,11 @@ def parse_wechat_text_to_raw_segments(
         start, end = match.span()
         at_display_name = match.group(1).strip()
 
-        # 优先通过昵称/备注映射表反查 wxid，其次按序消费 <atuserlist> 中的精确 wxid
         resolved_wxid = name_to_wxid.get(at_display_name.lower(), "")
         if not resolved_wxid and xml_wxid_queue:
             resolved_wxid = xml_wxid_queue.pop(0)
+        elif resolved_wxid and xml_wxid_queue and xml_wxid_queue[0] == resolved_wxid:
+            xml_wxid_queue.pop(0)
 
         has_u2005 = cleaned[end - 1 : end] == "\u2005"
         if not has_u2005 and not resolved_wxid:
@@ -382,7 +405,6 @@ def project_message(record: Dict[str, Any]) -> Dict[str, Any]:
     user_nickname = record.get("sender_nickname") or sender
     user_cardname = record.get("sender_cardname")
     group_name = record.get("group_name") or record["chat_id"]
-    # No implicit image-to-caption or audio-to-text conversion. Original assets remain in the vault.
     return {
         "message_id": native_message_id(record["source"], record["account"], record["msg_id"]),
         "platform": "wechat",

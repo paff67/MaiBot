@@ -79,9 +79,25 @@ flowchart LR
   `message_capture.js` 通过 `Java.cast(Java.use('no3.w1').a(), Java.use('rt5.i5')).Jj(chatId, content, msgType, 0)` 调用微信内部 `MicroMsg.SendMsgMgr`（实现 `ISendMsgMgr` 接口 `no3.c1`）。该入口不依赖前台 `ChattingUI`，支持手机息屏、处于桌面或停留在任意其他界面时向任意 `wxid_*` 或 `*@chatroom` 发送消息。
 - **原生引用回复（`AppMsgLogic:k0.I` + `nx0.r` AppMsg 57 消息卡片）**：
   - **微信引用底层机制**：微信 Android 8.0.79 的引用回复并非纯文本拼接，而是标准的 AppMsg（库表 `type=822083633`，AppMsg 内部 `type=57`）。XML 内包含完整 `<refermsg>` 节点，涵盖被引用消息的全局唯一 `svrid`、来源会话 `fromusr`、原发送者 `chatusr`、原发送者昵称/备注 `displayname`、原消息摘要 `content` 与时间戳 `createtime`。
-  - **逆向反编译关键路径**：
+  - **逆向反编译关键路径与底层签名**：
     - 数据模型反序列化：`Java.use('nx0.r').v(xml)` 解析 XML 并自动实例化 `com.tencent.mm.plugin.msgquote.model.MsgQuoteItem`（`na5.a`）至 AppMsg 的 `x2` 字段。
-    - 无 UI 发送分发：`Java.use('com.tencent.mm.pluginsdk.model.app.k0').I(appMsg, chatId, "", "", "", null)` 完成消息入库（`status=1`）、加入 NetScene 发送队列并返回 `Pair<Integer, Long>(0, localMsgId)`。
+    - XML 规范与账号绑定：XML 根部 `<fromusername>` **必须传入当前登录微信号的真实 `wxid`**（通过 `SELECT value FROM userinfo WHERE id=2` 动态获取，如 `wxid_w5d0efdxczt322`），绝不可传入 32 位 MicroMsg 目录 MD5 哈希，否则会导致鉴权失败。
+    - 无 UI 发送分发与正确参数签名：
+      底层方法完整签名为：
+      ```java
+      public static Pair<Integer, Long> com.tencent.mm.pluginsdk.model.app.k0.I(
+          nx0.r appMsg,
+          String appId,        // 必须传 ""（应用ID，非第三方App场景为空）
+          String appName,      // 必须传 ""（应用名）
+          String toUser,       // 目标会话 chatId（好友 wxid_* 或群聊 *@chatroom）
+          String mediaTagName, // 必须传 ""
+          byte[] data          // 必须传 null
+      )
+      ```
+      > [!IMPORTANT]
+      > **核心参数位置防坑踩点**：目标接收者 `chatId` **必须作为第 4 个参数（`toUser`）传入**，调用形式为 `k0.I(appMsg, "", "", chatId, "", null)`！若错误将 `chatId` 误传给第 2 个参数 `appId`，微信内部异步 Kotlin 协程任务 `ru.d`（继承自 `ev.j`）在 `prepare` 阶段将因收件人为空报错 `retCode: -520012`，在 `updateMsg` 阶段报错 `retCode: -520009`（`UpdateMsgError`），上报日志 `report32784`，消息将完全无法写入数据库。
+    - 异步协程返回与回执捕获：
+      `k0.I` 调用后在主线程入队一个异步协程（`ru.d`），立即返回 `Pair(0, null)`，其 `pair.second` 为 `null`。因此出站账本不能依赖同步返回值中的 `localMsgId`，而是通过 `pollActiveSends()` 记录调用前的 `maxMsgIdBefore` 水位线；当协程将消息写入 `message` 表（`type=822083633, status=1`）并通过网络 CGI 发送成功（`status=2` 且生成 `msgSvrId`）时，增量水位线扫描捕获并完成回执闭环，端到端完整耗时仅约 **600ms**。
   - **云端解析与端到端闭环（`driver.py` & `edge_client.py`）**：
     - 当 Maisaka Planner 产出带 `ReplyComponent` 的回复时，`WeChatRootDriver._resolve_quote_target` 提取 `target_message_id`（如 `#wechat:scope:account:143229`），从 `message_ledger.db` 查询原始 `server_id`、`body`、`updated_at_ms`，并从 `companion_truth.db` 的 `person_info` 表匹配 `wechat_remark` 与 `person_name`。
     - 组装标准 quote 元数据后通过 `POST /wechat/send_quote` 投递至手机端 `edge_server.py`，经原子 Spool 入队并由 Frida 脚本无 UI 调度 `k0.I` 原生出站，彻底解决微信端仅展示孤立纯文本气泡而丢失引用卡片的问题。
@@ -130,6 +146,25 @@ flowchart LR
   2. `additional_config["platform_io_target_group_id"]`
   3. `additional_config["platform_io_target_user_id"]`（私聊目标用户，由 `send_service` 注入）
   4. `message.message_info.user_info.user_id`
+
+### 3. 人设多态性与三层身份解耦机制（`projection.py` & `truth_db.py`）
+为支持用户随时在 WebUI 切换 Profile（人设卡）或修改名字设定，系统构建了**平台物理身份与认知身份解耦的三层模型**：
+1. **三层身份分工**：
+   - **平台物理层（Physical Platform Layer）**：由底层微信号（`self_wxid`，如 `wxid_w5d0efdxczt322`）作为不可变基石；全局昵称（`userinfo id=4`）与各群名片（`chatroom.displayname`）构成外部视角；
+   - **投影路由层（Projection & Routing Layer）**：[`projection.py`](../../src/platform_io/wechat/projection.py) 不再硬编码任何名字常量，通过 `get_bot_self_aliases()` 动态读取 `global_config.bot.nickname` 与 `alias_names` 维护 `name_to_wxid` 字典，确保无论艾特新旧人设名字还是底层 wxid 都能精确解析；
+   - **认知与真值层（Cognitive & Truth Layer）**：以 `bot_config.toml` 为单一事实源，[`truth_db.py`](../../src/companion_vault/truth_db.py) 动态生成 `<自身账号与提及判定准则>`。
+2. **认知层双重身份排他准则（Dual-Identity Perception）**：
+   在上下文头部显式注入模型自我认知与排他防漂移规则：
+   ```markdown
+   <自身账号与提及判定准则>
+   - 你的唯一核心名字/当前人设：{bot_name}{alias_prompt} | 你的底层微信ID：{self_wxid}
+   - 提及(@)严格判定规则：仅当消息包含指向 '{self_wxid}' 的 @提及 或明确文本 {'@' + bot_name} / {'@' + alias} 时，才是在 @ 你本人。
+   - 当消息中出现 '@其他名字'（例如 '@ì _eun' 等）时，那是群成员在 @ 群内的其他群友（可通过下方<重要角色索引>核对其微信昵称与备注名的对应关系），绝不是你的底层代号，切勿将他人的微信昵称误认为自己！
+   - 如果群内有群友昵称与你相似或重名，以底层微信ID及下方<重要角色索引>为准，严禁将他人发言视作对你的指令。
+   </自身账号与提及判定准则>
+   ```
+3. **多 Profile 无缝热更新**：
+   用户在 WebUI 切换人设时，系统热重载配置并即时刷新别名映射和身份 Prompt 准则，零重启无缝切换；同时建议在实体微信群中同步更新“我在本群的昵称”，保持界面物理对称。
 
 ---
 
