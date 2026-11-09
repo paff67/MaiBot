@@ -20,7 +20,7 @@ class ComputeEconomySnapshot:
     fairy_total_spent_usd: float      # 累计总投入: settled_total_spent + unsettled_local_cost
     tier_code: str                    # "SUPERCHARGED" | "STANDARD" | "THRIFTY" | "HIBERNATING"
     tier_label: str                   # "充裕超频态" | "日常标准态" | "吃紧省流态" | "断粮休眠态"
-    active_sister: str                # 当前默认轮班角色标识
+    active_sister: str                # 当前激活模型/调度槽位标识
     updated_at_iso: str
 
 
@@ -92,7 +92,7 @@ class ComputeEconomyManager:
                 "fairy_unsettled_cost_usd": "REAL NOT NULL DEFAULT 0.0",
                 "fairy_total_spent_usd": "REAL NOT NULL DEFAULT 0.0",
                 "fairy_compute_tier": "TEXT NOT NULL DEFAULT 'STANDARD'",
-                "active_sister": "TEXT NOT NULL DEFAULT '许妍(Flash)'",
+                "active_sister": "TEXT NOT NULL DEFAULT 'flash_primary'",
                 "balance_updated_at": "TEXT NOT NULL DEFAULT ''",
             }
             for col_name, col_def in additions.items():
@@ -124,12 +124,12 @@ class ComputeEconomyManager:
     @staticmethod
     def evaluate_tier(balance_usd: float, is_available: bool = True) -> tuple[str, str, str]:
         if not is_available or balance_usd < 0.5:
-            return ("HIBERNATING", "断粮休眠态", "许妍(Flash)")
+            return ("HIBERNATING", "断粮休眠态", "flash_low_power")
         if balance_usd < 3.0:
-            return ("THRIFTY", "吃紧省流态", "许妍(Flash)")
+            return ("THRIFTY", "吃紧省流态", "flash_primary")
         if balance_usd < 15.0:
-            return ("STANDARD", "日常标准态", "许妍(Flash) / 姐姐(Argon·按需)")
-        return ("SUPERCHARGED", "充裕超频态", "双子协同(姐姐Argon + 许妍Flash)")
+            return ("STANDARD", "日常标准态", "flash_primary_argon_on_demand")
+        return ("SUPERCHARGED", "充裕超频态", "dual_argon_flash")
 
     def record_local_cost(self, estimated_cost_usd: float) -> ComputeEconomySnapshot:
         cost = max(0.0, float(estimated_cost_usd))

@@ -299,14 +299,16 @@ class CompanionTruthDB:
         sender_trust_role: str,
     ) -> str:
         """
-        严格使用 WHERE row_id = 1 读取 global_state 中的算力与双子轮班状态，
-        并按 OWNER 私聊 vs 公共会话执行公私隔离投影。
+        仅投影 global_state (row_id = 1) 中的客观算力工况与槽位状态，严禁在此处硬编码任何角色背景或世界观文案。
+        公私隔离规则：
+        - OWNER 私聊：投影实时算力余额、累计消耗、算力工况档位与当前激活模型槽位；
+        - 群聊或非 OWNER：仅投影脱敏的工作区可用状态，隐藏具体美元余额与账单数值。
         """
         remote_bal = 5.0
         unsettled_cost = 0.0
         total_spent = 0.0
         tier_code = "STANDARD"
-        active_sister = "许妍(Flash)"
+        active_slot = "flash_primary"
         try:
             cols = {
                 str(r["name"])
@@ -325,7 +327,7 @@ class CompanionTruthDB:
                     unsettled_cost = float(row["fairy_unsettled_cost_usd"] or 0.0)
                     total_spent = float(row["fairy_total_spent_usd"] or 0.0)
                     tier_code = str(row["fairy_compute_tier"] or "STANDARD")
-                    active_sister = str(row["active_sister"] or "许妍(Flash)")
+                    active_slot = str(row["active_sister"] or "flash_primary")
         except Exception:
             pass
 
@@ -339,26 +341,17 @@ class CompanionTruthDB:
         tier_label = tier_label_map.get(tier_code, "日常标准态")
         is_owner_private = (not is_group_chat) and (sender_trust_role.upper() == "OWNER")
 
-        base_worldview = (
-            "- 现实背景：日本东京文京区（本乡三丁目）合租公寓，客厅水冷服务器机柜中运行着自主研发的通用人工智能原型机「Fairy」。\n"
-            "- 双子设定：\n"
-            "  1. 妹妹·许妍（绑定 Gemini Flash）：国内本科毕业后赴东京投奔姐姐，现为东京大学 AI 方向研究生（修士）在读；\n"
-            "  2. 姐姐（绑定 Gemini Argon）：前 DeepMind 实验室核心研究员，后定居东京，主导「Fairy」核心架构研发。\n"
-            f"- 当前值班状态：{active_sister} | 算力工况档位：{tier_label} ({tier_code})"
-        )
-
         if is_owner_private:
             return (
-                "<双子背景与Fairy算力账本 (Owner私聊视图)>\n"
-                f"{base_worldview}\n"
-                f"- 实时算力余额：${effective_bal:.2f} USD | Fairy 累计研发总投入：${total_spent:.2f} USD\n"
-                "- 当前对话对象为「Fairy」项目的唯一资助人（Owner）与亲密伙伴。\n"
-                "</双子背景与Fairy算力账本>"
+                "<算力工况与工作区状态 (Owner私聊视图)>\n"
+                f"- 算力工况档位：{tier_label} ({tier_code}) | 当前模型槽位：{active_slot}\n"
+                f"- 实时算力可用余额：${effective_bal:.2f} USD | 累计消耗总额：${total_spent:.2f} USD\n"
+                "</算力工况与工作区状态>"
             )
         return (
-            "<双子背景与工作区状态>\n"
-            f"{base_worldview}\n"
-            "</双子背景与工作区状态>"
+            "<工作区运行状态>\n"
+            f"- 算力工况档位：{tier_label} ({tier_code}) | 当前模型槽位：{active_slot}\n"
+            "</工作区运行状态>"
         )
 
     def build_planner_catalog_injection(

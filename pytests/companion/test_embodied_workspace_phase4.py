@@ -271,7 +271,7 @@ def test_truth_db_twins_background_and_public_private_isolation(tmp_path: Path):
             truth_db.conn.execute("ALTER TABLE global_state ADD COLUMN fairy_unsettled_cost_usd REAL DEFAULT 0.0")
             truth_db.conn.execute("ALTER TABLE global_state ADD COLUMN fairy_total_spent_usd REAL DEFAULT 0.0")
             truth_db.conn.execute("ALTER TABLE global_state ADD COLUMN fairy_compute_tier TEXT DEFAULT 'STANDARD'")
-            truth_db.conn.execute("ALTER TABLE global_state ADD COLUMN active_sister TEXT DEFAULT '许妍(Flash)'")
+            truth_db.conn.execute("ALTER TABLE global_state ADD COLUMN active_sister TEXT DEFAULT 'flash_primary'")
         truth_db.conn.execute(
             """
             UPDATE global_state SET
@@ -279,7 +279,7 @@ def test_truth_db_twins_background_and_public_private_isolation(tmp_path: Path):
                 fairy_unsettled_cost_usd = 0.50,
                 fairy_total_spent_usd = 12.30,
                 fairy_compute_tier = 'STANDARD',
-                active_sister = '许妍(Flash)'
+                active_sister = 'flash_primary'
             WHERE row_id = 1
             """
         )
@@ -289,12 +289,11 @@ def test_truth_db_twins_background_and_public_private_isolation(tmp_path: Path):
         is_group_chat=False,
         sender_trust_role="OWNER",
     )
-    assert "<双子背景与Fairy算力账本 (Owner私聊视图)>" in owner_injection
-    assert "妹妹·许妍（绑定 Gemini Flash）：国内本科毕业后赴东京投奔姐姐，现为东京大学 AI 方向研究生（修士）在读" in owner_injection
-    assert "姐姐（绑定 Gemini Argon）：前 DeepMind 实验室核心研究员，后定居东京" in owner_injection
-    assert "实时算力余额：$8.00 USD" in owner_injection
-    assert "Fairy 累计研发总投入：$12.30 USD" in owner_injection
-    assert "唯一资助人（Owner）与亲密伙伴" in owner_injection
+    assert "<算力工况与工作区状态 (Owner私聊视图)>" in owner_injection
+    assert "算力工况档位：日常标准态 (STANDARD)" in owner_injection
+    assert "当前模型槽位：flash_primary" in owner_injection
+    assert "实时算力可用余额：$8.00 USD" in owner_injection
+    assert "累计消耗总额：$12.30 USD" in owner_injection
 
     # 2. 验证群聊公共视图（脱敏，严格隐藏美元具体余额）
     group_injection = truth_db.build_planner_catalog_injection(
@@ -302,14 +301,19 @@ def test_truth_db_twins_background_and_public_private_isolation(tmp_path: Path):
         sender_trust_role="GROUP_MEMBER",
         chat_id="test_room@chatroom",
     )
-    assert "<双子背景与工作区状态>" in group_injection
-    assert "<双子背景与Fairy算力账本 (Owner私聊视图)>" not in group_injection
-    assert "妹妹·许妍（绑定 Gemini Flash）：国内本科毕业后赴东京投奔姐姐，现为东京大学 AI 方向研究生（修士）在读" in group_injection
-    assert "姐姐（绑定 Gemini Argon）：前 DeepMind 实验室核心研究员" in group_injection
+    assert "<工作区运行状态>" in group_injection
+    assert "<算力工况与工作区状态 (Owner私聊视图)>" not in group_injection
+    assert "算力工况档位：日常标准态 (STANDARD)" in group_injection
+    assert "当前模型槽位：flash_primary" in group_injection
     # 严格确保脱敏：群聊中绝不泄露美元金额
-    assert "实时算力余额" not in group_injection
+    assert "实时算力可用余额" not in group_injection
+    assert "累计消耗总额" not in group_injection
     assert "$8.00" not in group_injection
     assert "$12.30" not in group_injection
-    assert "唯一资助人" not in group_injection
+
+    # 3. 严格断言返回文本中绝不包含任何硬编码角色设定词汇
+    for forbidden in ("DeepMind", "文京区", "本乡三丁目", "东京大学", "修士", "双子", "合租", "资助人"):
+        assert forbidden not in owner_injection
+        assert forbidden not in group_injection
 
     truth_db.close()
