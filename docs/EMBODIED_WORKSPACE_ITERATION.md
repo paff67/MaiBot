@@ -536,7 +536,7 @@ python3 -m compileall -q plugins/embodied_workspace
 | **Phase 1** | `feat/embodied-workspace-phase1` | `90aac6bcce5a6d91d97c1a4960f388738311feef` | 完成快慢双轨分流、bwrap 命名空间沙盒、双库 RBAC 鉴权、Auto-Wake/Scale-to-Zero 网关与 6 项自动化测试。 | `agy` (Antigravity) |
 | **Phase 2** | `feat/embodied-workspace-phase2` | `c82ba349d` | 单级泛域名、CF Pages 边缘 2A 跳板、真值库 8 表 Schema 严格对齐、四级无感身份接力（抗预取）、FUSE 归档直写与 5 项专项测试。 | `agy` (Antigravity) |
 | **Phase 3** | `feat/embodied-workspace-phase3` | `e87de93fd` | cgroups v2 硬隔离包装器、宿主独立 Git 时光机双目录快照与回滚、群组全双工 WebSocket 实时总线、会话目录管理工具与 4 项专项测试。 | `agy` (Antigravity) |
-| **Mention Fix** | `feat/wechat-at-mention-identity-fix` | `HEAD` | 微信群聊 @mention XML 提取、中间字典段安全反序列化、昵称与备注名解耦双保留、RBAC 群聊脱敏花名册注入与 4 项专项单测。 | `agy` (Antigravity) |
+| **Mention Fix** | `feat/wechat-at-mention-identity-fix` | `52afe283f` | 微信群聊 @mention XML 提取、中间字典段安全反序列化、昵称与备注名解耦双保留、RBAC 群聊脱敏花名册注入与 4 项专项单测。 | `agy` (Antigravity) |
 
 
 ---
