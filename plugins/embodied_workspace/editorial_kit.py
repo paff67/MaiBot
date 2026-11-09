@@ -113,6 +113,13 @@ EDITORIAL_KIT_JS = r"""/* MaiBot Fairy Editorial Interactive Kit (Progress + Aut
     }
 
     document.querySelectorAll("pre").forEach((pre) => {
+      if (pre.classList.contains("mermaid")) {
+        let txt = pre.textContent || "";
+        txt = txt.replace(/--\s*"?([^"\n-]+?)"?\s*-->/g, "-->|$1|");
+        txt = txt.replace(/\["([^"]*?)'([^"]*?)"\]/g, '["$1$2"]');
+        pre.textContent = txt;
+        return;
+      }
       if (pre.querySelector(".fairy-copy-btn")) return;
       const btn = document.createElement("button");
       btn.className = "fairy-copy-btn";

@@ -332,9 +332,14 @@ class CLIBridge:
 
 ### 1. 长文本与深度排版 (`task_type == "document"`)
 当任务是撰写或整理长文章、攻略、报告、复盘或文档时：
+- **实时联网与事实核查（硬性原则）**：
+  凡涉及热点新闻、近期突发事件、时效性调查或人物事实核查，**严禁仅凭历史记忆主观推测或臆断（例如误将真实突发事件当成“谣言辟谣”）**。必须在终端执行 `web-search "<搜索关键词>"` 工具获取 Google 权威实时检索结果与最新新闻事实后，再进行客观严谨的报告撰写。
 - **双格式产出**：将完整的 Markdown 原稿保存至 `{ws_root}/dist/{slug}/files/{slug}.md`，同时生成排版精美的 `{ws_root}/dist/{slug}/index.html`。
 - **样式与组件引用**：在 `index.html` 中可直接引用 `<link rel="stylesheet" href="./_kit/editorial_theme.css">` 与 `<script src="./_kit/editorial_kit.js" defer></script>`（自动提供顶部阅读进度条、代码块一键复制与多章节浮动目录 TOC）。
-- **富文本支持**：数学公式使用 KaTeX CDN 渲染，流程图/时序图使用 Mermaid CDN 渲染，并在页面底部提供 `./files/{slug}.md` 原稿下载入口。
+- **富文本与图表规范**：
+  - 数学公式使用 KaTeX CDN 渲染；
+  - 流程图/时序图使用 Mermaid CDN 渲染：**连线标注必须使用箭头管道语法 `A -->|标注说明| B`，严禁使用 `-- "文字" -->`**；节点文本避免单双引号多层混用；
+  - 页面底部提供 `./files/{slug}.md` 原稿下载入口。
 
 ### 2. 交互式单页与数据可视化 (`task_type == "webapp"`)
 - 生成 `{ws_root}/dist/{slug}/index.html`，所有资源使用相对路径或公共 CDN（Tailwind / ECharts / Chart.js）。
