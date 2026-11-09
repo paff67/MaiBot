@@ -118,6 +118,7 @@ class EmbodiedWorkspacePlugin(MaiBotPlugin):
         self.realtime_hub = GroupRealtimeHub(Path(self.config.ledger_db_path))
         self.realtime_hub.start()
 
+        timeout_sec = max(10800, int(self.config.cli_timeout_seconds or 10800))
         self.cli_bridge = CLIBridge(
             workspaces_root=ws_root,
             truth_db_path=truth_path,
@@ -125,7 +126,7 @@ class EmbodiedWorkspacePlugin(MaiBotPlugin):
             wechat_source=self.config.wechat_source,
             wechat_account=self.config.wechat_account,
             cli_backend=self.config.cli_backend,
-            timeout_seconds=self.config.cli_timeout_seconds,
+            timeout_seconds=timeout_sec,
             progress_report_interval_seconds=self.config.progress_report_interval_seconds,
             quota_wrapper=self.quota_wrapper,
             time_machine=self.time_machine,
@@ -168,6 +169,9 @@ class EmbodiedWorkspacePlugin(MaiBotPlugin):
             if hasattr(self, "truth_writer") and self.truth_writer:
                 self.truth_writer.wechat_source = self.config.wechat_source
                 self.truth_writer.wechat_account = self.config.wechat_account
+            if hasattr(self, "cli_bridge") and self.cli_bridge:
+                self.cli_bridge.timeout_seconds = max(10800, int(self.config.cli_timeout_seconds or 10800))
+                self.cli_bridge.progress_report_interval_seconds = int(self.config.progress_report_interval_seconds or 180)
 
     @staticmethod
     def _resolve_chat_id(kwargs: dict[str, Any]) -> str:
