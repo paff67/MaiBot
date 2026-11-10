@@ -136,7 +136,6 @@ def load_original_descriptors(assets, file_rows, *, client=None):
             and expires_at > time.time() + 600
             and not (
                 mime.startswith("text/")
-                or mime.startswith("audio/")
                 or mime in {"application/json", "image/gif", "audio/x-silk"}
                 or suffix in {".xlsx", ".xlsm", ".docx", ".pptx"}
             )
@@ -181,7 +180,54 @@ def load_original_descriptors(assets, file_rows, *, client=None):
                         }
                     )
                     continue
-                if img_mime.startswith("audio/"):
+                if client is not None:
+                    try:
+                        uploaded = client.files.upload(
+                            file=io.BytesIO(part.inline_data.data), config={"mime_type": part.inline_data.mime_type}
+                        )
+                        deadline = time.monotonic() + 120
+                        while uploaded.state and uploaded.state.name == "PROCESSING":
+                            if time.monotonic() > deadline:
+                                raise TimeoutError("Attachment processing timeout")
+                            time.sleep(1)
+                            uploaded = client.files.get(name=uploaded.name)
+                        if not uploaded.uri or (uploaded.state and uploaded.state.name == "FAILED"):
+                            raise ValueError("Attachment processing failed")
+                        if len(parts) == 1 and mime == part.inline_data.mime_type:
+                            expiry = (
+                                uploaded.expiration_time.timestamp()
+                                if getattr(uploaded, "expiration_time", None)
+                                else time.time() + 47 * 3600
+                            )
+                            with assets.db.conn:
+                                assets.db.conn.execute(
+                                    "UPDATE media_vault SET gemini_file_uri=?, uri_expires_at=? WHERE file_code=?",
+                                    (uploaded.uri, expiry, code),
+                                )
+                        descriptors.append(
+                            {
+                                "file_code": code,
+                                "semantic_name": semantic_name,
+                                "file_uri": uploaded.uri,
+                                "mime_type": part.inline_data.mime_type,
+                                "part_index": index,
+                            }
+                        )
+                        continue
+                    except Exception:
+                        if img_mime.startswith("audio/"):
+                            descriptors.append(
+                                {
+                                    "file_code": code,
+                                    "semantic_name": semantic_name,
+                                    "audio_base64": base64.b64encode(img_data).decode("ascii"),
+                                    "mime_type": img_mime,
+                                    "part_index": index,
+                                }
+                            )
+                            continue
+                        raise
+                elif img_mime.startswith("audio/"):
                     descriptors.append(
                         {
                             "file_code": code,
@@ -192,39 +238,8 @@ def load_original_descriptors(assets, file_rows, *, client=None):
                         }
                     )
                     continue
-                if client is None:
+                else:
                     raise ValueError("Original attachment requires configured Files client")
-                uploaded = client.files.upload(
-                    file=io.BytesIO(part.inline_data.data), config={"mime_type": part.inline_data.mime_type}
-                )
-                deadline = time.monotonic() + 120
-                while uploaded.state and uploaded.state.name == "PROCESSING":
-                    if time.monotonic() > deadline:
-                        raise TimeoutError("Attachment processing timeout")
-                    time.sleep(1)
-                    uploaded = client.files.get(name=uploaded.name)
-                if not uploaded.uri or (uploaded.state and uploaded.state.name == "FAILED"):
-                    raise ValueError("Attachment processing failed")
-                if len(parts) == 1 and mime == part.inline_data.mime_type:
-                    expiry = (
-                        uploaded.expiration_time.timestamp()
-                        if getattr(uploaded, "expiration_time", None)
-                        else time.time() + 47 * 3600
-                    )
-                    with assets.db.conn:
-                        assets.db.conn.execute(
-                            "UPDATE media_vault SET gemini_file_uri=?, uri_expires_at=? WHERE file_code=?",
-                            (uploaded.uri, expiry, code),
-                        )
-                descriptors.append(
-                    {
-                        "file_code": code,
-                        "semantic_name": semantic_name,
-                        "file_uri": uploaded.uri,
-                        "mime_type": part.inline_data.mime_type,
-                        "part_index": index,
-                    }
-                )
             else:
                 raise ValueError("Unsupported original part")
     return descriptors

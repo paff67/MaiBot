@@ -64,6 +64,16 @@ def test_audio_inline_multimodal_pipeline(tmp_path):
     assert "audio_base64" in desc
     assert base64.b64decode(desc["audio_base64"]) == wav_payload
 
+    # 3b. Test failing client (e.g. 404 from third party proxy) gracefully falls back to audio_base64
+    class FailingFiles:
+        def upload(self, **kwargs):
+            raise RuntimeError("404 Not Found from proxy")
+
+    fallback_desc = load_original_descriptors(assets, [wav_asset], client=SimpleNamespace(files=FailingFiles()))
+    assert len(fallback_desc) == 1
+    assert "audio_base64" in fallback_desc[0]
+    assert base64.b64decode(fallback_desc[0]["audio_base64"]) == wav_payload
+
     # 4. Test ContextItemBuilder with audio
     builder = ContextItemBuilder().set_role(RoleType.User)
     builder.add_text_content("这是一条语音消息：")
