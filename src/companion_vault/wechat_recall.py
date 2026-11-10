@@ -447,6 +447,12 @@ def _append_descriptor_part(builder, part: Dict[str, Any]) -> None:
             image_format=part.get("image_format", "jpeg"),
             image_base64=part["image_base64"],
         )
+    elif "audio_base64" in part:
+        builder.add_audio_base64_part(
+            audio_base64=part["audio_base64"],
+            mime_type=part.get("mime_type", "audio/wav"),
+            file_code=part.get("file_code", ""),
+        )
     else:
         builder.add_file_uri_part(part["file_uri"], part["mime_type"], part["file_code"])
 

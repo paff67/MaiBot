@@ -1,5 +1,6 @@
 from .context_item import (
     AssistantMessageItem,
+    ContextAudioPart,
     ContextContentPart,
     ContextFileUriPart,
     ContextImagePart,
@@ -27,6 +28,7 @@ from .tool_option import ToolCall
 
 __all__ = [
     "AssistantMessageItem",
+    "ContextAudioPart",
     "ContextContentPart",
     "ContextFileUriPart",
     "ContextImagePart",

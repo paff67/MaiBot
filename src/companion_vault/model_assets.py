@@ -70,7 +70,7 @@ def build_original_parts(pipeline: AssetPipeline, file_code: str, client: Any) -
         return build_original_parts(pipeline, derived[0], client)
     if not (mime in {"image/jpeg", "image/png", "image/webp", "application/pdf"} or mime.startswith(("audio/", "video/"))):
         raise ValueError(f"{file_code}: {mime} 原件已归档，模型不支持直接读取")
-    if path.stat().st_size <= 512 * 1024:
+    if path.stat().st_size <= 15 * 1024 * 1024:
         return [types.Part.from_bytes(data=path.read_bytes(), mime_type=mime)]
     if not row["gemini_file_uri"] or row["uri_expires_at"] <= time.time() + 600:
         if client is None:

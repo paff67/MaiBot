@@ -523,6 +523,13 @@ def _build_item_from_sequence(
                     image_base64=part["image_base64"],
                 )
                 has_content = True
+        elif "audio_base64" in part and part["audio_base64"]:
+            builder.add_audio_base64_part(
+                audio_base64=part["audio_base64"],
+                mime_type=part.get("mime_type", "audio/wav"),
+                file_code=part.get("file_code", ""),
+            )
+            has_content = True
         elif "file_uri" in part and part["file_uri"]:
             builder.add_file_uri_part(
                 part["file_uri"],

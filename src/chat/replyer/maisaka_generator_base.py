@@ -683,10 +683,21 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
             builder = ContextItemBuilder().set_role(RoleType.User)
             builder.add_text_part("【系统已为你挂载点亮的历史原文件，请直接查看原文件画面/音频/文档作答】")
             for part in file_parts:
-                if 'text' in part:
+                if 'text' in part and part['text']:
                     builder.add_text_part(part['text'])
-                else:
-                    builder.add_file_uri_part(part["file_uri"], part["mime_type"], part["file_code"])
+                elif 'image_base64' in part and part['image_base64']:
+                    builder.add_image_base64_part(
+                        image_format=part.get("image_format", "jpeg"),
+                        image_base64=part["image_base64"],
+                    )
+                elif 'audio_base64' in part and part['audio_base64']:
+                    builder.add_audio_base64_part(
+                        audio_base64=part["audio_base64"],
+                        mime_type=part.get("mime_type", "audio/wav"),
+                        file_code=part.get("file_code", ""),
+                    )
+                elif 'file_uri' in part and part['file_uri']:
+                    builder.add_file_uri_part(part["file_uri"], part["mime_type"], part.get("file_code", ""))
             items.append(builder.build())
         return items
 

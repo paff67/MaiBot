@@ -106,6 +106,19 @@ class ContextImagePart:
 
 
 @dataclass(frozen=True, slots=True)
+class ContextAudioPart:
+    """不可变音频片段。"""
+
+    audio_base64: str
+    mime_type: str = "audio/wav"
+    file_code: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.audio_base64.strip() or not self.mime_type.strip():
+            raise ValueError("音频 base64 与 MIME 类型不能为空")
+
+
+@dataclass(frozen=True, slots=True)
 class ContextFileUriPart:
     """不可变原生多模态文件句柄。"""
 
@@ -129,7 +142,7 @@ class ContextRefusalPart:
             raise ValueError("拒答内容不能为空")
 
 
-ContextContentPart: TypeAlias = ContextTextPart | ContextImagePart | ContextFileUriPart | ContextRefusalPart
+ContextContentPart: TypeAlias = ContextTextPart | ContextImagePart | ContextAudioPart | ContextFileUriPart | ContextRefusalPart
 
 
 @dataclass(frozen=True, slots=True)
@@ -474,6 +487,23 @@ class ContextItemBuilder:
     ) -> "ContextItemBuilder":
         return self.add_image_base64_part(image_format, image_base64, support_formats)
 
+    def add_audio_base64_part(
+        self,
+        audio_base64: str,
+        mime_type: str = "audio/wav",
+        file_code: str = "",
+    ) -> "ContextItemBuilder":
+        self.__parts.append(ContextAudioPart(audio_base64=audio_base64, mime_type=mime_type, file_code=file_code))
+        return self
+
+    def add_audio_content(
+        self,
+        audio_base64: str,
+        mime_type: str = "audio/wav",
+        file_code: str = "",
+    ) -> "ContextItemBuilder":
+        return self.add_audio_base64_part(audio_base64=audio_base64, mime_type=mime_type, file_code=file_code)
+
     def set_tool_call_id(self, tool_call_id: str) -> "ContextItemBuilder":
         if self.__role != RoleType.Tool:
             raise ValueError("仅当角色为 Tool 时才能设置工具调用 ID")
@@ -685,6 +715,7 @@ def without_item_replay(item: ContextItem) -> ContextItem:
 __all__ = [
     "AssistantMessageItem",
     "CONTEXT_ITEM_SCHEMA_VERSION",
+    "ContextAudioPart",
     "ContextContentPart",
     "ContextFileUriPart",
     "ContextImagePart",

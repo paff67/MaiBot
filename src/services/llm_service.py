@@ -52,7 +52,7 @@ from src.services.service_task_resolver import (
 
 logger = get_logger("llm_service")
 
-CACHE_STATS_BINARY_KEYS = frozenset({"base64", "encrypted_content", "image_base64", "thought_signature"})
+CACHE_STATS_BINARY_KEYS = frozenset({"audio_base64", "base64", "encrypted_content", "image_base64", "thought_signature"})
 
 
 class LLMServiceClient:

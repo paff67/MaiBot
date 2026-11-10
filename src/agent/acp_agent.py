@@ -20,7 +20,7 @@ from src.computer.provider import ComputerToolProvider
 from src.files.provider import FileToolProvider
 
 from src.llm_models.payload_content.context_item import (
-    AssistantMessageItem, ContextImagePart, ContextItem, ContextItemBuilder, ContextItemMeta, ContextTextPart,
+    AssistantMessageItem, ContextAudioPart, ContextFileUriPart, ContextImagePart, ContextItem, ContextItemBuilder, ContextItemMeta, ContextTextPart,
     ProviderActivityItem, ReasoningItem, ReasoningRepresentation, RoleType,
 )
 
@@ -227,6 +227,10 @@ class AcpAgent:
                         if not self.capabilities.get("promptCapabilities", {}).get("image", False):
                             raise ValueError("ACP 当前模型路由未声明图片输入能力，任务保留在队列中")
                         prompt.append({"type": "image", "data": part.image_base64, "mimeType": "image/" + part.image_format})
+                    elif isinstance(part, ContextAudioPart):
+                        prompt.append({"type": "text", "text": f"[音频附件: {part.mime_type}]"})
+                    elif isinstance(part, ContextFileUriPart):
+                        prompt.append({"type": "text", "text": f"[文件附件: {part.file_code or part.file_uri}]"})
                     elif isinstance(part, ContextTextPart):
                         prompt.append({"type": "text", "text": part.text})
             self.pending = {"input_ids": [record["id"] for record in batch]}

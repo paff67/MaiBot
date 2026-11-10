@@ -136,6 +136,7 @@ def load_original_descriptors(assets, file_rows, *, client=None):
             and expires_at > time.time() + 600
             and not (
                 mime.startswith("text/")
+                or mime.startswith("audio/")
                 or mime in {"application/json", "image/gif", "audio/x-silk"}
                 or suffix in {".xlsx", ".xlsm", ".docx", ".pptx"}
             )
@@ -175,6 +176,17 @@ def load_original_descriptors(assets, file_rows, *, client=None):
                             "semantic_name": semantic_name,
                             "image_format": fmt,
                             "image_base64": base64.b64encode(img_data).decode("ascii"),
+                            "mime_type": img_mime,
+                            "part_index": index,
+                        }
+                    )
+                    continue
+                if img_mime.startswith("audio/"):
+                    descriptors.append(
+                        {
+                            "file_code": code,
+                            "semantic_name": semantic_name,
+                            "audio_base64": base64.b64encode(img_data).decode("ascii"),
                             "mime_type": img_mime,
                             "part_index": index,
                         }

@@ -19,6 +19,8 @@ from src.llm_models.openai_compat import split_openai_request_overrides
 from src.llm_models.payload_content.context_item import (
     PROVIDER_REPLAY_SCHEMA_VERSION,
     AssistantMessageItem,
+    ContextAudioPart,
+    ContextFileUriPart,
     ContextImagePart,
     ContextItem,
     ContextItemMeta,
@@ -147,6 +149,14 @@ def _convert_user_content(item: UserMessageItem) -> List[Dict[str, Any]]:
         if isinstance(part, ContextTextPart):
             if part.text.strip():
                 content.append({"type": "input_text", "text": part.text})
+            continue
+
+        if isinstance(part, ContextAudioPart):
+            content.append({"type": "input_text", "text": f"[音频附件: {part.mime_type}]"})
+            continue
+
+        if isinstance(part, ContextFileUriPart):
+            content.append({"type": "input_text", "text": f"[文件附件: {part.file_code or part.file_uri}]"})
             continue
 
         if not isinstance(part, ContextImagePart):
