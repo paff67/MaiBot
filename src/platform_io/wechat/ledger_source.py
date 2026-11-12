@@ -236,10 +236,16 @@ class LedgerSource:
                         chat_cursors[c] = rowid
                 continue
             row = item["message"]
+            is_revoked = row is not None and (int(row.get("kind") or 0) & 65535) == 10000
+            if is_revoked and msg_id and hasattr(driver, "revoke_committed"):
+                try:
+                    await driver.revoke_committed(chat_id=str(chat_id or ""), msg_id=msg_id)
+                except Exception:
+                    pass
             if (
                 row is None
                 or row.get("direction") != "incoming"
-                or (int(row.get("kind") or 0) & 65535) == 10000
+                or is_revoked
                 or item["already_delivered"]
                 or msg_id in delivered_in_batch
             ):

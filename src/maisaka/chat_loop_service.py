@@ -3,7 +3,7 @@
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, List, Optional, Sequence
+from typing import Any, Callable, List, Literal, Optional, Sequence
 
 import asyncio
 import time
@@ -666,6 +666,14 @@ class MaisakaChatLoopService:
         self._llm_chat_clients: dict[str, LLMServiceClient] = {}
         self.planner_request_snapshot: PlannerRequestSnapshot | None = None
         self.passive_replyer_override: Optional[bool] = None
+        self.chat_execution_mode: Literal["dual_director", "one_pass_st"] = "dual_director"
+        self._st_prompt_composer: Optional[Callable[..., list[ContextItem]]] = None
+
+    def set_st_prompt_composer(
+        self, composer: Optional[Callable[..., list[ContextItem]]]
+    ) -> None:
+        """预留挂载点：供后续 STPresetEngine 零侵入接管 Planner 上下文编排。"""
+        self._st_prompt_composer = composer
 
     @property
     def behavior_style_prompt(self) -> str:

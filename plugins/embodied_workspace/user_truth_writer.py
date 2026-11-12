@@ -98,7 +98,7 @@ class UserScopedTruthWriter:
                 else clean_wxid
             )
 
-            # 1. 处理个人状态与个人偏好 -> 写入该用户专属的 person_info.impression
+            # 1. 处理个人状态与个人偏好 -> 按公私物理分列写入 public_impression 或 owner_private_notes
             status_text = str(patch.get("current_status") or "").strip()[:200]
             avail_text = str(patch.get("availability") or "").strip()[:60]
             pref_patch = patch.get("preference_item")
@@ -112,12 +112,14 @@ class UserScopedTruthWriter:
 
             if impression_notes:
                 note_line = f"[{now_str[:10]}] " + " | ".join(impression_notes)
+                target_col = "owner_private_notes" if (not is_group and is_owner) else "public_impression"
                 if person_row:
-                    old_imp = str(person_row["impression"] or "").strip()
-                    new_imp = f"{old_imp}\n{note_line}".strip()[-2000:]
+                    row_keys = set(person_row.keys())
+                    old_val = str(person_row[target_col] or "").strip() if target_col in row_keys else ""
+                    new_val = f"{old_val}\n{note_line}".strip()[-2000:]
                     conn.execute(
-                        "UPDATE person_info SET impression = ? WHERE person_id = ?",
-                        (new_imp, str(person_row["person_id"])),
+                        f"UPDATE person_info SET {target_col} = ? WHERE person_id = ?",
+                        (new_val, str(person_row["person_id"])),
                     )
                 else:
                     new_pid = self._allocate_next_code(conn, "person_info", "person_id", "P")
@@ -126,8 +128,9 @@ class UserScopedTruthWriter:
                         """
                         INSERT INTO person_info (
                             person_id, platform_ids, person_name, wechat_remark,
-                            trust_role, one_line_intro, impression, intimacy_score, shared_episodes
-                        ) VALUES (?, ?, ?, '', 'GROUP_MEMBER', '', ?, 0, '[]')
+                            trust_role, one_line_intro, public_impression, owner_private_notes,
+                            impression, intimacy_score, shared_episodes
+                        ) VALUES (?, ?, ?, '', 'GROUP_MEMBER', '', ?, '', '', 0, '[]')
                         """,
                         (new_pid, platform_json, clean_wxid, note_line),
                     )
@@ -135,33 +138,37 @@ class UserScopedTruthWriter:
                         self._upsert_private_provenance(conn, new_pid, origin_chat_id)
                 applied.append("已更新个人档案印象/偏好")
 
-            # 若操作者为 OWNER 本人，同步写入真实表 user_status
-            if is_owner and (status_text or avail_text):
+            # 若操作者为 OWNER 本人且处于私聊作用域，同步写入真实表 user_status（群聊严禁修改主人私密状态）
+            if is_owner and not is_group and (status_text or avail_text):
                 if status_text:
                     conn.execute(
                         """
-                        INSERT INTO user_status (key, category, current_value, visibility, updated_at)
-                        VALUES ('current_status', 'activity', ?, 'PRIVATE', ?)
+                        INSERT INTO user_status (key, category, current_value, visibility, scope_chat_id, updated_at)
+                        VALUES ('current_status', 'activity', ?, 'PRIVATE', ?, ?)
                         ON CONFLICT(key) DO UPDATE SET
                             current_value = excluded.current_value,
+                            visibility = 'PRIVATE',
+                            scope_chat_id = excluded.scope_chat_id,
                             updated_at = excluded.updated_at
                         """,
-                        (status_text, now_str),
+                        (status_text, origin_chat_id, now_str),
                     )
                 if avail_text:
                     conn.execute(
                         """
-                        INSERT INTO user_status (key, category, current_value, visibility, updated_at)
-                        VALUES ('availability', 'state', ?, 'PRIVATE', ?)
+                        INSERT INTO user_status (key, category, current_value, visibility, scope_chat_id, updated_at)
+                        VALUES ('availability', 'state', ?, 'PRIVATE', ?, ?)
                         ON CONFLICT(key) DO UPDATE SET
                             current_value = excluded.current_value,
+                            visibility = 'PRIVATE',
+                            scope_chat_id = excluded.scope_chat_id,
                             updated_at = excluded.updated_at
                         """,
-                        (avail_text, now_str),
+                        (avail_text, origin_chat_id, now_str),
                     )
                 applied.append("已同步更新主人全局状态(user_status)")
 
-            # 2. 处理个人待办约定 -> 写入真实 quests_events 表，通过 [owner:<wxid>] 锁死归属权
+            # 2. 处理个人待办约定 -> 写入真实 quests_events 表，绑定 scope_chat_id 防止跨群串台
             quest_title = str(patch.get("quest_title") or "").strip()[:120]
             if quest_title:
                 req_code = str(patch.get("quest_code") or "").strip().upper()
@@ -173,7 +180,7 @@ class UserScopedTruthWriter:
 
                 if req_code:
                     existing = conn.execute(
-                        "SELECT current_progress FROM quests_events WHERE quest_code = ?",
+                        "SELECT current_progress, scope_chat_id FROM quests_events WHERE quest_code = ?",
                         (req_code,),
                     ).fetchone()
                 else:
@@ -185,18 +192,28 @@ class UserScopedTruthWriter:
                         """
                         INSERT INTO quests_events (
                             quest_code, title, current_progress, deadline_or_condition,
-                            status, visibility, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                            status, visibility, scope_chat_id, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                         """,
-                        (q_code, quest_title, tagged_progress, deadline, status_val, visibility, now_str),
+                        (
+                            q_code,
+                            quest_title,
+                            tagged_progress,
+                            deadline,
+                            status_val,
+                            visibility,
+                            origin_chat_id,
+                            now_str,
+                        ),
                     )
                     if visibility == "PRIVATE":
                         self._upsert_private_provenance(conn, q_code, origin_chat_id)
                     applied.append(f"新增个人待办({q_code}: {quest_title[:30]})")
                 else:
-                    # 严格校验该待办是否归属于当前 actor_wxid
                     cur_prog = str(existing["current_progress"] or "")
-                    if owner_tag in cur_prog or is_owner:
+                    cur_scope = str(existing["scope_chat_id"] or "")
+                    same_scope = (not cur_scope) or (cur_scope == origin_chat_id)
+                    if same_scope and (owner_tag in cur_prog or is_owner):
                         conn.execute(
                             """
                             UPDATE quests_events
@@ -226,30 +243,123 @@ class UserScopedTruthWriter:
             (code_index, self.wechat_source, self.wechat_account, chat_id),
         )
 
-    def list_known_members(self) -> list[dict[str, str]]:
-        """从真实 person_info 表提取 (wxid, 称谓) 列表供前端 PIN 登录框选择"""
-        if not self.truth_db_path.exists():
+    def list_group_public_members(self, chat_id: str) -> list[dict[str, str]]:
+        """
+        按当前路由 chat_id 严格过滤候选成员名单：
+        1. 私聊页面绝不返回任何他人列表（返回 []）；
+        2. 群聊页面仅限定在 group_members 登记的本群成员范围内；
+        3. SQL 投影层仅读取公开微信昵称 person_name，物理拒绝查询号主单向备注 wechat_remark。
+        """
+        clean_chat = chat_id.strip()
+        if not clean_chat.endswith("@chatroom") or not self.truth_db_path.exists():
             return []
         try:
             conn = sqlite3.connect(f"file:{self.truth_db_path}?mode=ro", uri=True)
             conn.row_factory = sqlite3.Row
             try:
-                rows = conn.execute(
-                    "SELECT person_name, wechat_remark, platform_ids FROM person_info LIMIT 120"
-                ).fetchall()
-                members: list[dict[str, str]] = []
-                for r in rows:
-                    try:
-                        pids = json.loads(str(r["platform_ids"] or "{}"))
-                    except Exception:
-                        pids = {}
-                    wxid = str(pids.get("wechat") or "").strip()
-                    if not wxid:
-                        continue
-                    label = str(r["wechat_remark"] or r["person_name"] or wxid).strip()
-                    members.append({"wxid": wxid, "nickname": label})
-                return members
+                has_gm = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='group_members'"
+                ).fetchone()
+                if not has_gm:
+                    return []
+                member_wxids = self._query_group_member_wxids(conn, clean_chat)
+                if not member_wxids:
+                    return []
+
+                name_map: dict[str, str] = {}
+                has_pi = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='person_info'"
+                ).fetchone()
+                if has_pi:
+                    rows = conn.execute(
+                        "SELECT person_name, platform_ids FROM person_info"
+                    ).fetchall()
+                    for r in rows:
+                        try:
+                            pids = json.loads(str(r["platform_ids"] or "{}"))
+                        except Exception:
+                            pids = {}
+                        wxid = str(pids.get("wechat") or "").strip()
+                        if wxid in member_wxids:
+                            pub_name = str(r["person_name"] or "").strip()
+                            if pub_name:
+                                name_map[wxid] = pub_name
+
+                return [
+                    {"wxid": uid, "nickname": name_map.get(uid, uid)}
+                    for uid in sorted(member_wxids)
+                ]
             finally:
                 conn.close()
         except Exception:
             return []
+
+    def get_group_member_wxids(self, chat_id: str) -> set[str]:
+        clean_chat = chat_id.strip()
+        if not clean_chat.endswith("@chatroom") or not self.truth_db_path.exists():
+            return set()
+        try:
+            conn = sqlite3.connect(f"file:{self.truth_db_path}?mode=ro", uri=True)
+            conn.row_factory = sqlite3.Row
+            try:
+                has_gm = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='group_members'"
+                ).fetchone()
+                if not has_gm:
+                    return set()
+                return self._query_group_member_wxids(conn, clean_chat)
+            finally:
+                conn.close()
+        except Exception:
+            return set()
+
+    def _query_group_member_wxids(self, conn: sqlite3.Connection, group_id: str) -> set[str]:
+        if self.wechat_source and self.wechat_account:
+            rows = conn.execute(
+                "SELECT user_id FROM group_members WHERE source = ? AND account = ? AND group_id = ?",
+                (self.wechat_source, self.wechat_account, group_id),
+            ).fetchall()
+            if rows:
+                return {str(r["user_id"]).strip() for r in rows if str(r["user_id"]).strip()}
+        rows = conn.execute(
+            "SELECT user_id FROM group_members WHERE group_id = ?",
+            (group_id,),
+        ).fetchall()
+        return {str(r["user_id"]).strip() for r in rows if str(r["user_id"]).strip()}
+
+    def get_public_nickname(self, wxid: str) -> str:
+        """获取指定 wxid 的公开微信昵称（绝不读取 wechat_remark）"""
+        clean_wxid = wxid.strip()
+        if not clean_wxid or not self.truth_db_path.exists():
+            return clean_wxid
+        try:
+            conn = sqlite3.connect(f"file:{self.truth_db_path}?mode=ro", uri=True)
+            conn.row_factory = sqlite3.Row
+            try:
+                row = conn.execute(
+                    "SELECT person_name FROM person_info WHERE json_extract(platform_ids, '$.wechat') = ? LIMIT 1",
+                    (clean_wxid,),
+                ).fetchone()
+                if row and str(row["person_name"] or "").strip():
+                    return str(row["person_name"]).strip()
+                return clean_wxid
+            finally:
+                conn.close()
+        except Exception:
+            return clean_wxid
+
+    def is_owner_wxid(self, wxid: str) -> bool:
+        """只读判断给定 wxid 是否为真值库登记的 OWNER"""
+        clean_wxid = wxid.strip()
+        if not clean_wxid or not self.truth_db_path.exists():
+            return False
+        try:
+            conn = sqlite3.connect(f"file:{self.truth_db_path}?mode=ro", uri=True)
+            conn.row_factory = sqlite3.Row
+            try:
+                person_row = self._find_person_row_by_wxid(conn, clean_wxid)
+                return bool(person_row and str(person_row["trust_role"] or "").upper() == "OWNER")
+            finally:
+                conn.close()
+        except Exception:
+            return False

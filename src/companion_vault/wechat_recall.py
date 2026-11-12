@@ -156,8 +156,11 @@ async def build_quote_context_async(
         from .asset_pipeline import AssetPipeline
         from .quote_recall import recall_quotes, recall_message_attachments, load_original_descriptors
 
+        ledger_file = Path(ledger_path)
+        if not ledger_file.is_file():
+            return "", []
         db = CompanionTruthDB(db_path)
-        ledger = sqlite3.connect(Path(ledger_path).resolve().as_uri() + "?mode=ro", uri=True)
+        ledger = sqlite3.connect(ledger_file.resolve().as_uri() + "?mode=ro", uri=True)
         assets = AssetPipeline(db, os.environ.get("MAIBOT_ASSET_SPOOL", "data/companion_assets"))
         client = None
         blocks = []

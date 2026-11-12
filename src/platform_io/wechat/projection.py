@@ -6,6 +6,7 @@ from typing import Any, Dict, Optional
 import hashlib
 import html
 import json
+import os
 import re
 import sqlite3
 
@@ -21,8 +22,17 @@ _AT_USERLIST_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
-DEFAULT_SELF_WXID = "wxid_w5d0efdxczt322"
+DEFAULT_SELF_WXID = os.environ.get("MAIBOT_SELF_WXID", "").strip() or "wxid_bot_self"
 BOT_SELF_WXID = DEFAULT_SELF_WXID
+
+
+def get_self_wxid(explicit_wxid: str = "") -> str:
+    """动态解析自身底层微信号，消除特定账号实例硬编码。"""
+    clean = str(explicit_wxid or "").strip()
+    if clean:
+        return clean
+    env_val = os.environ.get("MAIBOT_SELF_WXID", "").strip()
+    return env_val or DEFAULT_SELF_WXID
 
 
 def get_dynamic_bot_aliases() -> set[str]:
@@ -41,7 +51,7 @@ def get_dynamic_bot_aliases() -> set[str]:
                     aliases.add(clean_a)
     except Exception:
         pass
-    return aliases or {"许妍", "妍妍", "小妍"}
+    return aliases or {"麦麦"}
 
 
 def strip_group_sender_prefix(raw_text: str, sender_id: str = "", is_group: bool = False) -> str:
@@ -129,7 +139,7 @@ def build_identity_lookup_maps(
         elif isinstance(r, sqlite3.Row):
             row_dict = dict(r)
         else:
-            row_dict = dict(zip(col_names, r))
+            row_dict = dict(zip(col_names, r, strict=False))
         try:
             pids = json.loads(str(row_dict.get("platform_ids") or "{}"))
         except Exception:
@@ -167,8 +177,8 @@ def enrich_sender_identity(
 ) -> None:
     """
     解耦微信公开昵称 (person_name) 与号主单向备注 (wechat_remark)：
-    - sender_nickname: 优先使用 person_name（如 'ì _eun'），确保群友 @ì _eun 时名字在上下文中可对齐；
-    - sender_cardname: 承载 wechat_remark（如 'R'），使消息头渲染为 <message user="ì _eun" group_card="R">。
+    - sender_nickname: 优先使用 person_name（如公开群昵称），确保群友 @提及 时名字在上下文中可对齐；
+    - sender_cardname: 承载 wechat_remark，使消息头渲染为 <message user="公开昵称" group_card="备注">。
     """
     profile = wxid_to_profile.get(sender_wxid, {})
     person_name = profile.get("person_name", "").strip()

@@ -2,8 +2,8 @@
   "manifest_version": 2,
   "id": "maibot-team.embodied-workspace",
   "name": "具身动态工作区与全栈沙盒",
-  "version": "1.4.0",
-  "description": "提供快轨人设长文发布与慢轨 Codex/agy CLI 全栈沙盒构建、动态子域名挂载及按需唤醒后端服务",
+  "version": "1.5.0",
+  "description": "提供统一异步慢轨全栈沙盒构建（长文排版/交互网页/按需唤醒后端）、动态子域名交付与 Git 时光机管理",
   "author": {
     "name": "MaiBot Architect",
     "url": "https://github.com/paff67/MaiBot"
@@ -22,7 +22,6 @@
   },
   "dependencies": [],
   "capabilities": [
-    "maisaka.reply.generate",
     "maisaka.context.append",
     "maisaka.proactive.trigger"
   ],
@@ -31,3 +30,4 @@
     "supported_locales": ["zh-CN"]
   }
 }
+

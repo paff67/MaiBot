@@ -833,6 +833,10 @@ class ExpressionLearner:
             checked: 是否已经完成人工审核。
             modified_by: 最后修改者标记。
         """
+        clean_session_id = str(session_id or "").strip()
+        if not clean_session_id:
+            logger.warning("拒绝创建缺少明确 session_id 归属的表达方式（严禁落入全局无归属池）")
+            return None
         content_list = [situation]
         try:
             with get_db_session() as db:
@@ -841,7 +845,7 @@ class ExpressionLearner:
                     style=style,
                     content_list=json.dumps(content_list),
                     count=1,
-                    session_id=session_id,
+                    session_id=clean_session_id,
                     last_active_time=datetime.now(),
                     checked=checked,
                     modified_by=modified_by,

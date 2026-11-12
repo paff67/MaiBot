@@ -1,7 +1,7 @@
 import json
 
-from src.mobile_agent.message_ingestor import MessageLedger
-from src.mobile_agent.message_quotes import latest_quote
+from src.platform_io.wechat.message_ingestor import MessageLedger
+from src.platform_io.wechat.message_quotes import latest_quote
 from src.companion_vault.asset_pipeline import AssetPipeline
 from src.companion_vault.message_media_worker import MessageMediaQueue
 from src.companion_vault.quote_recall import recall_quotes

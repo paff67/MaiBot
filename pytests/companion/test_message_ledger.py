@@ -4,7 +4,7 @@ import time
 import httpx
 import pytest
 
-from src.mobile_agent.message_ingestor import MessageLedger, poll
+from src.platform_io.wechat.message_ingestor import MessageLedger, poll
 from src.phone_edge.message_journal import read_message_events
 from src.companion_vault.message_archive import archive_page
 from src.companion_vault.asset_pipeline import AssetPipeline

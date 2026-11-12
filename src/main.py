@@ -201,7 +201,9 @@ class MainSystem:
         asyncio.create_task(chat_manager.regularly_save_sessions())
 
         logger.info(t("startup.chat_manager_initialized"))
-        await memory_automation_service.start()
+        # 非微信平台仍可按配置使用 A_memorix；platform=='wechat' 已在收发与 MemoryAutomationService 内部物理旁路跳过
+        if os.environ.get("MAIBOT_DISABLE_AMEMORIX", "0").strip().lower() not in ("1", "true", "yes"):
+            await memory_automation_service.start()
 
         wechat_config = os.environ.get("MAIBOT_WECHAT_CONFIG", "")
         if wechat_config:

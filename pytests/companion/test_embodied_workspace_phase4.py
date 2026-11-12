@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import sqlite3
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -11,15 +10,14 @@ import pytest
 from plugins.embodied_workspace.cli_bridge import (
     CLIBridge,
     WorkspaceJobRequest,
-    SANDBOX_WORKSPACE_PATH,
 )
 from plugins.embodied_workspace.compute_economy import (
     ComputeEconomyManager,
-    ComputeEconomySnapshot,
 )
 from plugins.embodied_workspace.editorial_kit import ensure_maibot_kit_assets
 from plugins.embodied_workspace.plugin import create_plugin
 from src.companion_vault.truth_db import CompanionTruthDB
+from src.platform_io.wechat.message_ingestor import MessageLedger
 
 
 @pytest.mark.asyncio
@@ -155,62 +153,75 @@ async def test_unified_slow_track_and_unscripted_fast_track_hint(tmp_path: Path)
 
 
 @pytest.mark.asyncio
-async def test_group_async_delivery_target_id_and_source_message_id_binding(tmp_path: Path):
+async def test_group_async_delivery_native_capabilities_and_multislot_unload(tmp_path: Path):
     ws_root = tmp_path / "workspaces"
     truth_db_path = tmp_path / "truth.db"
     ledger_db_path = tmp_path / "ledger.db"
     router_db_path = tmp_path / "routes.db"
 
-    # 初始化真值库与消息账本，模拟入站群消息
+    source = "https://127.0.0.1:8443"
+    account = "4d86ac1b06dd252fa3c7327eb5614865"
+
     truth_db = CompanionTruthDB(str(truth_db_path))
     truth_db.close()
 
-    with sqlite3.connect(str(ledger_db_path)) as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS messages (
-                msg_id TEXT PRIMARY KEY,
-                chat_id TEXT,
-                sender_id TEXT,
-                sender_name TEXT,
-                body TEXT,
-                direction TEXT,
-                created_at TEXT
-            )
-            """
-        )
-        conn.execute(
-            """
-            INSERT INTO messages (msg_id, chat_id, sender_id, sender_name, body, direction, created_at)
-            VALUES ('10099', 'group_xyz@chatroom', 'wxid_sender_01', 'Alice', '请帮我写个攻略', 'inbound', '2026-11-09T12:00:00')
-            """
-        )
+    ledger = MessageLedger(str(ledger_db_path))
+    ledger.ingest(
+        source,
+        "epoch1",
+        {
+            "seq": 1,
+            "account": account,
+            "msg_id": "10099",
+            "chat_id": "group_xyz@chatroom",
+            "revision": "r1",
+            "observed_at_ms": 1762680000000,
+            "row": {
+                "msgId": "10099",
+                "talker": "group_xyz@chatroom",
+                "type": "1",
+                "content": "wxid_sender_01:\n请帮我写个攻略",
+                "msgSvrId": "9001",
+                "isSend": "0",
+                "createTime": "1762680000000",
+            },
+        },
+    )
+    ledger.db.close()
 
     plugin = create_plugin()
-    plugin.config.workspaces_root = str(ws_root)
-    plugin.config.truth_db_path = str(truth_db_path)
-    plugin.config.ledger_db_path = str(ledger_db_path)
-    plugin.config.router_db_path = str(router_db_path)
-    plugin.config.gateway_port = 18799
+    plugin.set_plugin_config({
+        "plugin": {"config_version": "1.5.0"},
+        "workspaces_root": str(ws_root),
+        "truth_db_path": str(truth_db_path),
+        "ledger_db_path": str(ledger_db_path),
+        "router_db_path": str(router_db_path),
+        "wechat_source": source,
+        "wechat_account": account,
+        "gateway_port": 0,
+    })
 
     mock_ctx = MagicMock()
     mock_ctx.call_capability = AsyncMock()
     plugin._set_context(mock_ctx)
-
     await plugin.on_load()
 
     try:
-        # 反查 source_message_id
         src_id = plugin.cli_bridge.resolve_latest_source_message_id("group_xyz@chatroom", "wxid_sender_01")
         assert src_id == "10099"
 
-        # 模拟执行完成投递通知
         ws_dir = plugin.cli_bridge.get_chat_workspace("group_xyz@chatroom")
         dist_dir = ws_dir / "dist" / "app-demo"
         project_dir = ws_dir / "projects" / "app-demo"
         dist_dir.mkdir(parents=True, exist_ok=True)
         project_dir.mkdir(parents=True, exist_ok=True)
         (dist_dir / "index.html").write_text("<h1>Demo</h1>", encoding="utf-8")
+
+        # 预置另一个群仍在运行的长任务槽位，验证本任务结束不会覆盖清空它
+        plugin._active_jobs["job_other_group"] = {
+            "project_slug": "other-proj",
+            "latest_status": "正在执行数据分析",
+        }
 
         req = WorkspaceJobRequest(
             job_id="job_test_dedup_01",
@@ -236,24 +247,44 @@ async def test_group_async_delivery_target_id_and_source_message_id_binding(tmp_
 
         await plugin._run_slow_job_and_notify(req)
 
-        # 验证 proactive trigger 被调用且携带 target_id 与 source_message_id
-        proactive_calls = [
-            c for c in mock_ctx.call_capability.call_args_list
-            if c[0][0] == "maisaka.proactive.trigger"
-        ]
-        assert len(proactive_calls) == 1
-        _, kwargs = proactive_calls[0]
-        assert kwargs["target_id"] == "group_xyz@chatroom"
-        assert kwargs["source_message_id"] == "10099"
-        assert "job_test_dedup_01" in kwargs["intent"]
+        # 验证并发任务槽位互不清空
+        assert "job_other_group" in plugin._active_jobs
+        assert "other-proj" in plugin.get_active_jobs_summary()
 
-        # 验证防重锁：同一 job_id 再次调用 _run_slow_job_and_notify 不会再次触发
+        # 验证调用宿主 Capability 仅传真实支持的参数，绝不含 target_id / source_message_id 伪参数
+        ctx_calls = [c for c in mock_ctx.call_capability.call_args_list if c[0][0] == "maisaka.context.append"]
+        assert len(ctx_calls) == 1
+        _, ctx_kwargs = ctx_calls[0]
+        assert set(ctx_kwargs.keys()) == {"stream_id", "segments", "visible_text", "source_kind"}
+        assert "[引用: 10099]" in ctx_kwargs["visible_text"]
+
+        proactive_calls = [c for c in mock_ctx.call_capability.call_args_list if c[0][0] == "maisaka.proactive.trigger"]
+        assert len(proactive_calls) == 1
+        _, pro_kwargs = proactive_calls[0]
+        assert set(pro_kwargs.keys()) == {"stream_id", "intent"}
+        assert "job_test_dedup_01" in pro_kwargs["intent"]
+
+        # 防重锁验证
         await plugin._run_slow_job_and_notify(req)
-        proactive_calls_after = [
-            c for c in mock_ctx.call_capability.call_args_list
-            if c[0][0] == "maisaka.proactive.trigger"
-        ]
-        assert len(proactive_calls_after) == 1
+        assert len([c for c in mock_ctx.call_capability.call_args_list if c[0][0] == "maisaka.proactive.trigger"]) == 1
+
+        # 验证 on_unload 显式取消并回收在途后台任务
+        cancelled_flag = False
+
+        async def slow_sleeper() -> None:
+            nonlocal cancelled_flag
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                cancelled_flag = True
+                raise
+
+        bg = asyncio.create_task(slow_sleeper())
+        plugin._bg_tasks.add(bg)
+        await asyncio.sleep(0.02)
+        await plugin.on_unload()
+        assert cancelled_flag is True
+        assert bg.done()
     finally:
         await plugin.on_unload()
 
@@ -316,13 +347,8 @@ def test_truth_db_twins_background_and_public_private_isolation(tmp_path: Path):
         assert forbidden not in owner_injection
         assert forbidden not in group_injection
 
-    # 4. 验证运行中慢轨长程任务的动态状态投影
+    # 4. 验证运行中慢轨长程任务的动态状态投影（列已由 CompanionTruthDB 单一 Schema 原生提供，无需动态 ALTER TABLE）
     with truth_db.conn:
-        truth_db.conn.execute(
-            """
-            ALTER TABLE global_state ADD COLUMN fairy_active_job_summary TEXT DEFAULT ''
-            """
-        )
         truth_db.conn.execute(
             """
             UPDATE global_state SET fairy_active_job_summary = '项目【doc-jensen】已运行 3 分钟：已生成调研脚本与数据集'
@@ -391,25 +417,22 @@ async def test_3_hours_timeout_and_progress_monitoring_and_hook_compatibility(tm
     status3 = bridge.inspect_project_progress(proj_dir, dist_dir, [], 90)
     assert "已生成初版页面 (index.html)" in status3
 
-    # 3. 验证 protect_subdomain_url_hook 兼容 Runner kwargs 调用（不再报 missing event 异常）
+    # 3. 验证 protect_subdomain_url_hook 原生 Runner kwargs 协议（已彻底移除旧版单一 dict 原地修改死分支）
     runner_kwargs_res = await plugin.protect_subdomain_url_hook(
         response="任务已完成，访问：https://abc123xyz789.paff-67.top",
         session_id="sess_01",
         reply_message_id="msg_01",
+        skip_post_process=False,
         enable_chinese_typo=True,
         enable_splitter=True,
     )
     assert runner_kwargs_res["action"] == "continue"
+    assert runner_kwargs_res["modified_kwargs"]["skip_post_process"] is False
     assert runner_kwargs_res["modified_kwargs"]["enable_chinese_typo"] is False
     assert runner_kwargs_res["modified_kwargs"]["enable_splitter"] is False
 
-    # 4. 验证 protect_subdomain_url_hook 兼容旧版单一 dict 传参
-    legacy_dict_res = await plugin.protect_subdomain_url_hook(
-        {
-            "response": "任务已完成，访问：https://abc123xyz789.paff-67.top",
-            "enable_chinese_typo": True,
-            "enable_splitter": True,
-        }
-    )
-    assert legacy_dict_res["enable_chinese_typo"] is False
-    assert legacy_dict_res["enable_splitter"] is False
+    # 4. 验证 cli_timeout_seconds 允许设置小于 10800 秒（仅保留 >= 30s 防呆）
+    plugin.config.cli_timeout_seconds = 90
+    assert plugin._effective_timeout_seconds() == 90
+    plugin.config.cli_timeout_seconds = 5
+    assert plugin._effective_timeout_seconds() == 30

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import signal
 import socket
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,6 +18,7 @@ from .subdomain_router import SubdomainRoute
 @dataclass
 class ManagedBackend:
     token: str
+    unit_name: str
     port: int
     process: asyncio.subprocess.Process
     last_active_at: float
@@ -31,12 +34,14 @@ class BackendSupervisor:
         port_max: int = 19199,
         idle_timeout_sec: float = 900.0,
         quota_wrapper: ResourceQuotaWrapper | None = None,
+        cli_auth_dir: str = "~/.gemini",
     ) -> None:
         self.workspaces_root = workspaces_root
         self.port_min = port_min
         self.port_max = port_max
         self.idle_timeout_sec = idle_timeout_sec
         self.quota_wrapper = quota_wrapper
+        self.cli_auth_dir = cli_auth_dir
         self._active: dict[str, ManagedBackend] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self._janitor_task: asyncio.Task | None = None
@@ -48,6 +53,11 @@ class BackendSupervisor:
     async def stop_all(self) -> None:
         if self._janitor_task:
             self._janitor_task.cancel()
+            try:
+                await self._janitor_task
+            except asyncio.CancelledError:
+                pass
+            self._janitor_task = None
         for token in list(self._active.keys()):
             await self.stop_backend(token)
 
@@ -71,36 +81,57 @@ class BackendSupervisor:
                 return existing.port
 
             port = self._allocate_free_port()
-            chat_ws_dir = Path(route.project_dir).parents[1]
+            project_path = Path(route.project_dir).resolve()
+            chat_ws_dir = project_path.parents[1]
             rel_project_dir = f"{SANDBOX_WORKSPACE_PATH}/projects/{route.project_slug}"
+            unit_name = f"maibot-fairy-be-{route.token}"
 
+            env = build_sandbox_env(port=port, require_api_key=False)
             actual_cmd = [arg.replace("{PORT}", str(port)) for arg in start_cmd_template]
-            raw_bwrap_cmd = build_bwrap_prefix(chat_ws_dir, workdir=rel_project_dir)
-            raw_bwrap_cmd.extend(actual_cmd)
-            launch_cmd = (
-                self.quota_wrapper.wrap_command(raw_bwrap_cmd, unit_prefix=f"maibot-be-{route.token}")
-                if self.quota_wrapper
-                else raw_bwrap_cmd
-            )
 
-            env = build_sandbox_env()
-            env["PORT"] = str(port)
+            if shutil.which("bwrap"):
+                raw_bwrap_cmd = build_bwrap_prefix(
+                    chat_ws_dir,
+                    workdir=rel_project_dir,
+                    cli_auth_dir=self.cli_auth_dir,
+                    sandbox_env=env,
+                )
+                raw_bwrap_cmd.extend(actual_cmd)
+                launch_cmd = (
+                    self.quota_wrapper.wrap_command(raw_bwrap_cmd, unit_name=unit_name)
+                    if self.quota_wrapper
+                    else raw_bwrap_cmd
+                )
+                exec_cwd: str | None = None
+            elif os.name == "nt":
+                mapped_cmd = list(actual_cmd)
+                if mapped_cmd and mapped_cmd[0] in ("python3", "python", "python.exe", "python3.exe"):
+                    mapped_cmd[0] = sys.executable
+                launch_cmd = mapped_cmd
+                exec_cwd = str(project_path)
+            else:
+                raise RuntimeError("宿主机未安装 bwrap，拒绝裸机启动不可信后端进程")
 
-            proc = await asyncio.create_subprocess_exec(
-                *launch_cmd,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-                start_new_session=True,
-                env=env,
-            )
+            popen_kwargs: dict[str, object] = {
+                "stdout": asyncio.subprocess.DEVNULL,
+                "stderr": asyncio.subprocess.DEVNULL,
+                "env": env,
+            }
+            if exec_cwd is not None:
+                popen_kwargs["cwd"] = exec_cwd
+            if os.name != "nt":
+                popen_kwargs["start_new_session"] = True
+
+            proc = await asyncio.create_subprocess_exec(*launch_cmd, **popen_kwargs)
 
             ready = await self._wait_port_ready(port, proc, timeout=8.0)
             if not ready:
-                await self._kill_proc(proc)
+                await self._terminate_unit(unit_name, proc)
                 raise RuntimeError(f"后端服务未能及时监听端口 {port}")
 
             self._active[route.token] = ManagedBackend(
                 token=route.token,
+                unit_name=unit_name,
                 port=port,
                 process=proc,
                 last_active_at=time.time(),
@@ -124,19 +155,35 @@ class BackendSupervisor:
     async def stop_backend(self, token: str) -> None:
         item = self._active.pop(token, None)
         if item:
-            await self._kill_proc(item.process)
+            await self._terminate_unit(item.unit_name, item.process)
+
+    async def _terminate_unit(self, unit_name: str, proc: asyncio.subprocess.Process) -> None:
+        if self.quota_wrapper is not None:
+            await self.quota_wrapper.stop_unit(unit_name, proc)
+            return
+        await self._kill_proc(proc)
 
     @staticmethod
     async def _kill_proc(proc: asyncio.subprocess.Process) -> None:
         if proc.returncode is not None:
             return
         try:
-            os.killpg(proc.pid, signal.SIGTERM)
+            if hasattr(os, "killpg"):
+                os.killpg(proc.pid, signal.SIGTERM)
+            else:
+                proc.terminate()
             await asyncio.wait_for(proc.wait(), timeout=2.0)
         except Exception:
             try:
-                os.killpg(proc.pid, signal.SIGKILL)
+                if hasattr(os, "killpg"):
+                    os.killpg(proc.pid, signal.SIGKILL)
+                else:
+                    proc.kill()
             except ProcessLookupError:
+                pass
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=1.5)
+            except Exception:
                 pass
 
     async def _janitor_loop(self) -> None:

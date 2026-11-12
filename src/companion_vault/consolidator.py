@@ -6,6 +6,7 @@ import datetime
 import hashlib
 import json
 import logging
+import os
 import re
 import sqlite3
 import time
@@ -45,17 +46,18 @@ CREATE TABLE global_state (
  current_app TEXT DEFAULT '', live_observation TEXT DEFAULT '', latest_screen_file_code TEXT DEFAULT ''
 );
 CREATE TABLE user_status (key TEXT PRIMARY KEY, category TEXT, current_value TEXT,
- visibility TEXT DEFAULT 'PRIVATE', updated_at TEXT);
+ visibility TEXT DEFAULT 'PRIVATE', scope_chat_id TEXT DEFAULT '', updated_at TEXT);
 CREATE TABLE quests_events (quest_code TEXT PRIMARY KEY, title TEXT, current_progress TEXT,
  deadline_or_condition TEXT, status TEXT DEFAULT 'ongoing',
- visibility TEXT DEFAULT 'PRIVATE', updated_at TEXT);
+ visibility TEXT DEFAULT 'PRIVATE', scope_chat_id TEXT DEFAULT '', updated_at TEXT);
 CREATE TABLE chronicle_events (code_index TEXT PRIMARY KEY, time_span TEXT, location TEXT,
  summary TEXT, chronicle_text TEXT, key_dialogue TEXT, trigger_when TEXT,
  tk_estimate INTEGER DEFAULT 120, related_files TEXT DEFAULT '[]',
- visibility TEXT DEFAULT 'PRIVATE', status TEXT DEFAULT 'active', valid_from TEXT, valid_until TEXT);
+ visibility TEXT DEFAULT 'PRIVATE', scope_chat_id TEXT DEFAULT '', status TEXT DEFAULT 'active', valid_from TEXT, valid_until TEXT);
 CREATE TABLE person_info (person_id TEXT PRIMARY KEY, platform_ids TEXT DEFAULT '{{}}', person_name TEXT,
  wechat_remark TEXT, trust_role TEXT DEFAULT 'GROUP_MEMBER', one_line_intro TEXT,
- impression TEXT, intimacy_score REAL DEFAULT 0, shared_episodes TEXT DEFAULT '[]');
+ public_impression TEXT DEFAULT '', owner_private_notes TEXT DEFAULT '',
+ impression TEXT DEFAULT '', intimacy_score REAL DEFAULT 0, shared_episodes TEXT DEFAULT '[]');
 本批自动分配的起始编号为 {next_am_code}，新纪要从该 AMXXXX 编号递增，禁止复用旧编号。
 所有时间字段（time_span、cur_time、valid_from、valid_until、updated_at）必须严格使用输入中的 create_time_cst（北京时间 Asia/Shanghai，格式 YYYY-MM-DD HH:MM），严禁使用 UTC 或美西时间。
 time_span 格式 YYYY-MM-DD HH:MM ~ YYYY-MM-DD HH:MM；summary ≤30字；
@@ -66,7 +68,7 @@ related_files 为 FMXXXX 的 JSON 数组。chronicle_events 必须保持 visibil
 1. 输入中 direction="outgoing" 或 speaker_role="BOT_SELF" 的消息是 AI 伴侣自己发出的回复，严禁把 AI 伴侣自己的名字、年龄、职业、人设或自称写入 user_status 或 person_info。
 2. user_status 仅记录主人（OWNER）本人的个人高频硬状态，按 key 插入或覆写 current_value，更新 category、updated_at。
 3. global_state 仅 row_id=1：维护三级地点和时间流逝，不改手机实时躯体字段。群聊（chat_id 以 @chatroom 结尾）严禁修改 global_state 和 user_status。
-4. quests_events 维护约定、待办与长期事项进度；person_info 仅更新印象、简介与亲密度，禁止修改 trust_role、platform_ids 及已有 person_name。
+4. quests_events 维护约定、待办与长期事项进度（绑定当前会话 scope_chat_id）；person_info 中 public_impression 记录群聊公开互动与社交印象，owner_private_notes 仅在主人（OWNER）私聊中记录私密关系与专属偏好（群聊严禁读写 owner_private_notes），禁止修改 trust_role、platform_ids 及已有 person_name。
 5. <recent_context_readonly> 仅提供前文语境参考，只对本批新输入做整合。
 新事件 INSERT，纠错 UPDATE；被替代事件置 status='superseded' 并填 valid_until，
 然后 INSERT 新事件并填 valid_from；保留旧事件与原话，不用 DELETE 擦除历史。
@@ -575,6 +577,24 @@ class MemoryConsolidator:
                     row["code_index"]: tuple(row)
                     for row in self.db.execute("SELECT * FROM chronicle_events")
                 }
+                before_user_status_map = {
+                    row["key"]: tuple(row)
+                    for row in self.db.execute("SELECT * FROM user_status")
+                }
+                before_quests_map = {
+                    row["quest_code"]: dict(row)
+                    for row in self.db.execute("SELECT * FROM quests_events")
+                }
+                before_person_private = {
+                    row["person_id"]: (
+                        str(row["owner_private_notes"] or ""),
+                        str(row["impression"] or ""),
+                        str(row["trust_role"] or ""),
+                    )
+                    for row in self.db.execute(
+                        "SELECT person_id, owner_private_notes, impression, trust_role FROM person_info"
+                    )
+                }
                 is_group_scope = self.chat.endswith("@chatroom")
                 if is_group_scope:
                     before_user_status = [tuple(row) for row in self.db.execute("SELECT * FROM user_status ORDER BY key")]
@@ -592,7 +612,16 @@ class MemoryConsolidator:
                         (self.source, self.account, self.chat),
                     )
                 }
-                self.truth.execute_table_sql(raw_sql, manage_tx=False)
+                try:
+                    self.truth.execute_table_sql(
+                        raw_sql,
+                        manage_tx=False,
+                        forbid_private_person_columns=is_group_scope,
+                    )
+                except sqlite3.DatabaseError as exc:
+                    if is_group_scope and "not authorized" in str(exc).lower():
+                        raise ValueError("Group chat consolidation cannot read or modify owner_private_notes") from exc
+                    raise
                 if is_group_scope:
                     after_user_status = [tuple(row) for row in self.db.execute("SELECT * FROM user_status ORDER BY key")]
                     after_global_state = [tuple(row) for row in self.db.execute("SELECT * FROM global_state ORDER BY row_id")]
@@ -604,6 +633,51 @@ class MemoryConsolidator:
                     }
                     if any(after_person_names.get(pid) != pname for pid, pname in before_person_names.items()):
                         raise ValueError("Group chat consolidation cannot overwrite existing person_name")
+
+                    for p_row in self.db.execute("SELECT person_id, owner_private_notes, impression FROM person_info"):
+                        pid = str(p_row["person_id"])
+                        old_priv, old_imp, _ = before_person_private.get(pid, ("", "", ""))
+                        if str(p_row["owner_private_notes"] or "") != old_priv or str(p_row["impression"] or "") != old_imp:
+                            raise ValueError("Group chat consolidation cannot modify owner_private_notes or private impression")
+
+                    after_quests_map = {row["quest_code"]: dict(row) for row in self.db.execute("SELECT * FROM quests_events")}
+                    for qcode, old_q in before_quests_map.items():
+                        old_scope = str(old_q.get("scope_chat_id") or "")
+                        old_vis = str(old_q.get("visibility") or "PRIVATE")
+                        if ((old_vis == "PRIVATE") or (old_scope and old_scope != self.chat)) and after_quests_map.get(qcode) != old_q:
+                            raise ValueError("Group chat consolidation cannot modify quests_events outside current group scope")
+                    for qcode, new_q in after_quests_map.items():
+                        if before_quests_map.get(qcode) != new_q:
+                            self.db.execute(
+                                "UPDATE quests_events SET scope_chat_id = ?, visibility = 'PUBLIC' WHERE quest_code = ?",
+                                (self.chat, qcode),
+                            )
+                else:
+                    for u_row in self.db.execute("SELECT * FROM user_status"):
+                        ukey = str(u_row["key"])
+                        if before_user_status_map.get(ukey) != tuple(u_row):
+                            self.db.execute(
+                                "UPDATE user_status SET visibility = 'PRIVATE', scope_chat_id = ? WHERE key = ?",
+                                (self.chat, ukey),
+                            )
+                    after_quests_map = {row["quest_code"]: dict(row) for row in self.db.execute("SELECT * FROM quests_events")}
+                    for qcode, old_q in before_quests_map.items():
+                        old_scope = str(old_q.get("scope_chat_id") or "")
+                        if old_scope and old_scope != self.chat and after_quests_map.get(qcode) != old_q:
+                            raise ValueError("Private consolidation cannot modify quests_events from another chat scope")
+                    for qcode, new_q in after_quests_map.items():
+                        if before_quests_map.get(qcode) != new_q:
+                            self.db.execute(
+                                "UPDATE quests_events SET visibility = 'PRIVATE', scope_chat_id = ? WHERE quest_code = ?",
+                                (self.chat, qcode),
+                            )
+                    for p_row in self.db.execute("SELECT person_id, owner_private_notes, impression, trust_role FROM person_info"):
+                        pid = str(p_row["person_id"])
+                        cur_priv = str(p_row["owner_private_notes"] or "")
+                        cur_imp = str(p_row["impression"] or "")
+                        old_priv, old_imp, _ = before_person_private.get(pid, ("", "", ""))
+                        if str(p_row["trust_role"] or "") == "OWNER" and cur_imp != old_imp and cur_imp and cur_priv == old_priv:
+                            self.db.execute("UPDATE person_info SET owner_private_notes = ? WHERE person_id = ?", (cur_imp, pid))
                 after_rows = [dict(row) for row in self.db.execute("SELECT * FROM chronicle_events")]
                 after_events = {row["code_index"]: tuple(row.values()) for row in after_rows}
                 for fcode in foreign_codes:
@@ -616,8 +690,12 @@ class MemoryConsolidator:
                     code = row["code_index"]
                     if before_events.get(code) == tuple(row.values()):
                         continue
-                    if row["visibility"] != "PRIVATE":
+                    if is_group_scope and row["visibility"] != "PRIVATE":
                         raise ValueError("Chat consolidation memories must be PRIVATE")
+                    self.db.execute(
+                        "UPDATE chronicle_events SET visibility = 'PRIVATE', scope_chat_id = ? WHERE code_index = ?",
+                        (self.chat, code),
+                    )
                     if not (row["summary"] or "").strip() or not (row["chronicle_text"] or "").strip():
                         raise ValueError("Empty memory summary or chronicle_text")
                     self.db.executemany(

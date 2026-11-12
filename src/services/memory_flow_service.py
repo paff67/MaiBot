@@ -36,6 +36,11 @@ class PersonFactEvidence:
     context_messages: List[Any]
 
 
+def _is_wechat_embodied_message(message: Any) -> bool:
+    """微信具身驱动模式下，companion_truth.db 是唯一权威记忆源，旁路禁用 A_memorix 双写防脑裂与泄漏。"""
+    return str(getattr(message, "platform", "") or "").strip().lower() == "wechat"
+
+
 class PersonFactWritebackService:
     def __init__(self) -> None:
         self._queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=256)
@@ -115,6 +120,8 @@ class PersonFactWritebackService:
                 await asyncio.sleep(60)
 
     async def enqueue(self, message: Any) -> None:
+        if _is_wechat_embodied_message(message):
+            return
         if not bool(global_config.a_memorix.integration.person_fact_writeback_enabled):
             return
         if self._stopping:
@@ -1015,11 +1022,15 @@ class MemoryAutomationService:
         self._started = False
 
     async def on_incoming_message(self, message: Any) -> None:
+        if _is_wechat_embodied_message(message):
+            return
         if not self._started:
             await self.start()
         await self._run_message_tasks(self._observe_sender_identity(message), self.image_writeback.enqueue(message))
 
     async def on_message_sent(self, message: Any) -> None:
+        if _is_wechat_embodied_message(message):
+            return
         if not self._started:
             await self.start()
         await self._run_message_tasks(

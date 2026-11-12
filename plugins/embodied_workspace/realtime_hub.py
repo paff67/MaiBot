@@ -11,21 +11,26 @@ from aiohttp import WSMsgType, web
 
 from .subdomain_router import SubdomainRoute
 
+MAX_BROADCAST_BYTES = 64 * 1024  # 单次 WebSocket 广播上限 64KB
+
 
 class GroupRealtimeHub:
     """
-    Phase 3 群组全双工实时同步总线。
-    [v3.1 修正] 严格对齐 src/platform_io/wechat/message_ingestor.py 的生产 messages 表字段：
-    优先读取 body / raw_content 与 updated_at_ms，兼容测试库字段。
+    群组全双工实时同步总线。
+    严格绑定 src/platform_io/wechat/message_ingestor.py 的 MessageLedger 真实 Schema。
     """
 
     def __init__(
         self,
         ledger_db_path: Path,
         poll_interval_sec: float = 1.0,
+        wechat_source: str = "",
+        wechat_account: str = "",
     ) -> None:
         self.ledger_db_path = ledger_db_path
         self.poll_interval_sec = poll_interval_sec
+        self.wechat_source = wechat_source.strip()
+        self.wechat_account = wechat_account.strip()
         self._chat_clients: dict[str, set[web.WebSocketResponse]] = {}
         self._token_clients: dict[str, set[web.WebSocketResponse]] = {}
         self._chat_cursors: dict[str, int] = {}
@@ -50,15 +55,27 @@ class GroupRealtimeHub:
         self._chat_clients.clear()
         self._token_clients.clear()
 
+    def _build_scope_filter(self, chat_id: str) -> tuple[str, list[Any]]:
+        clauses = ["chat_id = ?"]
+        params: list[Any] = [chat_id]
+        if self.wechat_source:
+            clauses.append("source = ?")
+            params.append(self.wechat_source)
+        if self.wechat_account:
+            clauses.append("account = ?")
+            params.append(self.wechat_account)
+        return " AND ".join(clauses), params
+
     def _get_max_rowid_for_chat(self, chat_id: str) -> int:
         if not self.ledger_db_path.exists():
             return 0
         try:
             conn = sqlite3.connect(f"file:{self.ledger_db_path}?mode=ro", uri=True)
             try:
+                where_sql, params = self._build_scope_filter(chat_id)
                 row = conn.execute(
-                    "SELECT COALESCE(MAX(rowid), 0) FROM messages WHERE chat_id = ?",
-                    (chat_id,),
+                    f"SELECT COALESCE(MAX(rowid), 0) FROM messages WHERE {where_sql}",
+                    tuple(params),
                 ).fetchone()
                 return int(row[0]) if row else 0
             finally:
@@ -73,45 +90,25 @@ class GroupRealtimeHub:
             conn = sqlite3.connect(f"file:{self.ledger_db_path}?mode=ro", uri=True)
             conn.row_factory = sqlite3.Row
             try:
-                cols = {
-                    str(r["name"])
-                    for r in conn.execute("PRAGMA table_info(messages)").fetchall()
-                }
-                if not cols:
-                    return []
-
-                # [v3.1 修正] 优先匹配生产 message_ledger.db 的真实字段名 (sender_id, body, updated_at_ms)
-                sender_col = (
-                    "sender_name" if "sender_name" in cols
-                    else ("sender_id" if "sender_id" in cols else "''")
-                )
-                text_col = (
-                    "body" if "body" in cols
-                    else ("raw_message" if "raw_message" in cols
-                    else ("content" if "content" in cols
-                    else ("raw_content" if "raw_content" in cols else "''")))
-                )
-                ts_col = (
-                    "updated_at_ms" if "updated_at_ms" in cols
-                    else ("timestamp" if "timestamp" in cols
-                    else ("create_time" if "create_time" in cols else "0"))
-                )
-
+                where_sql, params = self._build_scope_filter(chat_id)
+                params.append(after_rowid)
                 rows = conn.execute(
                     f"""
-                    SELECT rowid, {sender_col} AS sender, {text_col} AS content, {ts_col} AS ts
+                    SELECT rowid, sender_id, body, kind, updated_at_ms
                     FROM messages
-                    WHERE chat_id = ? AND rowid > ?
+                    WHERE {where_sql}
+                      AND rowid > ?
+                      AND (CAST(COALESCE(kind, '0') AS INTEGER) & 65535) != 10000
                     ORDER BY rowid ASC LIMIT 20
                     """,
-                    (chat_id, after_rowid),
+                    tuple(params),
                 ).fetchall()
                 return [
                     {
                         "rowid": int(r["rowid"]),
-                        "sender": str(r["sender"] or ""),
-                        "content": str(r["content"] or "")[:500],
-                        "timestamp": r["ts"],
+                        "sender": str(r["sender_id"] or ""),
+                        "content": str(r["body"] or "")[:500],
+                        "timestamp": r["updated_at_ms"] or 0,
                     }
                     for r in rows
                 ]
@@ -126,7 +123,7 @@ class GroupRealtimeHub:
         route: SubdomainRoute,
         actor_wxid: str | None,
     ) -> web.WebSocketResponse:
-        ws = web.WebSocketResponse(heartbeat=25.0)
+        ws = web.WebSocketResponse(heartbeat=25.0, max_msg_size=MAX_BROADCAST_BYTES * 2)
         await ws.prepare(request)
 
         chat_id = route.chat_id
@@ -151,26 +148,38 @@ class GroupRealtimeHub:
         try:
             async for msg in ws:
                 if msg.type == WSMsgType.TEXT:
+                    if len(msg.data.encode("utf-8")) > MAX_BROADCAST_BYTES:
+                        await ws.send_json(
+                            {
+                                "type": "error",
+                                "error": f"消息包体超过 {MAX_BROADCAST_BYTES} 字节上限，已拒绝广播",
+                            }
+                        )
+                        continue
                     try:
                         payload = json.loads(msg.data)
                     except Exception:
+                        continue
+                    if not isinstance(payload, dict):
                         continue
                     action = str(payload.get("action") or "broadcast")
                     if action == "ping":
                         await ws.send_json({"type": "pong", "ts": time.time()})
                     elif action == "broadcast":
                         if actor_wxid or route.access_policy == "member_collect":
-                            await self.broadcast_to_token(
-                                token,
-                                {
-                                    "type": "peer_broadcast",
-                                    "actor_wxid": actor_wxid or "anonymous",
-                                    "event": str(payload.get("event") or "state_sync")[:80],
-                                    "data": payload.get("data"),
-                                    "ts": time.time(),
-                                },
-                                exclude_ws=ws if not payload.get("echo", True) else None,
-                            )
+                            out_msg = {
+                                "type": "peer_broadcast",
+                                "actor_wxid": actor_wxid or "anonymous",
+                                "event": str(payload.get("event") or "state_sync")[:80],
+                                "data": payload.get("data"),
+                                "ts": time.time(),
+                            }
+                            if len(json.dumps(out_msg, ensure_ascii=False).encode("utf-8")) <= MAX_BROADCAST_BYTES:
+                                await self.broadcast_to_token(
+                                    token,
+                                    out_msg,
+                                    exclude_ws=ws if not payload.get("echo", True) else None,
+                                )
                 elif msg.type in (WSMsgType.CLOSE, WSMsgType.ERROR):
                     break
         finally:

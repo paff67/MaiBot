@@ -1,7 +1,7 @@
 # 技术开发与架构规范文档（Technical Development & Architecture Specification）
 
-> **适用版本**：MaiBot `1.3.19`（分支 `feat/embodied-shujuku-v1`）
-> **最后更新**：2026-11-08
+> **适用版本**：MaiBot `1.3.19`（活跃分支 `feat/embodied-workspace-phase4-twins`，底座分支 `feat/embodied-shujuku-v1`）
+> **最后更新**：2026-11-11
 
 ---
 
@@ -57,8 +57,9 @@ flowchart LR
 | [`src/device_services/`](../../src/device_services/) | 设备基础服务层 | 运行于小米 10 `/data/adb/device_services/`。负责屏幕低亮度常亮守护（`display.py`）与校园网 SRUN 门户自动重连认证（`campus.py`, `srun.py`）。 |
 | [`src/platform_io/wechat/`](../../src/platform_io/wechat/) | 微信平台驱动层 | 运行于 `DMIT-US`。负责将手机日记账同步至 `message_ledger.db`（`message_ingestor.py`）、解析引用结构（`message_quotes.py`）、游标消费与坏消息隔离（`ledger_source.py`）、生成原生 `SessionMessage` 封包（`projection.py`）、对接 `PlatformIOManager` 收发消息（`driver.py`, `edge_client.py`）。 |
 | [`src/companion_vault/`](../../src/companion_vault/) | 真值记忆与资产层 | 运行于 `DMIT-US`。负责 8 张真值表管理（`truth_db.py`）、会话级 RBAC 权限校验（`access_policy.py`）、通讯录与群成员同步（`group_members.py`）、后台多表 SQL 记忆整合（`consolidator.py`）、消息媒体异步拉取入库（`message_media_worker.py`）、历史多模态原件就地挂载与引用召回（`wechat_recall.py`, `quote_recall.py`, `runtime_bridge.py`）。 |
-| [`src/maisaka/`](../../src/maisaka/) | 推理与工具核心层 | Maisaka Planner / Replyer 循环（`reasoning_engine.py`, `runtime.py`）、历史上下文构建（`context/messages.py`）、内置工具与绿灯装载（`builtin_tool/reply.py`）。 |
-| [`pytests/companion/`](../../pytests/companion/) | 专项测试套件 | 覆盖账本同步、媒体解析、群成员与私聊 RBAC 隔离、SQL 记忆巩固、引用召回、驱动迁移与通配符多会话路由的端到端单元测试。 |
+| [`src/maisaka/`](../../src/maisaka/) | 推理与工具核心层 | Maisaka Planner / Replyer 循环（`reasoning_engine.py`, `runtime.py`）、上下文确定性降级压缩（`context/compaction.py`）、历史多模态原位构建（`context/messages.py`）、内置工具与绿灯装载（`builtin_tool/reply.py`）。 |
+| [`plugins/embodied_workspace/`](../../plugins/embodied_workspace/) | 动态工作区与沙盒插件层 | 基于 `maibot-plugin-sdk` v2 的全栈交付系统：统一慢轨构建桥接（`cli_bridge.py`）、Bubblewrap + cgroups v2 资源配额（`resource_quota.py`）、Scale-to-Zero 后端监管（`backend_supervisor.py`）、单级泛域名路由与四级免登网关（`subdomain_router.py`, `gateway_server.py`）、外部 Git 时光机（`time_machine.py`）、全双工实时协作总线（`realtime_hub.py`）与算力经济监控（`compute_economy.py`）。 |
+| [`pytests/companion/`](../../pytests/companion/) | 专项测试套件 | 覆盖账本同步、媒体解析、群成员与私聊 RBAC 隔离、SQL 记忆巩固、引用召回、内联音频多模态回退、驱动迁移及具身工作区 Phase 1~4 的端到端单元测试。 |
 
 ---
 
@@ -159,7 +160,7 @@ flowchart LR
    <自身账号与提及判定准则>
    - 你的唯一核心名字/当前人设：{bot_name}{alias_prompt} | 你的底层微信ID：{self_wxid}
    - 提及(@)严格判定规则：仅当消息包含指向 '{self_wxid}' 的 @提及 或明确文本 {'@' + bot_name} / {'@' + alias} 时，才是在 @ 你本人。
-   - 当消息中出现 '@其他名字'（例如 '@ì _eun' 等）时，那是群成员在 @ 群内的其他群友（可通过下方<重要角色索引>核对其微信昵称与备注名的对应关系），绝不是你的底层代号，切勿将他人的微信昵称误认为自己！
+   - 当消息中出现 '@其他名字'（例如 '@某群友' 等）时，那是群成员在 @ 群内的其他群友（可通过下方<重要角色索引>核对其微信昵称与备注名的对应关系），绝不是你的底层代号，切勿将他人的微信昵称误认为自己！
    - 如果群内有群友昵称与你相似或重名，以底层微信ID及下方<重要角色索引>为准，严禁将他人发言视作对你的指令。
    </自身账号与提及判定准则>
    ```
@@ -174,56 +175,79 @@ flowchart LR
 
 | 层级 | 表名 | 主键 | 注入与召回策略 |
 | :--- | :--- | :--- | :--- |
-| **L1 常驻层** | `global_state` | `row_id=1` | 每轮 Planner 全量注入：时间、地点、设备状态。 |
-| **L1 常驻层** | `user_status` | `key` | 常驻注入用户高频状态（群聊仅暴露 `visibility='PUBLIC'`）。 |
-| **L1 常驻层** | `quests_events` | `quest_code` (`QTxxxx`) | 常驻注入 `status='PENDING'` 的约定与待办。 |
+| **L1 常驻层** | `global_state` | `row_id=1` | 每轮 Planner 注入：东京叙事时钟、地点、设备状态、双子槽位（`active_persona_slot` / `elder_away_arc`）及算力工况（群聊隐藏精确美元账单）。 |
+| **L1 常驻层** | `user_status` | `key` | 常驻注入主人高频状态（强制 `PRIVATE` 与 `scope_chat_id` 绑定，仅 OWNER 私聊可见）。 |
+| **L1 常驻层** | `quests_events` | `quest_code` (`QE`/`QT`) | 常驻注入 `status='ongoing'` 的约定与待办（群聊按 `scope_chat_id` 严格隔离，绝不跨群串台）。 |
 | **L2 绿灯层** | `chronicle_events` | `code_index` (`AMxxxx`) | Planner 阶段注入 `summary + trigger_when` 目录；Replyer 阶段按 `memory_greenlights` 或会话作用域装载 `chronicle_text + key_dialogue`。 |
 | **L2 绿灯层** | `media_vault` | `file_code` (`FMxxxx`) | Planner 阶段注入当前会话授权的最近 20 个文件目录（含 `msg_id`）；Replyer 阶段按 `file_greenlights` 重新挂载二进制/URI。 |
-| **L2 绿灯层** | `person_info` | `person_id` | Planner 阶段注入 `one_line_intro`；Replyer 阶段按 `person_greenlights` 装载详细 `impression`。 |
-| **L2 绿灯层** | `app_sop_skills` | `sop_id` | 手机端标准操作 SOP 目录。 |
-| **L3 状态层** | `phone_surfing_log` | `surf_code` (`SFxxxx`) | 仅暴露 `is_shared=0` 的冲浪记录，点亮后自动置 `is_shared=1`。 |
+| **L2 绿灯层** | `person_info` | `person_id` | 物理拆分为 `public_impression`（公开社交印象）与 `owner_private_notes`（绝密金主/亲密档案，群聊 SQL 投影物理剔除）。 |
+| **L2 绿灯层** | `app_sop_skills` | `sop_id` | 手机端标准操作 SOP 目录（仅 OWNER 私聊暴露）。 |
+| **L3 状态层** | `phone_surfing_log` | `surf_code` (`SFxxxx`) | 含 `persona_slot` 双子分仓字段；仅暴露 `is_shared=0` 的冲浪记录，点亮后自动置 `is_shared=1`。 |
 
-### 2. 会话级 RBAC 与 SQL 沙箱隔离（`access_policy.py` & `consolidator.py`）
-- **访问控制矩阵（[`allowed_conversations`](../../src/companion_vault/access_policy.py)）**：
-  - **群聊会话（`*@chatroom`）**：仅允许读取本群（`{destination_chat_id}`）产生的记忆（`memory_provenance`）与媒体原件（`message_asset_links`），**绝对禁止读取任何私聊或其他群聊的数据**。
-  - **私聊会话（`wxid_*`）**：允许读取该私聊自身及该好友所在共同群聊（查询 `group_members` 表）的记忆与附件。
-- **SQL 巩固沙箱（[`_build_scoped_consolidation_db`](../../src/companion_vault/consolidator.py)）**：
-  后台记忆巩固模型生成的 `table_sql` **不在全量真值库上直接裸跑**，而是先在仅包含当前会话可见行集的独立内存 SQLite 快照上执行，校验通过后再将新增/更新行与 `memory_provenance` 溯源记录在 `BEGIN IMMEDIATE` 事务中原子回写主库，彻底杜绝通过 `INSERT ... SELECT` 跨私聊窃取数据的风险。
+### 2. 四道物理级记忆隔离防线（Zero-Leak Architecture）
+1. **防线一（`person_info` 物理分列 + SQL 投影级裁剪 + Authorizer 看守）**：
+   - `truth_db.py` 将人物印象拆分为 `public_impression` 与 `owner_private_notes`；群聊巩固执行 `execute_table_sql(..., forbid_private_person_columns=True)` 时由 SQLite 内核级 `set_authorizer` 物理拦截对 `owner_private_notes` 的任何读写；`person_profile.py` 与 `query_person_profile.py` 采用 Fail-Closed 默认群聊策略，凡非 OWNER 私聊，SQL `SELECT` 列表物理剔除 `owner_private_notes` 与 `wechat_remark`。
+2. **防线二（巩固提交期强制可见性降级锁）**：
+   - `consolidator.py` 在私聊整合提交事务内，无论模型输出的 SQL 如何填写 `visibility`，均强制覆写 `user_status` / `quests_events` / `chronicle_events` 为 `visibility='PRIVATE'` 并绑定 `scope_chat_id`；群聊待办强制绑定本群 `scope_chat_id`，杜绝跨群广播。
+3. **防线三（切断宿主 `A_memorix` 双写与私聊表达跨聊传染）**：
+   - 微信平台收发链路与 `MemoryAutomationService` 物理旁路宿主原生 `A_memorix` 自动写回（支持 `MAIBOT_DISABLE_AMEMORIX=1` 启动级关闭）；`runtime.py` 与 `maisaka_expression_selector.py` 物理阻断微信私聊参与 `ExpressionLearner` / `JargonLearner` 采样及跨会话表达共享池。
+4. **防线四（群聊出站硬机密锚点熔断 `output_guardrail.py`）**：
+   - `send_service.py` 在群聊消息发往 `PlatformIOManager` 前调用 `check_group_outbound_text`，对精确美元余额特征串（如 `$x.xx USD`）及 `MAIBOT_GROUP_SECRET_ANCHORS` 配置词表执行出口熔断。
 
-### 3. 多模态原件就地挂载与消息顺序保证（`wechat_recall.py` & `reasoning_engine.py`）
+### 3. 多模态原件就地挂载、内联双通道回退与消息顺序保证（`wechat_recall.py`, `model_assets.py` & `quote_recall.py`）
 - **自适应等待（`_wait_for_media_jobs`）**：
   当最新 4 条消息包含图片、表情、语音或文件时，推理引擎在进入 Planner 前最多等待 8 秒（每 200ms 轮询 `message_media_jobs`），确保刚收到的媒体完成手机拉取与转码。
 - **原位挂载（[`hydrate_wechat_history_media_async`](../../src/companion_vault/wechat_recall.py)）**：
   - 对当前历史窗口中最近 `max_hydrated`（默认 12）条微信消息，按消息原始 `msg_id` 顺序将已验证（`state='ready'` 且未被撤回）的原件描述符直接写入对应 `SessionBackedMessage.vault_descriptors`；
   - 滑出窗口的更早消息自动卸载二进制载荷（保留文本占位与 `FMxxxx` 目录索引），兼顾多模态时序精准度与上下文 Token 预算；
-  - 在 [`SessionBackedMessage.to_ planner_context_item`](../../src/maisaka/context/messages.py) 中，每条消息按 **`[时间/发送者/消息头与正文] -> [紧跟该消息的 vault_descriptors 原件图片/音频/PDF Part]`** 原位展开，不再将媒体堆叠在上下文末尾。
+  - 在 [`SessionBackedMessage.to_planner_context_item`](../../src/maisaka/context/messages.py) 中，每条消息按 **`[时间/发送者/消息头与正文] -> [紧跟该消息的 vault_descriptors 原件图片/音频/PDF Part]`** 原位展开，不再将媒体堆叠在上下文末尾。
+- **内联多模态双通道与零延迟直通编码器（`asset_encoder.py`）**：
+  - 核心载荷层（[`context_item.py`](../../src/llm_models/payload_content/context_item.py)）原生支持 `ContextAudioPart(audio_base64, mime_type, file_code)`，并在 Gemini（`Part.from_bytes`）、OpenAI Chat（`input_audio`）与 OpenAI Responses 客户端全栈打通。
+  - `model_assets.py` 与 `quote_recall.py` 统一复用 [`asset_encoder.py`](../../src/companion_vault/asset_encoder.py)（`encode_media_part` / `encode_inline_descriptor`）：当配置 `MAIBOT_FILES_API_ENABLED=0`（对接不支持 Google Files API 的聚合网关如 `api.0-0.pro`）时，`<= 15MB` 的语音与原件直接走零延迟内联字节通道，彻底消除每次先发起 `/upload/v1beta/files` 触发 404 再异常回退的无效网络往返。
 
 ---
 
-## 五、 插件开发与能力扩展规范（基于 `maibot-plugin-sdk` v2）
+## 五、 动态工作区与全栈沙盒交付架构（`plugins/embodied_workspace/`）
 
-在扩展新能力（如 VPS 沙盒执行 + 动态子域名挂载 + 微信发送限时链接）时，应遵循以下规范：
-1. **组件选型**：
-   - 使用 `@Tool` 暴露给 Maisaka Planner；
-   - 耗时 `<2s` 的轻量渲染任务同步返回 URL；
-   - 耗时 `>2s` 的重计算沙盒任务立即返回 `task_id`，后台完成后通过 `self.ctx.maisaka.append_context` 与 `self.ctx.maisaka.trigger_proactive` 唤醒 Planner 主动发送链接；
-   - 如需以机器人人设撰写长文，调用宿主能力 `maisaka.reply.generate`（[`DocumentReplyGenerator`](../../src/chat/replyer/document_generator.py)）。
-2. **微信原件鉴权**：
-   - 插件处理微信附件（`FMxxxx`）时，必须读取宿主在 `@Tool` 调用中自动注入的 `group_id` / `user_id`，并通过 [`authorized_file_rows`](../../src/companion_vault/access_policy.py) 验证当前会话对该文件的访问权限。
+系统通过 MaiBot v2 标准插件 `embodied_workspace`（叙事定位：「Fairy 工作区引擎」）提供长文杂志级排版、数据分析、交互式 WebApp 与受控临时后端交付能力（详见 [`docs/CLEANROOM_REFACTOR_SPEC.md`](../../docs/CLEANROOM_REFACTOR_SPEC.md)）：
+
+1. **统一异步慢轨架构（Unified Slow Track）**：
+   - 对外仅暴露 `@Tool("run_agent_workspace")`（支持 `task_type`：`document` | `webapp` | `backend`；`action`：`create` | `update`）与 `@Tool("manage_workspace_projects")`（支持 `list` | `history` | `rollback`），两者共用 `CLIBridge.project_lock` 异步互斥锁；外置标准构建规范模板 [`templates/FAIRY_AGENTS.md`](../../plugins/embodied_workspace/templates/FAIRY_AGENTS.md)。
+   - **长程超时与多槽进度追踪**：沙盒构建超时上限默认 `10800s`（3 小时，支持 `>= 30s` 任意合法配置）。执行期间按 `self._active_jobs[job_id]` 多槽维护并发状态，每 `180s` 通过宿主原生 `maisaka.context.append` 与 `maisaka.proactive.trigger` 唤醒聊天模型按人设自然播报进展；`on_unload()` 自动取消并回收全部在途后台协程。
+2. **净室沙盒隔离与确定性 cgroups v2 进程回收**：
+   - **净室环境白名单（`bwrap --clearenv`）**：`build_sandbox_env()` 绝不复制宿主 `os.environ` 且源码零明文密钥，仅显式注入 `PATH`、`HOME=/tmp/home`、`TZ=Asia/Tokyo`、`PORT` 及 `FAIRY_SANDBOX_API_KEY` / `FAIRY_SANDBOX_BASE_URL`；授权微信原件按任务隔离硬链接至 `/tmp/workspace/inbox/<job_id>/`，任务结束即自动清理。
+   - **确定性单元管控**：`ResourceQuotaWrapper` 使用 `--unit=maibot-fairy-...` 显式命名 `systemd-run --scope`，超时、空闲休眠或卸载时通过 `systemctl kill --kill-who=all <unit>.scope` 内核级原子清理整个进程树。
+3. **单级泛域名网关、共享连接池与私享防串号免登体系**：
+   - 本地网关（`:18790`）生命周期内复用单一 `aiohttp.ClientSession` 进行流式反代，使用 `Path.is_relative_to` 严格校验目录边界，支持 `issuer_name` 动态角色署名。
+   - 私聊工作区链接对无 Cookie 访客默认提供**免登只读浏览**（转发分享给朋友绝不泄露创建者/OWNER 身份 Cookie）；`verify_cookie` 强校验 90 天服务端有效期（未配置 `cookie_secret` 时自动生成 32 字节随机密钥持久化至 `.cookie_secret`）；群聊 `whoami` 仅按本群 `group_members` 返回公开 `person_name`（物理屏蔽 `wechat_remark`），前端 SDK 全量采用 DOM `.textContent` 渲染杜绝 XSS。
 
 ---
 
 ## 六、 测试与代码质量门禁
 
-在提交代码或发布上线前，必须在仓库根目录通过以下检查：
+在提交代码或发布上线前，可在 Windows（`.venv`）或 Linux / WSL 仓库根目录直接执行以下全量门禁（142 项测试 100% 通过）：
 
 ```bash
-# 1. 运行具身微信与真值库全套回归测试（69+ 项）
-pytest pytests/companion/ -q
+# 1. 运行具身微信、四道记忆防线、双子预留、撤回同步与工作区全套回归测试（142 项）
+pytest pytests/companion pytests/platform_io/test_wechat_at_parsing.py pytests/platform_io/test_adapter_policy.py pytests/maisaka/test_reasoning_engine.py -q
 
-# 2. 运行平台适配器策略与 Maisaka 推理引擎测试
-pytest pytests/platform_io/test_adapter_policy.py pytests/maisaka/test_reasoning_engine.py -q
-
-# 3. 静态语法与字节码编译检查
-python3 -m compileall -q src/companion_vault src/platform_io/wechat src/phone_edge src/device_services
+# 2. Ruff 静态代码质量与安全规范检查
+ruff check plugins/embodied_workspace src/companion_vault src/platform_io/wechat src/maisaka/memory/person_profile.py src/maisaka/builtin_tool/query_person_profile.py
 ```
+
+---
+
+## 七、 净室重构治理验收归档（v2.2 全三批次已清零闭环）
+
+此前 v2.1 架构审计识别的全部历史技术债与安全红线均已按 [`docs/CLEANROOM_REFACTOR_SPEC.md`](../../docs/CLEANROOM_REFACTOR_SPEC.md) 在 Batch 1 ~ Batch 3 中完成根治并通过终审复核：
+
+- **[已清零] P0 安全、状态一致性与配置契约**：
+  - `P0-SEC-01`：源码明文密钥与固定 Cookie Secret 已彻底移除，实装 `bwrap --clearenv` 与 `.cookie_secret` 随机自举；
+  - `P0-CONSISTENCY-02`：已打通 `LedgerSource` $\rightarrow$ `WeChatRootDriver.revoke_committed` $\rightarrow$ `MaisakaHeartFlowChatting.revoke_message` 实时剔除防抖队列与 `_chat_history` 撤回残影；
+  - `P0-CONFIG-03`：已移除 `max(10800, ...)` 硬钳制，恢复 `cli_timeout_seconds >= 30s` 真实配置契约。
+- **[已清零] P1 记忆隔离、Schema 单一事实源与插件契约**：
+  - `LEAK-01 ~ LEAK-06`：四道物理级记忆防线（`person_info` 拆列 + Authorizer、提交期 `PRIVATE` 锁、切断微信 `A_memorix` 与私聊表达跨聊传染、`output_guardrail.py` 群聊出口熔断）已全线实装；
+  - `P1-ISOLATION-02`：算力账本已提纯为 [`src/companion_vault/compute_ledger.py`](../../src/companion_vault/compute_ledger.py)，彻底废除插件运行期 `ALTER TABLE`；
+  - `P1-SANDBOX-PLUGIN-05`：私聊只读分享防串号、本群公开昵称过滤、DOM `.textContent` 安全化、命名 cgroup 回收、`@Command` 命名捕获组与死代码（`fast_renderer.py` 等）清理全部完成。
+- **[已清零] P2 去实例硬编码与遗留目录归档**：
+  - 源码已剥离特定微信号/群友昵称/`143000` 魔数阈值，补齐 `tzdata` 跨平台依赖，并物理移除 `src/mobile_agent/` 与 `src/integration_tools/` 废弃目录。

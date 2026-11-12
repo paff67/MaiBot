@@ -114,10 +114,6 @@ EDITORIAL_KIT_JS = r"""/* MaiBot Fairy Editorial Interactive Kit (Progress + Aut
 
     document.querySelectorAll("pre").forEach((pre) => {
       if (pre.classList.contains("mermaid")) {
-        let txt = pre.textContent || "";
-        txt = txt.replace(/--\s*"?([^"\n-]+?)"?\s*-->/g, "-->|$1|");
-        txt = txt.replace(/\["([^"]*?)'([^"]*?)"\]/g, '["$1$2"]');
-        pre.textContent = txt;
         return;
       }
       if (pre.querySelector(".fairy-copy-btn")) return;
@@ -141,10 +137,20 @@ EDITORIAL_KIT_JS = r"""/* MaiBot Fairy Editorial Interactive Kit (Progress + Aut
       btn.style.cssText = "position:fixed;bottom:52px;right:14px;z-index:99990;background:var(--surface);color:var(--fg);border:1px solid var(--border);padding:6px 12px;border-radius:999px;font-size:12px;font-weight:600;box-shadow:0 4px 12px rgba(0,0,0,.15);cursor:pointer";
       const panel = document.createElement("div");
       panel.style.cssText = "display:none;position:fixed;bottom:90px;right:14px;z-index:99991;background:var(--surface);color:var(--fg);border:1px solid var(--border);padding:12px 14px;border-radius:12px;max-width:260px;max-height:55vh;overflow-y:auto;box-shadow:0 10px 28px rgba(0,0,0,.22);font-size:13px";
-      panel.innerHTML = "<div style='font-weight:700;margin-bottom:8px;border-bottom:1px solid var(--border);padding-bottom:4px'>目录</div>" +
-        headings.map(h => `<a href="#${h.id}" style="display:block;padding:4px 0;color:var(--fg);text-decoration:none;padding-left:${h.tagName==='H3'?'12px':'0'};font-size:${h.tagName==='H3'?'12px':'13px'}">${h.textContent}</a>`).join("");
+      const titleEl = document.createElement("div");
+      titleEl.style.cssText = "font-weight:700;margin-bottom:8px;border-bottom:1px solid var(--border);padding-bottom:4px";
+      titleEl.textContent = "目录";
+      panel.appendChild(titleEl);
+      headings.forEach((h) => {
+        const link = document.createElement("a");
+        link.href = "#" + h.id;
+        const isH3 = h.tagName === "H3";
+        link.style.cssText = "display:block;padding:4px 0;color:var(--fg);text-decoration:none;padding-left:" + (isH3 ? "12px" : "0") + ";font-size:" + (isH3 ? "12px" : "13px");
+        link.textContent = h.textContent || "";
+        panel.appendChild(link);
+      });
       btn.onclick = () => { panel.style.display = panel.style.display === "none" ? "block" : "none"; };
-      panel.onclick = (e) => { if (e.target.tagName === "A") panel.style.display = "none"; };
+      panel.onclick = (e) => { if (e.target && e.target.tagName === "A") panel.style.display = "none"; };
       document.body.appendChild(btn);
       document.body.appendChild(panel);
     }

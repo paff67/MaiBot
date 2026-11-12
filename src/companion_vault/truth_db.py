@@ -2,6 +2,7 @@
 
 from typing import Any, Dict, List, Sequence, Tuple
 import json
+import os
 import re
 import sqlite3
 
@@ -19,22 +20,33 @@ CREATE TABLE IF NOT EXISTS global_state (
     current_location TEXT, current_minor_region TEXT, current_major_region TEXT,
     prev_scene_time TEXT, elapsed_time TEXT, cur_time TEXT,
     body_state TEXT DEFAULT 'IDLE', current_app TEXT DEFAULT '',
-    live_observation TEXT DEFAULT '', latest_screen_file_code TEXT DEFAULT ''
+    live_observation TEXT DEFAULT '', latest_screen_file_code TEXT DEFAULT '',
+    timezone_name TEXT DEFAULT 'Asia/Tokyo',
+    active_persona_slot TEXT DEFAULT 'sister_younger',
+    active_sister TEXT DEFAULT 'sister_younger',
+    elder_away_arc TEXT DEFAULT '',
+    chat_execution_mode TEXT DEFAULT 'dual_director',
+    fairy_remote_balance_usd REAL DEFAULT 5.0,
+    fairy_unsettled_cost_usd REAL DEFAULT 0.0,
+    fairy_total_spent_usd REAL DEFAULT 0.0,
+    fairy_compute_tier TEXT DEFAULT 'STANDARD',
+    fairy_active_job_summary TEXT DEFAULT '',
+    balance_updated_at TEXT DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS user_status (
     key TEXT PRIMARY KEY, category TEXT, current_value TEXT,
-    visibility TEXT DEFAULT 'PRIVATE', updated_at TEXT
+    visibility TEXT DEFAULT 'PRIVATE', scope_chat_id TEXT DEFAULT '', updated_at TEXT
 );
 CREATE TABLE IF NOT EXISTS quests_events (
     quest_code TEXT PRIMARY KEY, title TEXT, current_progress TEXT,
     deadline_or_condition TEXT, status TEXT DEFAULT 'ongoing',
-    visibility TEXT DEFAULT 'PRIVATE', updated_at TEXT
+    visibility TEXT DEFAULT 'PRIVATE', scope_chat_id TEXT DEFAULT '', updated_at TEXT
 );
 CREATE TABLE IF NOT EXISTS chronicle_events (
     code_index TEXT PRIMARY KEY, time_span TEXT, location TEXT, summary TEXT,
     chronicle_text TEXT, key_dialogue TEXT, trigger_when TEXT,
     tk_estimate INTEGER DEFAULT 120, related_files TEXT DEFAULT '[]',
-    visibility TEXT DEFAULT 'PRIVATE', status TEXT DEFAULT 'active',
+    visibility TEXT DEFAULT 'PRIVATE', scope_chat_id TEXT DEFAULT '', status TEXT DEFAULT 'active',
     valid_from TEXT, valid_until TEXT
 );
 CREATE TABLE IF NOT EXISTS media_vault (
@@ -46,7 +58,8 @@ CREATE TABLE IF NOT EXISTS media_vault (
 );
 CREATE TABLE IF NOT EXISTS phone_surfing_log (
     surf_code TEXT PRIMARY KEY, app_name TEXT, post_summary TEXT, my_thought TEXT,
-    screenshot_file_code TEXT, trigger_when TEXT, is_shared INTEGER DEFAULT 0, created_at TEXT
+    screenshot_file_code TEXT, trigger_when TEXT, is_shared INTEGER DEFAULT 0,
+    persona_slot TEXT DEFAULT 'sister_younger', created_at TEXT
 );
 CREATE TABLE IF NOT EXISTS app_sop_skills (
     sop_id TEXT PRIMARY KEY, app_name TEXT, feature_name TEXT, package_name TEXT,
@@ -55,7 +68,8 @@ CREATE TABLE IF NOT EXISTS app_sop_skills (
 CREATE TABLE IF NOT EXISTS person_info (
     person_id TEXT PRIMARY KEY, platform_ids TEXT DEFAULT '{}', person_name TEXT,
     wechat_remark TEXT, trust_role TEXT DEFAULT 'GROUP_MEMBER', one_line_intro TEXT,
-    impression TEXT, intimacy_score REAL DEFAULT 0, shared_episodes TEXT DEFAULT '[]'
+    public_impression TEXT DEFAULT '', owner_private_notes TEXT DEFAULT '',
+    impression TEXT DEFAULT '', intimacy_score REAL DEFAULT 0, shared_episodes TEXT DEFAULT '[]'
 );
 """
 
@@ -76,6 +90,63 @@ class CompanionTruthDB:
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(_SCHEMA)
         self.conn.executescript(GROUP_MEMBERS_SCHEMA)
+        self._ensure_schema_migrations()
+
+    def _ensure_schema_migrations(self) -> None:
+        """单一 Schema 事实源：幂等补齐存量真值库演进列并迁移旧 impression 至物理分列。"""
+        table_additions: dict[str, dict[str, str]] = {
+            "global_state": {
+                "timezone_name": "TEXT DEFAULT 'Asia/Tokyo'",
+                "active_persona_slot": "TEXT DEFAULT 'sister_younger'",
+                "active_sister": "TEXT DEFAULT 'sister_younger'",
+                "elder_away_arc": "TEXT DEFAULT ''",
+                "chat_execution_mode": "TEXT DEFAULT 'dual_director'",
+                "fairy_remote_balance_usd": "REAL DEFAULT 5.0",
+                "fairy_unsettled_cost_usd": "REAL DEFAULT 0.0",
+                "fairy_total_spent_usd": "REAL DEFAULT 0.0",
+                "fairy_compute_tier": "TEXT DEFAULT 'STANDARD'",
+                "fairy_active_job_summary": "TEXT DEFAULT ''",
+                "balance_updated_at": "TEXT DEFAULT ''",
+            },
+            "user_status": {"scope_chat_id": "TEXT DEFAULT ''"},
+            "quests_events": {"scope_chat_id": "TEXT DEFAULT ''"},
+            "chronicle_events": {"scope_chat_id": "TEXT DEFAULT ''"},
+            "phone_surfing_log": {"persona_slot": "TEXT DEFAULT 'sister_younger'"},
+            "person_info": {
+                "public_impression": "TEXT DEFAULT ''",
+                "owner_private_notes": "TEXT DEFAULT ''",
+                "impression": "TEXT DEFAULT ''",
+            },
+        }
+        with self.conn:
+            for tbl, col_defs in table_additions.items():
+                existing = {
+                    str(r["name"])
+                    for r in self.conn.execute(f"PRAGMA table_info({tbl})").fetchall()
+                }
+                for col_name, col_ddl in col_defs.items():
+                    if col_name not in existing:
+                        self.conn.execute(f"ALTER TABLE {tbl} ADD COLUMN {col_name} {col_ddl}")
+
+            # 迁移旧库中未拆分的 OWNER 私密 impression 至物理绝密列 owner_private_notes
+            self.conn.execute(
+                """
+                UPDATE person_info
+                SET owner_private_notes = impression, impression = ''
+                WHERE trust_role = 'OWNER'
+                  AND COALESCE(TRIM(owner_private_notes), '') = ''
+                  AND COALESCE(TRIM(impression), '') != ''
+                """
+            )
+            self.conn.execute(
+                """
+                UPDATE person_info
+                SET public_impression = impression, impression = ''
+                WHERE trust_role != 'OWNER'
+                  AND COALESCE(TRIM(public_impression), '') = ''
+                  AND COALESCE(TRIM(impression), '') != ''
+                """
+            )
 
     def close(self) -> None:
         self.conn.close()
@@ -96,7 +167,14 @@ class CompanionTruthDB:
         ).fetchone()
         return f"{prefix}{row[0] + 1:04d}"
 
-    def execute_table_sql(self, raw_sql: str, *, manage_tx: bool = True) -> int:
+    def execute_table_sql(
+        self,
+        raw_sql: str,
+        *,
+        manage_tx: bool = True,
+        forbid_private_person_columns: bool = False,
+        forbid_owner_state_tables: bool = False,
+    ) -> int:
         """只允许八张真值表上的 INSERT/UPDATE/DELETE，并以单事务原子提交。"""
         sql = normalize_sql_structure(raw_sql)
         if manage_tx and self.conn.in_transaction:
@@ -111,6 +189,17 @@ class CompanionTruthDB:
 
         def authorize(action: int, arg1: str, arg2: str, database: str, source: str) -> int:
             if source is not None or database not in {None, "main"}:
+                return sqlite3.SQLITE_DENY
+            if forbid_owner_state_tables and arg1 in {"global_state", "user_status"} and action in (
+                sqlite3.SQLITE_INSERT,
+                sqlite3.SQLITE_UPDATE,
+                sqlite3.SQLITE_DELETE,
+            ):
+                return sqlite3.SQLITE_DENY
+            if forbid_private_person_columns and arg1 == "person_info" and (arg2 or "").lower() in {
+                "owner_private_notes",
+                "impression",
+            } and action in (sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_READ):
                 return sqlite3.SQLITE_DENY
             if action in (sqlite3.SQLITE_INSERT, sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_DELETE):
                 return sqlite3.SQLITE_OK if arg1 in allowed_tables else sqlite3.SQLITE_DENY
@@ -217,15 +306,21 @@ class CompanionTruthDB:
             f"SELECT {columns} FROM {table} WHERE {condition} ORDER BY {order}"
         )]
 
-    def _render_self_identity_anchor(self, self_wxid: str = "wxid_w5d0efdxczt322") -> str:
+    def _render_self_identity_anchor(self, self_wxid: str = "") -> str:
         """[动态人设与身份排他准则] 明确告知模型自身底层微信 ID、核心人设名与别名，并严格排他"""
+        effective_wxid = (
+            str(self_wxid or "").strip()
+            or os.environ.get("MAIBOT_SELF_WXID", "").strip()
+            or "wxid_bot_self"
+        )
         try:
             from src.config.config import global_config
-            bot_name = str(getattr(global_config.bot, "nickname", "") or "许妍").strip()
+
+            bot_name = str(getattr(global_config.bot, "nickname", "") or "").strip() or "麦麦"
             aliases = [str(a).strip() for a in (getattr(global_config.bot, "alias_names", []) or []) if str(a).strip()]
         except Exception:
-            bot_name = "许妍"
-            aliases = ["妍妍", "小妍"]
+            bot_name = "麦麦"
+            aliases = []
 
         alias_str = "、".join(aliases) if aliases else ""
         alias_prompt = f"（别名：{alias_str}）" if alias_str else ""
@@ -234,9 +329,9 @@ class CompanionTruthDB:
 
         return (
             "<自身账号与提及判定准则>\n"
-            f"- 你的唯一核心名字/当前人设：{bot_name}{alias_prompt} | 你的底层微信ID：{self_wxid}\n"
-            f"- 提及(@)严格判定规则：仅当消息包含指向 '{self_wxid}' 的 @提及 或明确文本 {at_rules} 时，才是在 @ 你本人。\n"
-            "- 当消息中出现 '@其他名字'（例如 '@ì _eun' 等）时，那是群成员在 @ 群内的其他群友（可通过下方<重要角色索引>核对其微信昵称与备注名的对应关系），绝不是你的底层代号，切勿将他人的微信昵称误认为自己！\n"
+            f"- 你的唯一核心名字/当前人设：{bot_name}{alias_prompt} | 你的底层微信ID：{effective_wxid}\n"
+            f"- 提及(@)严格判定规则：仅当消息包含指向 '{effective_wxid}' 的 @提及 或明确文本 {at_rules} 时，才是在 @ 你本人。\n"
+            "- 当消息中出现 '@其他名字'（例如 '@某群友' 等）时，那是群成员在 @ 群内的其他群友（可通过下方<重要角色索引>核对其微信昵称与备注名的对应关系），绝不是你的底层代号，切勿将他人的微信昵称误认为自己！\n"
             "- 如果群内有群友昵称与你相似或重名，以底层微信ID及下方<重要角色索引>为准，严禁将他人发言视作对你的指令。\n"
             "</自身账号与提及判定准则>"
         )
@@ -308,34 +403,31 @@ class CompanionTruthDB:
         unsettled_cost = 0.0
         total_spent = 0.0
         tier_code = "STANDARD"
-        active_slot = "flash_primary"
+        active_slot = "sister_younger"
+        elder_away_arc = ""
         active_job_summary = ""
         try:
-            cols = {
-                str(r["name"])
-                for r in self.conn.execute("PRAGMA table_info(global_state)").fetchall()
-            }
-            if "fairy_remote_balance_usd" in cols:
-                select_cols = [
-                    "fairy_remote_balance_usd",
-                    "fairy_unsettled_cost_usd",
-                    "fairy_total_spent_usd",
-                    "fairy_compute_tier",
-                    "active_sister",
-                ]
-                if "fairy_active_job_summary" in cols:
-                    select_cols.append("fairy_active_job_summary")
-                row = self.conn.execute(
-                    f"SELECT {', '.join(select_cols)} FROM global_state WHERE row_id = 1"
-                ).fetchone()
-                if row:
-                    remote_bal = float(row["fairy_remote_balance_usd"] or 5.0)
-                    unsettled_cost = float(row["fairy_unsettled_cost_usd"] or 0.0)
-                    total_spent = float(row["fairy_total_spent_usd"] or 0.0)
-                    tier_code = str(row["fairy_compute_tier"] or "STANDARD")
-                    active_slot = str(row["active_sister"] or "flash_primary")
-                    if "fairy_active_job_summary" in cols:
-                        active_job_summary = str(row["fairy_active_job_summary"] or "").strip()
+            row = self.conn.execute(
+                """
+                SELECT fairy_remote_balance_usd, fairy_unsettled_cost_usd, fairy_total_spent_usd,
+                       fairy_compute_tier, active_persona_slot, active_sister, elder_away_arc,
+                       fairy_active_job_summary
+                FROM global_state WHERE row_id = 1
+                """
+            ).fetchone()
+            if row:
+                remote_bal = float(row["fairy_remote_balance_usd"] if row["fairy_remote_balance_usd"] is not None else 5.0)
+                unsettled_cost = float(row["fairy_unsettled_cost_usd"] or 0.0)
+                total_spent = float(row["fairy_total_spent_usd"] or 0.0)
+                tier_code = str(row["fairy_compute_tier"] or "STANDARD")
+                persona_slot_val = str(row["active_persona_slot"] or "").strip()
+                legacy_sister_val = str(row["active_sister"] or "").strip()
+                if legacy_sister_val and legacy_sister_val != "sister_younger" and persona_slot_val in ("", "sister_younger"):
+                    active_slot = legacy_sister_val
+                else:
+                    active_slot = persona_slot_val or legacy_sister_val or "sister_younger"
+                elder_away_arc = str(row["elder_away_arc"] or "").strip()
+                active_job_summary = str(row["fairy_active_job_summary"] or "").strip()
         except Exception:
             pass
 
@@ -350,12 +442,14 @@ class CompanionTruthDB:
         is_owner_private = (not is_group_chat) and (sender_trust_role.upper() == "OWNER")
 
         active_job_line = f"- 后台慢轨长程任务：{active_job_summary}\n" if active_job_summary else ""
+        away_arc_line = f"- 离场弧光状态：{elder_away_arc}\n" if elder_away_arc else ""
 
         if is_owner_private:
             return (
                 "<算力工况与工作区状态 (Owner私聊视图)>\n"
                 f"- 算力工况档位：{tier_label} ({tier_code}) | 当前模型槽位：{active_slot}\n"
                 f"- 实时算力可用余额：${effective_bal:.2f} USD | 累计消耗总额：${total_spent:.2f} USD\n"
+                f"{away_arc_line}"
                 f"{active_job_line}"
                 "</算力工况与工作区状态>"
             )
@@ -376,10 +470,6 @@ class CompanionTruthDB:
         chat_id: str = "",
         active_sender_ids: set[str] | None = None,
     ) -> str:
-        """
-        [v1.1 修正 P1] 保留全向向下兼容签名（chat_id 与 active_sender_ids 均带默认值），
-        确保现网 test_quote_context.py、test_memory_consolidation.py 等测试模块零改动通过。
-        """
         blocks: list[str] = [
             self._render_self_identity_anchor(),
             self._render_twin_and_compute_economy_block(
@@ -390,13 +480,37 @@ class CompanionTruthDB:
 
         owner = not is_group_chat and sender_trust_role == "OWNER"
         visibility = "1=1" if owner else "visibility = 'PUBLIC'"
-        # 全局屏幕和位置没有 visibility 字段，不能作为公共状态披露。
+        clean_chat_id = (chat_id or "").strip()
+
+        if owner:
+            quests = [
+                dict(row)
+                for row in self.conn.execute(
+                    "SELECT * FROM quests_events WHERE status = 'ongoing' ORDER BY quest_code"
+                )
+            ]
+        elif clean_chat_id:
+            quests = [
+                dict(row)
+                for row in self.conn.execute(
+                    "SELECT * FROM quests_events WHERE status = 'ongoing' AND visibility = 'PUBLIC' "
+                    "AND (COALESCE(scope_chat_id, '') = '' OR scope_chat_id = ?) ORDER BY quest_code",
+                    (clean_chat_id,),
+                )
+            ]
+        else:
+            quests = [
+                dict(row)
+                for row in self.conn.execute(
+                    "SELECT * FROM quests_events WHERE status = 'ongoing' AND visibility = 'PUBLIC' "
+                    "AND COALESCE(scope_chat_id, '') = '' ORDER BY quest_code"
+                )
+            ]
+
         state = {
             "global_state": [dict(row) for row in self.conn.execute("SELECT * FROM global_state")] if owner else [],
             "user_status": [dict(row) for row in self.conn.execute(f"SELECT * FROM user_status WHERE {visibility} ORDER BY key")],
-            "quests_events": [dict(row) for row in self.conn.execute(
-                f"SELECT * FROM quests_events WHERE status = 'ongoing' AND {visibility} ORDER BY quest_code"
-            )],
+            "quests_events": quests,
         }
         blocks.append("<全局与实时状态>\n" + json.dumps(state, ensure_ascii=False) + "\n</全局与实时状态>")
 

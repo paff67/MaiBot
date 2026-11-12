@@ -156,7 +156,7 @@ class WeChatEdgeClient:
     ) -> Dict[str, Any]:
         if self.use_hook_send:
             return await self.send_text_via_hook(chat_id, text, internal_id, quote=quote)
-        from src.mobile_agent.wechat_screen_parser import WeChatScreenParser
+        from .screen_fallback import WeChatScreenParser
 
         if not internal_id or not text.strip():
             raise ValueError("Sending requires stable internal message ID and nonempty text")

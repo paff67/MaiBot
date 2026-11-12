@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from pathlib import Path
 import sqlite3
 from typing import Any, Dict, Optional
@@ -95,13 +94,31 @@ def _clean_text(value: Any) -> str:
     return str(value or "").strip()
 
 
+def _is_requester_owner(conn: sqlite3.Connection, platform: str, user_id: str) -> bool:
+    clean_uid = _clean_text(user_id)
+    if not clean_uid:
+        return False
+    clean_plat = _clean_text(platform)
+    if clean_plat:
+        row = conn.execute(
+            "SELECT trust_role FROM person_info WHERE person_id = ? OR json_extract(platform_ids, ?) = ? LIMIT 1",
+            (clean_uid, f"$.{clean_plat}", clean_uid),
+        ).fetchone()
+    else:
+        row = conn.execute("SELECT trust_role FROM person_info WHERE person_id = ? LIMIT 1", (clean_uid,)).fetchone()
+    return bool(row and _clean_text(row["trust_role"]).upper() == "OWNER")
+
+
 def _query_companion_truth_person(
     person_id: str,
     person_name: str,
     db_path: str = DEFAULT_TRUTH_DB_PATH,
+    *,
+    is_group_chat: bool = True,
+    requester_platform: str = "",
+    requester_user_id: str = "",
 ) -> Optional[Dict[str, str]]:
-    """从 companion_truth.db -> person_info 查询人物档案。"""
-
+    """从 companion_truth.db -> person_info 查询人物档案（防线一 SQL 投影级物理硬裁剪）。"""
     clean_id = _clean_text(person_id)
     clean_name = _clean_text(person_name)
     path = Path(db_path)
@@ -118,47 +135,68 @@ def _query_companion_truth_person(
 
     try:
         conn.row_factory = sqlite3.Row
-        rows = conn.execute("SELECT * FROM person_info").fetchall()
+        existing_cols = {str(r["name"]) for r in conn.execute("PRAGMA table_info(person_info)").fetchall()}
+        if not existing_cols:
+            return None
+
+        allow_owner_private = (not is_group_chat) and _is_requester_owner(conn, requester_platform, requester_user_id)
+        select_cols = ["person_id", "person_name", "trust_role"]
+        if not is_group_chat and "wechat_remark" in existing_cols:
+            select_cols.append("wechat_remark")
+        if "one_line_intro" in existing_cols:
+            select_cols.append("one_line_intro")
+        if "relationship_text" in existing_cols and not is_group_chat:
+            select_cols.append("relationship_text")
+        if "public_impression" in existing_cols:
+            select_cols.append("public_impression")
+        if allow_owner_private:
+            if "owner_private_notes" in existing_cols:
+                select_cols.append("owner_private_notes")
+            if "impression" in existing_cols:
+                select_cols.append("impression")
+
+        projection = ", ".join(select_cols)
+        matched_row: Optional[sqlite3.Row] = None
+
+        if clean_id:
+            matched_row = conn.execute(
+                f"SELECT {projection} FROM person_info "
+                f"WHERE person_id = ? OR json_extract(platform_ids, '$.wechat') = ? OR person_name = ? LIMIT 1",
+                (clean_id, clean_id, clean_id),
+            ).fetchone()
+        if matched_row is None and clean_name:
+            if not is_group_chat and "wechat_remark" in existing_cols:
+                matched_row = conn.execute(
+                    f"SELECT {projection} FROM person_info "
+                    f"WHERE person_name = ? OR wechat_remark = ? OR person_id = ? LIMIT 1",
+                    (clean_name, clean_name, clean_name),
+                ).fetchone()
+            else:
+                matched_row = conn.execute(
+                    f"SELECT {projection} FROM person_info WHERE person_name = ? OR person_id = ? LIMIT 1",
+                    (clean_name, clean_name),
+                ).fetchone()
+
+        if matched_row is None:
+            keyword = (clean_name or clean_id).strip()
+            if keyword:
+                like_pat = f"%{keyword}%"
+                search_cols = ["person_id", "person_name"]
+                if "one_line_intro" in existing_cols:
+                    search_cols.append("one_line_intro")
+                if "public_impression" in existing_cols:
+                    search_cols.append("public_impression")
+                if not is_group_chat and "wechat_remark" in existing_cols:
+                    search_cols.append("wechat_remark")
+                where_like = " OR ".join(f"COALESCE({c}, '') LIKE ?" for c in search_cols)
+                matched_row = conn.execute(
+                    f"SELECT {projection} FROM person_info WHERE {where_like} LIMIT 1",
+                    tuple(like_pat for _ in search_cols),
+                ).fetchone()
     except Exception:
         return None
     finally:
         conn.close()
-
-    matched_row: Optional[sqlite3.Row] = None
-    # 1. 精确匹配 person_id / platform_ids / person_name / wechat_remark
-    for row in rows:
-        row_keys = set(row.keys())
-        row_pid = _clean_text(row["person_id"]) if "person_id" in row_keys else ""
-        row_pname = _clean_text(row["person_name"]) if "person_name" in row_keys else ""
-        row_remark = _clean_text(row["wechat_remark"]) if "wechat_remark" in row_keys else ""
-        try:
-            pids = json.loads(row["platform_ids"] or "{}") if "platform_ids" in row_keys else {}
-            if not isinstance(pids, dict):
-                pids = {}
-        except (ValueError, TypeError):
-            pids = {}
-        pid_values = {_clean_text(v) for v in pids.values() if _clean_text(v)}
-        if clean_id and (clean_id == row_pid or clean_id in pid_values or clean_id in {row_pname, row_remark}):
-            matched_row = row
-            break
-        if clean_name and clean_name in {row_pname, row_remark, row_pid}:
-            matched_row = row
-            break
-
-    # 2. 模糊匹配 (LIKE / 子串)
-    if matched_row is None:
-        keyword = (clean_name or clean_id).lower()
-        if keyword:
-            for row in rows:
-                row_keys = set(row.keys())
-                fields = [
-                    _clean_text(row[col])
-                    for col in ("person_id", "person_name", "wechat_remark", "one_line_intro", "relationship_text", "impression")
-                    if col in row_keys and _clean_text(row[col])
-                ]
-                if any(keyword in field.lower() or field.lower() in keyword for field in fields):
-                    matched_row = row
-                    break
 
     if matched_row is None:
         return None
@@ -168,27 +206,29 @@ def _query_companion_truth_person(
     row_pname = _clean_text(matched_row["person_name"]) if "person_name" in row_keys else ""
     row_remark = _clean_text(matched_row["wechat_remark"]) if "wechat_remark" in row_keys else ""
     trust_role = _clean_text(matched_row["trust_role"]) if "trust_role" in row_keys else ""
-    impression = _clean_text(matched_row["impression"]) if "impression" in row_keys else ""
-    relationship_text = ""
-    if "relationship_text" in row_keys:
-        relationship_text = _clean_text(matched_row["relationship_text"])
-    if not relationship_text and "one_line_intro" in row_keys:
-        relationship_text = _clean_text(matched_row["one_line_intro"])
+    pub_imp = _clean_text(matched_row["public_impression"]) if "public_impression" in row_keys else ""
+    priv_notes = ""
+    if allow_owner_private:
+        priv_notes = _clean_text(matched_row["owner_private_notes"]) if "owner_private_notes" in row_keys else ""
+        if not priv_notes and "impression" in row_keys:
+            priv_notes = _clean_text(matched_row["impression"])
 
-    profile_text = (
-        f"person_id: {row_pid}\n"
-        f"姓名/昵称: {row_pname}\n"
-        f"备注: {row_remark}\n"
-        f"身份角色: {trust_role}\n"
-        f"印象: {impression}\n"
-        f"关系与相处准则: {relationship_text}"
+    eff_impression = "\n".join(x for x in (priv_notes, pub_imp) if x) if allow_owner_private else pub_imp
+    relationship_text = (_clean_text(matched_row["relationship_text"]) if "relationship_text" in row_keys and not is_group_chat else "") or (
+        _clean_text(matched_row["one_line_intro"]) if "one_line_intro" in row_keys else ""
     )
+
+    lines = [f"person_id: {row_pid}", f"姓名/昵称: {row_pname}"]
+    if not is_group_chat and row_remark:
+        lines.append(f"备注: {row_remark}")
+    lines.extend([f"身份角色: {trust_role}", f"印象: {eff_impression}", f"关系与相处准则: {relationship_text}"])
+    profile_text = "\n".join(lines)
     return {
         "person_id": row_pid,
         "person_name": row_pname or row_remark,
-        "wechat_remark": row_remark,
+        "wechat_remark": "" if is_group_chat else row_remark,
         "trust_role": trust_role,
-        "impression": impression,
+        "impression": eff_impression,
         "relationship_text": relationship_text,
         "profile_text": profile_text,
     }
@@ -212,8 +252,21 @@ async def handle_tool(
 
     limit = _normalize_limit(invocation.arguments.get("limit"))
     db_path = str(invocation.arguments.get("db_path") or DEFAULT_TRUTH_DB_PATH).strip() or DEFAULT_TRUTH_DB_PATH
+    chat_stream = getattr(getattr(tool_ctx, "runtime", None), "chat_stream", None)
+    is_group_chat = bool(getattr(chat_stream, "is_group_session", True)) if chat_stream is not None else True
+    req_platform = _clean_text(getattr(chat_stream, "platform", "")) if chat_stream is not None else ""
+    req_user_id = _clean_text(getattr(chat_stream, "user_id", "")) if chat_stream is not None else ""
+
     try:
-        truth_record = await asyncio.to_thread(_query_companion_truth_person, person_id, person_name, db_path)
+        truth_record = await asyncio.to_thread(
+            _query_companion_truth_person,
+            person_id,
+            person_name,
+            db_path,
+            is_group_chat=is_group_chat,
+            requester_platform=req_platform,
+            requester_user_id=req_user_id,
+        )
     except Exception:
         truth_record = None
 
@@ -238,6 +291,13 @@ async def handle_tool(
             invocation.tool_name,
             profile_text,
             structured_content=structured_content,
+        )
+
+    # 微信具身模式或群聊会话禁止回退 A_memorix 读取未按群私隔离的跨聊事实
+    if req_platform.lower() == "wechat" or is_group_chat:
+        return tool_ctx.build_failure_result(
+            invocation.tool_name,
+            "未在当前会话可见范围内找到该人物的公开档案。",
         )
     try:
         if person_id:

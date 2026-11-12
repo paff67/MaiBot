@@ -1,11 +1,8 @@
-"""私聊 OWNER 的手机指令登记与 jp-main 沙盒异步协议。"""
+"""私聊 OWNER 的手机 SOP 指令登记协议。"""
 
 from typing import Any, Dict, Optional
 import asyncio
 import json
-import os
-
-import aiohttp
 
 from src.companion_vault.consolidator import update_body_state
 from src.companion_vault.runtime_bridge import DEFAULT_TRUTH_DB_PATH, _open_truth_db, _resolve_trust_role_sync
@@ -29,23 +26,8 @@ def get_phone_action_tool_spec() -> ToolSpec:
             },
             "required": ["action_type", "sop_id", "task_goal"],
         },
-        provider_name="maisaka_builtin", provider_type="builtin",
-    )
-
-
-def get_sandbox_task_tool_spec() -> ToolSpec:
-    return ToolSpec(
-        name="sandbox_task",
-        description="仅主人私聊可用。向 jp-main 派发文件处理任务，后台执行后返回结果。",
-        parameters_schema={
-            "type": "object",
-            "properties": {
-                "task_instruction": {"type": "string", "minLength": 1},
-                "input_file_codes": {"type": "array", "items": {"type": "string"}, "default": []},
-            },
-            "required": ["task_instruction"],
-        },
-        provider_name="maisaka_builtin", provider_type="builtin",
+        provider_name="maisaka_builtin",
+        provider_type="builtin",
     )
 
 
@@ -114,48 +96,7 @@ async def handle_phone_action_tool(
         on_finished=tool_ctx.runtime.deliver_subagent_result,
     )
     return tool_ctx.build_success_result(
-        invocation.tool_name, "手机指令已登记，等待设备执行器消费。",
+        invocation.tool_name,
+        "手机指令已登记，等待设备执行器消费。",
         structured_content={"task_id": task_id, "status": "pending", **arguments},
-    )
-
-
-async def handle_sandbox_task_tool(
-    tool_ctx: BuiltinToolRuntimeContext, invocation: ToolInvocation,
-    context: Optional[ToolExecutionContext] = None,
-) -> ToolExecutionResult:
-    if tool_ctx.runtime.chat_stream.is_group_session:
-        return tool_ctx.build_failure_result(invocation.tool_name, "群聊禁止执行沙盒任务。")
-    if not await _is_owner(tool_ctx):
-        return tool_ctx.build_failure_result(invocation.tool_name, "只有 OWNER 可以执行沙盒任务。")
-    manager = tool_ctx.runtime._subagent_tasks
-    if manager.running_count >= SUBAGENT_MAX_RUNNING_TASKS:
-        return tool_ctx.build_failure_result(invocation.tool_name, "后台任务已达到并发上限。")
-    instruction = invocation.arguments["task_instruction"].strip()
-    if not instruction:
-        return tool_ctx.build_failure_result(invocation.tool_name, "task_instruction 不能为空。")
-    task_id = manager.allocate_task_id()
-    payload = {
-        "task_id": task_id, "session_id": tool_ctx.runtime.session_id,
-        "task_instruction": instruction,
-        "input_file_codes": invocation.arguments.get("input_file_codes", []),
-    }
-    url = os.environ.get("MAIBOT_SANDBOX_URL", "http://100.87.39.37:9000/internal/execute")
-
-    async def execute(task: SubAgentTask) -> SubAgentOutcome:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=300)) as client:
-            async with client.post(url, json=payload) as response:
-                response.raise_for_status()
-                result = await response.json()
-        # HTTP 成功不等于任务成功；保留服务端的明确失败信息。
-        if result.get("success") is False:
-            raise RuntimeError(json.dumps(result, ensure_ascii=False))
-        return SubAgentOutcome(conclusion=json.dumps(result, ensure_ascii=False), tool_usage={"sandbox_task": 1})
-
-    manager.start(
-        task_id=task_id, description=instruction, granted_tools=["sandbox_task"], runner=execute,
-        on_finished=tool_ctx.runtime.deliver_subagent_result,
-    )
-    return tool_ctx.build_success_result(
-        invocation.tool_name, "沙盒任务已转入后台，完成或失败后会返回结果。",
-        structured_content={"task_id": task_id, "status": "running"},
     )

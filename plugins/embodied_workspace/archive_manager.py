@@ -37,38 +37,57 @@ class WorkspaceArchiveManager:
         dist_dir: Path,
         declared_files: list[str] | None = None,
     ) -> list[str]:
-        candidates: list[Path] = []
-        files_dir = dist_dir / "files"
+        dist_root = dist_dir.resolve()
+        files_dir = (dist_root / "files").resolve()
+        candidates: list[tuple[Path, Path]] = []
+        seen_sources: set[Path] = set()
+
         if files_dir.is_dir():
             for item in sorted(files_dir.rglob("*")):
                 if item.is_file():
-                    candidates.append(item)
+                    resolved_item = item.resolve()
+                    if resolved_item.is_relative_to(files_dir):
+                        rel_dest = resolved_item.relative_to(files_dir)
+                        candidates.append((resolved_item, rel_dest))
+                        seen_sources.add(resolved_item)
 
         for rel in declared_files or []:
-            target = (dist_dir / rel.lstrip("/")).resolve()
-            if str(target).startswith(str(dist_dir.resolve())) and target.is_file():
-                if target not in candidates:
-                    candidates.append(target)
+            clean_rel = str(rel or "").strip().lstrip("/\\")
+            if not clean_rel:
+                continue
+            target = (dist_root / clean_rel).resolve()
+            if target.is_relative_to(dist_root) and target.is_file() and target not in seen_sources:
+                rel_dest = (
+                    target.relative_to(files_dir)
+                    if target.is_relative_to(files_dir)
+                    else target.relative_to(dist_root)
+                )
+                candidates.append((target, rel_dest))
+                seen_sources.add(target)
 
         if not candidates:
             return []
 
         date_str = datetime.date.today().isoformat()
         folder_name = f"{date_str}_{project_slug}"
-        dest_dir = self.gdrive_archive_root / chat_safe_id / folder_name
+        dest_dir = (self.gdrive_archive_root / chat_safe_id / folder_name).resolve()
         await asyncio.to_thread(dest_dir.mkdir, parents=True, exist_ok=True)
 
         archived_names: list[str] = []
         manifest_items: list[dict[str, Any]] = []
 
-        for src_file in candidates:
-            dest_file = dest_dir / src_file.name
+        for src_file, rel_dest in candidates:
+            dest_file = (dest_dir / rel_dest).resolve()
+            if not dest_file.is_relative_to(dest_dir):
+                continue
+            await asyncio.to_thread(dest_file.parent.mkdir, parents=True, exist_ok=True)
             await asyncio.to_thread(shutil.copy2, src_file, dest_file)
             digest = await asyncio.to_thread(self._sha256_file, dest_file)
-            archived_names.append(src_file.name)
+            rel_posix = rel_dest.as_posix()
+            archived_names.append(rel_posix)
             manifest_items.append(
                 {
-                    "file_name": src_file.name,
+                    "file_name": rel_posix,
                     "size_bytes": dest_file.stat().st_size,
                     "sha256": digest,
                 }

@@ -359,7 +359,7 @@ function scan(sweep, tail, ids) {
    }
    if(hasLocalFull){
     pendingImgDownloads.delete(row.msgId);
-   }else if(!sweep && targetInfo && row.msgId && row.talker && Number(row.msgId)>=143000){
+   }else if(!sweep && targetInfo && row.msgId && row.talker && Number(row.msgId)>0 && (!row.createTime || Date.now()-Number(row.createTime)<86400000)){
     const now=Date.now();
     const lastAttempt=imgDownloadAttempts.get(row.msgId)||0;
     if(now-lastAttempt>60000){

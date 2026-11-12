@@ -13,7 +13,7 @@ from src.common.data_models.llm_service_data_models import LLMResponseResult
 from src.common.database.database import get_db_session
 from src.common.database.database_model import Jargon, JargonCreatedBy, Messages
 from src.common.logger import get_logger
-from src.common.utils.utils_config import JargonConfigUtils
+from src.common.utils.utils_config import ChatConfigUtils, JargonConfigUtils
 from src.common.utils.utils_message import MessageUtils
 from src.config.config import global_config
 from src.llm_models.payload_content.context_item import ContextItemBuilder, RoleType
@@ -647,12 +647,13 @@ class JargonMiner:
                 logger.error(f"查询黑话 '{content}' 失败: {e}")
                 continue
             related_session_ids, _ = JargonConfigUtils.resolve_jargon_group_scope(self.session_id)
+            is_private_session = ChatConfigUtils.is_private_session_id(self.session_id)
             # 找匹配项
             matched_jargon: Optional[Jargon] = None
             matched_ai_jargon: Optional[Jargon] = None
             for item in jargon_items:
                 item_matches_scope = False
-                if item.is_global:
+                if item.is_global and not is_private_session:
                     item_matches_scope = True
                 elif item.session_id_dict:
                     try:

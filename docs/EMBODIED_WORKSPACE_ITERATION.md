@@ -1,8 +1,9 @@
 # 具身微信 MaiBot 动态工作区与全栈沙盒交付系统开发迭代规范与全景记录
 
-> **维护基准分支**：`feat/embodied-workspace-phase3`  
+> **维护基准分支**：`feat/embodied-workspace-phase4-twins`（提交基线 `2bbcae1d4`）  
 > **生产主脑节点**：`DMIT-US`（`/opt/maibot-brain`）  
 > **核心组件定位**：`plugins/embodied_workspace/`（MaiBot v2 标准插件）  
+> **配套净室重构基线**：[`docs/CLEANROOM_REFACTOR_SPEC.md`](./CLEANROOM_REFACTOR_SPEC.md)（基于本文档第十、十一章审计结论制定的正式重构与双子预留规范）  
 > **文档维护规约**：**本文档为该交付系统的法定迭代档案。每次 Phase 开发（编码、联调、测试验证）完成后，必须同步增量更新本文档对应的 Phase 章节、关键实现细节、避坑记录与测试审计结果。**
 
 ---
@@ -29,9 +30,13 @@
   - [3. 核心设计模式与时序流](#3-核心设计模式与时序流-2)
   - [4. 生产环境工程踩坑与实战攻关全景表（P0/P1 Matrix）](#4-生产环境工程踩坑与实战攻关全景表p0p1-matrix-1)
   - [5. 生产节点验证与测试覆盖报告](#5-生产节点验证与测试覆盖报告-2)
-- [六、 Phase 4：演进规划与后续接入设计（规划中）](#六-phase-4演进规划与后续接入设计规划中)
+- [六、 Phase 4：统一异步慢轨、杂志排版套件、算力经济监控与快慢双轨进度播报（已完成）](#六-phase-4统一异步慢轨杂志排版套件算力经济监控与快慢双轨进度播报已完成)
 - [七、 迭代追溯索引与提交记录](#七-迭代追溯索引与提交记录)
 - [八、 微信群聊 @mention 识别穿透与角色身份投影断层重构（v1.1 闭环交付）](#八-微信群聊-mention-识别穿透与角色身份投影断层重构v11-闭环交付)
+- [九、 DMIT-US 生产真机全链路实测与 P0 修补报告（v2.0 闭环验收）](#九-dmit-us-生产真机全链路实测与-p0-修补报告v20-闭环验收)
+- [十、 全栈架构与代码质量审计报告（v2.1 首席架构师红线审查）](#十-全栈架构与代码质量审计报告v21-首席架构师红线审查)
+- [十一、 Phase 1~4 AGY 沙盒插件（`embodied_workspace`）全模块深度专项审计档案](#十一-phase-14-agy-沙盒插件embodied_workspace全模块深度专项审计档案)
+- [十二、 净室重构落地闭环与架构师终审验收记录（Batch 1 ~ Batch 3）](#十二-净室重构落地闭环与架构师终审验收记录batch-1--batch-3)
 
 ---
 
@@ -518,14 +523,16 @@ python3 -m compileall -q plugins/embodied_workspace
 
 ---
 
-## 六、 Phase 4：演进规划与后续接入设计（规划中）
+## 六、 Phase 4：统一异步慢轨、杂志排版套件、算力经济监控与快慢双轨进度播报（已完成）
 
-在 Phase 1（双轨分流与沙盒交付）、Phase 2（单级泛域名、CF Pages 跳板、8 表隔离与免登接力）与 Phase 3（cgroups 硬隔离、Git 时光机与全双工总线）均已在 `DMIT-US` 生产节点闭环上线的前提下，后续 Phase 4 将面向更加复杂的具身多模态与长效工作流：
+### 1. 阶段目标与交付范围
+在 Phase 1~3 跑通双轨交付与沙盒托管后，真实生产测试暴露出同步快轨（`publish_document_page`）受制于跨进程 IPC 超时、长程调研任务在 180s 被掐断、AGY CLI 缺乏实时联网核查约束、Mermaid 连线语法报错以及算力账单不可见等问题。Phase 4（`feat/embodied-workspace-phase4-twins`）完成了以下核心架构演进：
 
-1. **分布式沙盒多节点集群（Multi-Host Execution Pool）**：
-   - 当 `DMIT-US` 负载过高时，网关支持通过 WireGuard 内网调度将重型编译与全栈容器无缝分发至计算专用节点。
-2. **具身微信原生小程序无感桥接（MiniProgram Trampoline）**：
-   - 探索将 `https://<token>.paff-67.top` 包装为临时微信小程序 Web-view 容器，实现一键微信原生产业链卡片转发与多人群协作。
+* [x] **统一异步慢轨收敛（Unified Slow Track）**：将长文撰写排版（`task_type="document"`）、交互式单页（`task_type="webapp"`）与受控后端（`task_type="backend"`）统一收敛至非阻塞工具 `run_agent_workspace`；原 `publish_document_page` 保留为内部兼容转发入口。
+* [x] **三层上下文与杂志级排版套件（`TASK_CONTEXT.md` + `editorial_kit.py`）**：慢轨启动前自动从 `message_ledger.db` 只读摘录当前会话最近 15 条对话写入 `TASK_CONTEXT.md`；预置 `editorial_theme.css` 与 `editorial_kit.js`（支持暗色自适应、阅读进度条、代码一键复制与浮动目录 TOC）。
+* [x] **3 小时构建窗口与快轨人设化进度播报**：默认 `cli_timeout_seconds` 扩展至 `10800` 秒（3 小时）；`CLIBridge` 每 `180` 秒巡检工作区产物变化，触发 `maisaka.proactive.trigger` 由快轨聊天模型按当前人设自然播报进展。
+* [x] **实时联网 Grounding 约束与算力经济监控（`compute_economy.py`）**：在 `AGENTS.md` 强制要求热点/事实类报告调用 `web-search` 核查；新增 `ComputeEconomyManager` 对接远端余额接口，按公私隔离原则在私聊 OWNER 视图展示精确算力余额，在群聊仅暴露脱敏工况档位，并剥离了硬编码世界观文案（`29b1b613b`）。
+* [x] **多模态音频内联回退加固（`2bbcae1d4`）**：针对第三方网关不支持 Gemini Files API 上传（返回 404）的场景，新增 `ContextAudioPart`（`audio_base64`）全链路支持与自动降级回退。
 
 ---
 
@@ -535,8 +542,9 @@ python3 -m compileall -q plugins/embodied_workspace
 | :---: | :---: | :---: | :--- | :---: |
 | **Phase 1** | `feat/embodied-workspace-phase1` | `90aac6bcce5a6d91d97c1a4960f388738311feef` | 完成快慢双轨分流、bwrap 命名空间沙盒、双库 RBAC 鉴权、Auto-Wake/Scale-to-Zero 网关与 6 项自动化测试。 | `agy` (Antigravity) |
 | **Phase 2** | `feat/embodied-workspace-phase2` | `c82ba349d` | 单级泛域名、CF Pages 边缘 2A 跳板、真值库 8 表 Schema 严格对齐、四级无感身份接力（抗预取）、FUSE 归档直写与 5 项专项测试。 | `agy` (Antigravity) |
-| **Phase 3** | `feat/embodied-workspace-phase3` | `e87de93fd` | cgroups v2 硬隔离包装器、宿主独立 Git 时光机双目录快照与回滚、群组全双工 WebSocket 实时总线、会话目录管理工具与 4 项专项测试。 | `agy` (Antigravity) |
-| **Mention Fix** | `feat/wechat-at-mention-identity-fix` | `52afe283f` | 微信群聊 @mention XML 提取、中间字典段安全反序列化、昵称与备注名解耦双保留、RBAC 群聊脱敏花名册注入与 4 项专项单测。 | `agy` (Antigravity) |
+| **Phase 3** | `feat/embodied-workspace-phase3` | `f97f6a4ce` / `fc4f9a693` | cgroups v2 硬隔离包装器、宿主独立 Git 时光机双目录快照与回滚、群组全双工 WebSocket 实时总线、bwrap 内 AGY CLI 配置。 | `agy` (Antigravity) |
+| **Mention Fix** | `feat/wechat-at-mention-identity-fix` | `52afe283f` / `03eb454fc` | 微信群聊 @mention XML 提取、昵称与备注名解耦双保留、RBAC 群聊脱敏花名册注入与 AppMsg 57 引用回复秒级降级兜底。 | `agy` (Antigravity) |
+| **Phase 4** | `feat/embodied-workspace-phase4-twins` | `71a37c6eb` .. `2bbcae1d4` | 统一慢轨三类交付、杂志级排版套件、算力经济监控去硬编码、3 小时超时与快轨进度汇报、联网 Grounding 及内联音频 `audio_base64` 回退。 | `agy` / Cline Audit |
 
 
 ---
@@ -966,3 +974,104 @@ SELECT COUNT(*) FROM wechat_driver_quarantine;
 - **生产修复方案**：
   - 更新签名：`async def protect_subdomain_url_hook(self, event: dict[str, Any], **kwargs: Any) -> dict[str, Any]:`。
   - 同步更新测试集断言，远端重新拉起 `maibot-main.service`，全量回归 86/86 再次全绿。
+
+---
+
+## 十、 全栈架构与代码质量审计报告（v2.1 首席架构师红线审查）
+
+> **审计基准**：`upstream/main` (`v1.3.19`, `c6429547a`) $\rightarrow$ `feat/embodied-workspace-phase4-twins` (`2bbcae1d4`)  
+> **审计范围**：全量 149 个改动文件（+21,542 / -168 行），重点覆盖 `plugins/embodied_workspace`、`src/companion_vault`、`src/platform_io/wechat`、`src/phone_edge` 及对 MaiBot 主干（`src/maisaka`、`src/llm_models`、`src/chat`）的所有侵入点。
+
+### 1. 架构演进亮点（值得保留的核心工程资产）
+1. **内核态采集与引用发送闭环**：`message_capture.js` 基于 WCDB 提交态钩子 + 独立单写者日记账（`maibot_message_journal.db`）与微信 `8.0.79` 二进制 SHA256 强指纹校验，以及 `AppMsgLogic:k0.I` 原生 AppMsg 57 引用回复与秒级纯文本降级，彻底摆脱了脆弱的 UI 自动化点击。
+2. **真值库 RBAC 与内存快照巩固沙箱**：`access_policy.py` 与 `consolidator.py` 的 `_build_scoped_consolidation_db` 将大模型生成的 SQL 限制在当前会话可见行的内存 SQLite 快照内执行再事务回写，安全边界扎实。
+3. **宿主核心多模态扩展克制且正交**：`ContextAudioPart` 与 `ContextFileUriPart` 在 `src/llm_models/` 载荷层、序列化快照及三家客户端（Gemini / OpenAI Chat / Responses）中的扩展符合开闭原则；`compaction.py` 新增的本地确定性降级摘要（`build_deterministic_fallback_summary`）有效根治了网关波动导致的上下文静默丢失。
+4. **插件快慢轨收敛方向正确**：Phase 4 果断废弃受 RPC 30s 超时制约的同步快轨，统一收敛至 `bwrap + systemd-run cgroups v2 + Scale-to-Zero + 外部 Git 时光机` 的异步慢轨体系。
+
+### 2. 核心架构污染、不合理硬编码与“打补丁（Patch-on-Patch）”问题矩阵
+
+| 编号 | 严重度 | 所在模块与精确位置 | 问题定性与污染表现 | 标准重构治理方案 |
+| :--- | :---: | :--- | :--- | :--- |
+| **AUD-01** | **P0** | `cli_bridge.py` (`L106-109`)<br/>`plugin.py` (`L42`) | **明文硬编码生产 API Key 与固定 HMAC Secret**：`build_sandbox_env()` 直接写入了真实 `sk-OGOA7...` 密钥字符串；`cookie_secret` 使用固定默认明文，可离线伪造任意 `wxid` 身份 Cookie。 | 删除源码所有明文密钥并轮换已暴露 Key；未注入环境变量时报错拒绝启动；`cookie_secret` 为空时自动生成 32 字节随机密钥持久化至受限文件。 |
+| **AUD-02** | **P0** | `ledger_source.py` (`L242`)<br/>`src/maisaka/runtime.py` | **撤回事件断层导致内存“幽灵上下文”**：消息进入 5s 防抖队列（`_chat_history`）后迅速撤回（`kind=268445456`），`LedgerSource` 仅忽略该修订行，未通知运行时剔除对应 `msg_id`，导致 Planner 仍对已撤回消息推理。 | 在 `PlatformIOManager` 与 `MaisakaHeartFlowChatting` 增加 `revoke_inbound_message(native_msg_id)` 通道，账本扫到撤回修订时级联清理内存上下文。 |
+| **AUD-03** | **P0** | `plugin.py` (`L121`, `L173`) | **补丁掩盖配置契约**：提交 `5e6bb4c67` 为绕过远端旧 `config.toml` 中的 `180`，硬写 `max(10800, int(self.config.cli_timeout_seconds or 10800))`，导致任何 `<3h` 的配置均被静默覆盖。 | 移除 `max(10800, ...)` 硬钳制（仅保留 `max(30, ...)` 防呆），通过 `config_version` 迁移升级远端配置。 |
+| **AUD-04** | **P1** | `gateway_server.py` (`L23`, `L101`)<br/>`truth_db.py` (`L220-239`)<br/>`projection.py` (`L24`, `L44`)<br/>`plugin.py` (`L40-54`) | **实例级硬编码散落各层**：网关过期页/弹窗仍硬编码“许妍”；`truth_db.py` 与 `projection.py` 默认写死 `wxid_w5d0efdxczt322`、兜底别名 `许妍/妍妍/小妍` 及真实群友 `'@ì _eun'`；插件默认配置写死 `paff-67.top`、`/opt/maibot-brain` 与 `100.87.39.37`。 | 网关动态注入 `bot_nickname`；`self_wxid` 由边缘 `userinfo(id=2)` 同步透传；Prompt 示例改为通用占位 `@某群友`；插件默认路径改为相对路径。 |
+| **AUD-05** | **P1** | `compute_economy.py` (`L72-105`)<br/>`plugin.py` (`L370-385`) | **插件越权篡改核心真值库 Schema**：各自直连 `companion_truth.db` 动态执行 `ALTER TABLE global_state ADD COLUMN fairy_*`；且 `compute_economy.py` 兜底建表语句与 `truth_db.py` 列定义冲突，伴随静默 `except Exception: pass`。 | 收回插件对 `companion_truth.db` 的 DDL 权限；运行态指标迁入插件独立状态库或统一由 `CompanionTruthDB` 封装接口。 |
+| **AUD-06** | **P1** | `user_truth_writer.py` (`L229-255`)<br/>`gateway_server.py` (`L355`) | **跨会话用户名单泄露与 PIN 暴力枚举隐患**：`/_maibot/auth/whoami` 对未登录访问者返回全库前 120 名联系人备注与 `wxid`，且 4 位数字 PIN 无失败次数锁定。 | 按 `route.chat_id` 过滤成员（群聊仅返回本群公开昵称，私聊不返回他人列表）；为 `verify_user_pin` 增加失败锁定限流。 |
+| **AUD-07** | **P1** | `src/maisaka/memory/person_profile.py` (`L260-362`) | **群聊自动画像注入存在 RBAC 绕过与全表扫描**：未判断 `is_group_session`，全表扫描 `SELECT * FROM person_info` 并将私密字段 `impression` 直接注入群聊 Planner。 | 传入 `is_group_chat`：群聊严禁注入私密 `impression`；改用 SQL `json_extract` 索引查询。 |
+| **AUD-08** | **P1** | `model_assets.py` (`L75-103`)<br/>`quote_recall.py` (`L183-242`)<br/>`editorial_kit.py` (`L116-121`) | **Patch-on-Patch 重复胶水**：两处重复编写百行同步上传、`time.sleep` 轮询与 `audio_base64` 异常回退；前端 `editorial_kit.js` 用脆弱正则客户端篡改 Mermaid DOM。 | 合并为单一 `AssetPayloadEncoder`（支持 `files_api_enabled=False` 免除每次先请求 404 的额外 RTT）；移除前端盲目正则替换。 |
+| **AUD-09** | **P2** | `cli_bridge.py` (`L72`, `L236-282`, `L467`)<br/>`realtime_hub.py` (`L76-99`) | **硬编码 `/root` 路径、模型名与测试兼容分支污染生产 SQL**：写死 `/root/.gemini/...` 与 `gemini-4-argon-high`；每次查询先跑 `PRAGMA table_info(messages)` 猜列名，且缺 `source/account` 过滤。 | 提取 CLI 模型名与配置路径至插件配置；统一单测使用真实 `MessageLedger` Schema，生产查询固定列名并补齐作用域过滤。 |
+| **AUD-10** | **P2** | `src/mobile_agent/*`<br/>`src/integration_tools/*`<br/>`device_sandbox_tools.py` | **存量原型死代码与跨平台依赖缺失**：旧版 UI 屏幕解析目录与未注册的 `handle_sandbox_task_tool` 仍残留；`consolidator.py` 顶层 `ZoneInfo("Asia/Shanghai")` 缺 `tzdata` 声明导致 Windows 环境导入即崩。 | 归档移除 `mobile_agent` / `integration_tools` 死代码；补齐 `tzdata` 依赖或增加 `UTC+8` 时区兜底。 |
+
+### 3. 下一阶段重构执行序（建议路线图）
+1. **Step 1（安全与配置止血）**：清除 `cli_bridge.py` 明文 API Key 与 `plugin.py` 固定 `cookie_secret`、解除 `max(10800, ...)` 超时硬钳制、为 Web PIN 登录加上限流与按群过滤名册。
+2. **Step 2（状态一致性与 RBAC 闭环）**：打通微信撤回消息对内存 `_chat_history` 的级联剔除；修复 `person_profile.py` 群聊注入 `impression` 的越权漏洞。
+3. **Step 3（数据层收敛与补丁消肿）**：将 `fairy_*` 算力与任务运行态从 `companion_truth.db` 解耦或收归 `truth_db.py` 统一管理；合并 `model_assets.py` / `quote_recall.py` 的双通道编码器并增加 `files_api_enabled` 开关。
+4. **Step 4（去实例硬编码与死代码归档）**：剥离残留的 `wxid_w5d0efdxczt322`、`许妍`、`@ì _eun`、`paff-67.top` 默认值，归档移除 `src/mobile_agent` 与 `src/integration_tools` 历史包袱。
+
+---
+
+## 十一、 Phase 1~4 AGY 沙盒插件（`embodied_workspace`）全模块深度专项审计档案
+
+针对 `plugins/embodied_workspace/` 全部 14 个模块（Phase 1 快慢轨与 bwrap 沙盒 $\rightarrow$ Phase 2 单级泛域、8 表写入与四级免登 $\rightarrow$ Phase 3 cgroups v2、Git 时光机与全双工总线 $\rightarrow$ Phase 4 慢轨统一与算力经济）及 `pytests/companion/test_embodied_workspace*.py` 与宿主 `src/plugin_runtime/` 协议边界的逐行核查，进一步揭示以下 **四大维度、14 项插件深层架构缺陷与补丁反模式**：
+
+### 1. 维度一：沙盒逃逸面、环境变量泄漏与进程生命周期失控（Phase 1 & Phase 3）
+
+- **[SBX-01 | P0 沙盒形同虚设的环境变量全量透传]**（`cli_bridge.py` `L101-110` `build_sandbox_env` + `backend_supervisor.py` `L86`）：
+  - **现象与机理**：虽然 `build_bwrap_prefix`（`L85-91`）煞有介事地用 `--tmpfs` 和 `/dev/null` 遮蔽了 `/etc/maibot-media.env` 与 `/opt/maibot-brain`，但 `build_sandbox_env()` 第一行直接执行了 `env = dict(os.environ)`，并将该 `env` 传给 `create_subprocess_exec(..., env=env)`（而 `bwrap` 默认不加 `--clearenv` 会原样继承全部环境变量）！由于 `maibot-main.service` 启动时已将 `/etc/maibot-media.env` 加载进宿主进程环境，沙盒内的 AGY CLI 及用户可访问的 `mode="backend"` Web 进程只需读取 `os.environ`，即可直接拿到宿主机的 `MAIBOT_EDGE_TOKEN`、数据库路径、各类 API Key 等全部敏感凭据。
+  - **重构方案**：`build_bwrap_prefix` 必须启用 `--clearenv`，`build_sandbox_env()` 改为严格白名单制（仅显式传入 `PATH`、`LANG`、`HOME`、`XDG_*`、`PORT` 及沙盒专用受限模型代理凭据）。
+- **[SBX-02 | P0 `systemd-run --scope` 下 `os.killpg` 失效与孤儿进程泄漏]**（`cli_bridge.py` `L471-545`、`backend_supervisor.py` `L80-140`、`resource_quota.py` `L66-95`）：
+  - **现象与机理**：Phase 3 引入 `systemd-run --scope` 包装 `bwrap` 后，`proc.pid` 实际上是短生命周期的 `systemd-run` 客户端包装器或 scope 内首进程；且 `wrap_command(raw_cmd, unit_prefix=...)` 接收了 `unit_prefix` 参数却**根本没有传给 `systemd-run --unit=...`**（`unit_prefix` 在 `resource_quota.py` `L66` 是完全未使用的死参数！）。当任务超时或 `stop_backend` 执行 `os.killpg(proc.pid, SIGKILL)` 时，若沙盒内 Node/Python/AGY 子进程已 `setsid()` 脱离进程组，信号无法覆盖整个 cgroup，且因未命名 scope 单元，宿主无法通过 `systemctl stop <unit>.scope` 干净回收整个控制组。此外 `bwrap` 在 `systemd-run` 下因多层父进程包裹，`--die-with-parent` 在特定异常退出路径下亦可能失效。
+  - **重构方案**：在 `resource_quota.py` 中实际使用 `--unit={unit_prefix}-{uuid}` 命名 scope，并在超时/停止时优先通过 `systemctl kill --kill-who=all <unit>.scope` 原子销毁整个 cgroup 内的全部派生进程。
+- **[SBX-03 | P1 插件卸载/热重载时未取消在途慢轨任务，且覆写全局单槽状态]**（`plugin.py` `L152-161`, `L334-336`, `L396-445`）：
+  - **现象与机理**：`on_unload()` 关闭了网关和 `supervisor`，却完全没有遍历取消 `self._bg_tasks` 中正在运行长达 3 小时的 `_run_slow_job_and_notify` 任务；且 `global_state.fairy_active_job_summary` 只有单行单列（`row_id=1`），当两个群同时发起慢轨任务时，后结束的任务执行 `_update_truth_db_active_job("")`（`L444`）会直接清空另一个仍在运行的任务状态！
+- **[SBX-04 | P1 `inbox/` 附件暂存区跨项目污染与无限膨胀]**（`cli_bridge.py` `L146-149`, `L201-220`）：
+  - **现象与机理**：同一微信会话下所有项目共用一个 `/tmp/workspace/inbox/`，每次 `stage_authorized_files` 只往里拷贝从不清理；任务 B 即使未授权传入某历史附件 `FM0001`，只要该会话此前的任务 A 暂存过，沙盒内 Agent 依然能在 `/tmp/workspace/inbox/` 直接读到它。
+
+### 2. 维度二：Web 网关、四级免登鉴权与全双工总线安全漏洞（Phase 2 & Phase 3）
+
+- **[GW-01 | P0 私聊工作区 URL 泄露即等同于永久授予访问者创建者（含 OWNER）全局 Cookie]**（`gateway_server.py` `L330-355`, `L398-400`）：
+  - **现象与机理**：在私聊会话生成的任何页面中，`/_maibot/auth/whoami` 只要检测到 `!actor_wxid && is_private_chat && route.creator_wxid`，就会**无条件向当前浏览器签发有效期长达 365 天、作用域覆盖整个根域名 `.paff-67.top` 的 `maibot_wxid=<creator_wxid>` Cookie**！这意味着一旦号主（OWNER）把私聊生成的某篇公开文章链接转发给朋友分享，第一个点开链接的外部人士不仅会自动获得号主的 `OWNER` 身份 Cookie，还能凭此 Cookie 横向访问并篡改号主在该域名下的**所有其他 `creator_only` 独占页面与群聊页面**，甚至通过 `memory_patch` 直接覆写 `user_status` 主人全局状态！
+  - **重构方案**：彻底废除“打开私聊页面即签发全域 365 天创建者 Cookie”的危险捷径；私聊创建者同样通过一次性 Handoff 票据或 PIN/口令完成首次浏览器绑定，且 Cookie 必须评估会话过期上限（如 30 天）与 `verify_cookie` 服务端 `ts` 过期校验（当前 `verify_cookie` `L209-217` 签入了 `ts` 却根本没有校验 `ts` 是否过期！）。
+- **[GW-02 | P1 微信口令认领（`claim`）跨群无作用域校验与 `INSERT OR REPLACE` 碰撞劫持]**（`subdomain_router.py` `L260-292`、`plugin.py` `L737-746`）：
+  - **现象与机理**：`create_claim` 虽然把 `route.chat_id` 存入了 `web_identity_claims` 表，但 `fulfill_claim_by_wechat(code, sender_wxid)`（`L275`）在核销时**根本没有校验命令来源 `chat_id` 是否与发起认领的页面 `chat_id` 一致**；且 4 位随机码（仅 9000 种可能）使用 `INSERT OR REPLACE` 直接覆盖未过期的同号口令，未验证认领者是否属于目标群聊成员。
+- **[GW-03 | P1 前端 SDK 注入存在存储型 DOM XSS 漏洞]**（`gateway_server.py` `L50-53`, `L78-80`、`editorial_kit.py` `L145`）：
+  - **现象与机理**：`MAIBOT_SDK_JS` 直接使用模板字符串拼接微信昵称到 `innerHTML`：`` `<option value="${m.wxid}">${m.nickname}</option>` `` 与 `` `<span>👤 ${label}...</span>` ``。由于微信群友可以随时将自己的微信昵称改为 `<img src=x onerror=fetch('/_maibot/auth/handoff',{method:'POST'}).then(...)>`，一旦同步进 `person_info`，所有打开工作区网页的群友（包括 OWNER）都会在同域下触发任意 JS 执行，瞬间被窃取免登 Handoff 票据！`editorial_kit.py` 拼接标题 `h.textContent` 到 `innerHTML` 同样未做 HTML 转义。
+- **[GW-04 | P1 静态文件回退 SPA 吞没路径穿越并误注入 SDK + 每次反代新建 `ClientSession` 连接泄漏隐患]**（`gateway_server.py` `L460-530`）：
+  - **现象与机理**：① `_serve_static_file`（`L464`）使用 `str(target).startswith(str(dist_root))` 判断路径前缀（经典 Prefix 绕过隐患：若同级存在 `dist/app_evil` 则 `"/dist/app_evil".startswith("/dist/app")` 为 `True`，应改用 `target.is_relative_to(dist_root)`）；② `_proxy_to_backend`（`L495-497`）每次 HTTP/WebSocket 请求都 `await request.read()` 全量读入内存（最大 50MB）并新建销毁一个独立的 `aiohttp.ClientSession()`，高并发或高频静态资源加载下极易耗尽临时端口与文件描述符，且未剥离客户端伪造的请求头或透传安全的 `X-Forwarded-*`；③ `RealtimeHub`（`realtime_hub.py` `L162`）在 `member_collect` 模式下允许未登录匿名连接（`actor_wxid=None`）无速率限制、无包体大小限制地向全房间无限广播任意 JSON `data`。
+
+### 3. 维度三：并发状态机、时光机回滚与归档层缺陷（Phase 1, Phase 2 & Phase 3）
+
+- **[STM-01 | P1 时光机回滚（`rollback`）绕过项目互斥锁且缺少权限校验]**（`plugin.py` `L537-608`, `L680-730`）：
+  - **现象与机理**：① `_perform_project_rollback` 直接对 `projects/<slug>` 与 `dist/<slug>` 执行 `git rm -rf` 和 `shutil.rmtree`，**完全没有获取 `CLIBridge._project_locks[(chat_id, slug)]` 互斥锁**！若某个慢轨构建正在后台写入同一项目，任何群成员此时触发 `/rollback <slug>` 会直接删空正在构建的工作目录，引发竞态损坏；② `/rollback` 命令和 `manage_workspace_projects(action="rollback")` 均未校验发起人 `sender_wxid` 是否为 `creator_only` 项目的创建者，群内任何人都能随意回滚他人的独占项目。
+- **[STM-02 | P2 Git 快照日志解析分隔符脆弱与 Google Drive 同名产物静默覆盖]**：
+  - `time_machine.py`（`L124-131`）使用 `--pretty=format:%H|%h|%cI|%s` 再 `line.split("|", 3)`，虽然 `maxsplit=3` 保住了 `subject` 内的 `|`，但未对 `slug` 做路径边界强校验（若外部绕过 `safe_id` 直接调用存在隐患）；
+  - `archive_manager.py`（`L43-66`）遍历 `dist/files/` 递归子目录 `rglob("*")` 后，将所有文件扁平化拷贝至 `dest_dir / src_file.name`——若子目录存在同名文件（如 `charts/summary.png` 与 `tables/summary.png`），后者会静默覆盖前者；且 `archive_manager.py`（`L49`）同样存在 `str(target).startswith(str(dist_dir.resolve()))` 的路径前缀比较缺陷。
+- **[STM-03 | P2 `UserScopedTruthWriter` 伪装归属标签与全库可见性污染]**（`user_truth_writer.py` `L88`, `L171-208`）：
+  - 群聊网页提交待办时直接写入 `visibility = "PUBLIC"`，而 `truth_db.py` 在构造所有非 OWNER 会话的 `<全局与实时状态>` 时执行 `SELECT * FROM quests_events WHERE status = 'ongoing' AND visibility = 'PUBLIC'`（无 `chat_id` 隔离！），这意味着**群 A 成员在网页提交的待办会跨群泄露到群 B、群 C 乃至其他好友私聊的 Planner 常驻提示词中**！
+
+### 4. 维度四：与 MaiBot 宿主 SDK 协议错配、补丁式胶水与死代码残留（Phase 1~4 演进全貌）
+
+- **[SDK-01 | P1 对宿主 `@Command` 与 Capability 契约失察，靠堆砌猜测分支打补丁]**：
+  - **`@Command` 正则捕获组契约误用**（`plugin.py` `L185-195`, `L695-768`）：宿主 `ComponentRegistry.find_command_by_text`（`src/plugin_runtime/host/component_registry.py` `L1121`）调用的是 `m.groupdict()`（仅提取**命名捕获组** `(?P<arg>...)` 返回 `dict`），且 `component_query.py`（`L525`）强制写了 `"matched_groups": matched_groups if isinstance(matched_groups, dict) else {}`；而插件所有命令正则写的都是匿名捕获组 `([0-9]{4,8})` / `(\S+)`，导致在真实宿主运行环境下 `matched_groups` **永远是空字典 `{}`**！插件代码里写的 `if isinstance(groups, (list, tuple))` 纯属只为迎合自家单元测试手工传 `matched_groups=("9999",)` 的虚假分支，线上实际全靠 `raw_text.split()` 兜底勉强工作；且 `component_query.py` 传入的上下文字段根本没有 `user_nickname`（只有 `user_id` 和 `message` 字典），导致 `claim` / `pin` 命令拿到的 `sender_name` 永远退化为冷冰冰的 `wxid_xxx`。
+  - **向宿主 Capability 传入根本不存在的伪参数**（`plugin.py` `L352-369`, `L432-438`）：插件向 `maisaka.context.append` 和 `maisaka.proactive.trigger` 传入了 `target_id` 与 `source_message_id`，但核查宿主 `src/plugin_runtime/capabilities/core.py`（`L247-366`）可见，宿主这两个能力实现**根本不读取 `target_id` 或 `source_message_id`**（完全被静默丢弃）！同样，`gateway_server.py`（`L434-436`）保留了 `try: await self.on_web_notify(6个参数) except TypeError: await self.on_web_notify(4个参数)` 的兼容补丁，以及 `subdomain_router.py`（`L216`, `L228`）残留 `d.pop("first_visit_auto_claim", None)` 清理 Phase 1 废弃列的补丁痕迹。
+  - **Hook 双协议分支胶水**（`plugin.py` `L781-811`）：`protect_subdomain_url_hook` 同时维护了“直接原地修改 `event` 字典返回”与“返回 `{"action": "continue", "modified_kwargs": ...}`”两套完全不同的协议分支，仅为了让 Phase 1 的旧假单测与 Phase 3/4 的真实 Runner 调用同时通过。
+- **[SDK-02 | P2 Phase 4 演进后未清理的 Phase 1 死代码与冗余权限声明]**：
+  - `plugins/embodied_workspace/fast_renderer.py`（整文件 57 行）及 `plugin.py` `L25` 的 `from .fast_renderer import render_markdown_to_wechat_html` 在 Phase 4 统一慢轨后**全项目零调用**（且其内部 `markdown.markdown` 未转义原始 HTML 标签，若重新启用即存在直接 XSS）；
+  - `plugins/embodied_workspace/_manifest.json` 仍将插件描述写为“提供快轨人设长文发布…”，且在 `capabilities` 中继续申请高权限 `"maisaka.reply.generate"`，而插件源码已不再有任何地方调用该能力，违背最小权限原则；
+  - `plugin.py` `L197` 的 `publish_document_page` 去掉了 `@Tool` 装饰器但仍保留为实例方法，内部每次调用都会生成随机 `doc-<token>` slug 且无人调用；
+  - `on_config_update`（`plugin.py` `L162-175`）仅热更了 4 个标量属性，若修改 `base_domain`、`cookie_secret`、`gateway_port`、`cli_backend` 或 `cgroup_*` 配额参数则完全不生效，造成“假热更”幻觉。
+
+---
+
+## 十二、 净室重构落地闭环与架构师终审验收记录（Batch 1 ~ Batch 3）
+
+依据 [`docs/CLEANROOM_REFACTOR_SPEC.md`](./CLEANROOM_REFACTOR_SPEC.md) 分三批次完成了上述全部 **10 项全栈审计缺陷（`AUD-01 ~ AUD-10`）**、**14 项插件深层隐患（`SBX / GW / STM / SDK`）** 以及 **6 条跨聊私密记忆泄漏暗道（`LEAK-01 ~ LEAK-06`）** 的根治重构与双子底层槽位预留，并经首席架构师独立逐行 Code Review 与全仓实跑验收：
+
+1. **Batch 1（`plugins/embodied_workspace/` 净室重构）**：清除全部硬编码凭据并实装 `bwrap --clearenv` + 严格环境变量白名单 + `TZ=Asia/Tokyo`；`systemd-run --scope --unit=...` 确定性 cgroup 命名与 `systemctl kill --kill-who=all` 进程树连根回收；`inbox/<job_id>/` 任务级硬链接暂存与 `finally` 自动清理；私聊未登录访问降级为只读分享态（根治 `GW-01` 365 天 OWNER Cookie 串号漏洞）、`whoami` 按本群 `group_members` 仅暴露公开昵称 `person_name`、PIN 5 次失败限流锁定、前端 SDK 全量改用 DOM `.textContent` 安全渲染、`issuer_name` 动态署名、共享 `aiohttp.ClientSession` 流式反代；移除 `fast_renderer.py` 与冗余 `"maisaka.reply.generate"` 权限声明，100% 对齐 `@Command` 命名捕获组与原生 Runner Hook 协议。
+2. **Batch 2（四道物理记忆隔离防线、单一 Schema 归位与双子预留）**：在 `src/companion_vault/truth_db.py` 统一正规化 `person_info`（物理拆分为 `public_impression` 与 `owner_private_notes` 并由 SQLite Authorizer 内核级看守）、`quests_events(scope_chat_id)`、`user_status(scope_chat_id)`、`chronicle_events(scope_chat_id)`、`phone_surfing_log(persona_slot)` 与 `global_state` 算力/双子列（彻底消除插件运行期 `ALTER TABLE`）；完成 `person_profile.py` 与 `query_person_profile.py` 的 Fail-Closed SQL 投影级硬裁剪、`consolidator.py` 私聊产物强制 `PRIVATE` 锁与群待办作用域隔离、切断微信平台向 `A_memorix` 的双写旁路、封堵私聊表达/黑话向群聊选择器的跨会话传染，并在 `send_service.py` 群聊发包出口挂载 `output_guardrail.py` 敏感锚点熔断卫士；提纯 `ComputeLedger`（`Asia/Tokyo` 时钟、`on_token_usage`、`<3.0 USD` 离场/回归弧光回调）与 `asset_encoder.py`（`MAIBOT_FILES_API_ENABLED` 零延迟内联直通），并在 `runtime_bridge.py` / `reply.py` / `chat_loop_service.py` / `maisaka_generator_base.py` 完成第三章双子与 ST 引擎预留插槽。
+3. **Batch 3（微信撤回级联内存剔除、去实例硬编码与遗留清理）**：打通 `LedgerSource` $\rightarrow$ `WeChatRootDriver.revoke_committed` $\rightarrow$ `MaisakaHeartFlowChatting.revoke_message` 全链路，在防抖窗口内即时剔除撤回消息并重置空批防抖定时器；剥离 `truth_db.py`、`projection.py`、`message_capture.js` 中的实例微信号/群友昵称/`143000` 魔数阈值；补齐 `tzdata` 依赖并物理归档移除 `src/mobile_agent/`、`src/integration_tools/` 与未注册的 `sandbox_task` 死代码。
+4. **首席架构师独立终审复核（Review Sign-off）**：
+   - 补齐 `pytests/maisaka/test_reasoning_engine.py` 旧单测对防线一 Fail-Closed 默认群聊脱敏契约的双态断言；
+   - 实跑全量关联套件（`pytests/companion` + `pytests/platform_io` + `pytests/maisaka/test_reasoning_engine.py`）共计 **142 passed, 0 failed**，`ruff check` 零错误通过；
+   - 同步更新 `deploy/embodied/OPERATIONS_MANUAL.md` 与 `media.env.example` 的去硬编码生产部署核对清单。

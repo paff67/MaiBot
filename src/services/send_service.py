@@ -773,11 +773,9 @@ async def _dispatch_adapter_callbacks(delivery_batch: DeliveryBatch) -> None:
 
 
 async def _notify_memory_automation_on_message_sent(message: SessionMessage) -> None:
-    """在发送成功后通知长期记忆自动化服务。
-
-    Args:
-        message: 已成功发送的内部消息对象。
-    """
+    """在发送成功后通知长期记忆自动化服务（微信具身平台物理旁路跳过）。"""
+    if str(message.platform or "").strip().lower() == "wechat":
+        return
     try:
         from src.services.memory_flow_service import memory_automation_service
 
@@ -910,6 +908,31 @@ async def _send_via_platform_io(
             reply_message_id=reply_message_id,
             reply_message=reply_message,
         )
+        # 防线四：群聊发包前出口敏感锚点熔断（Output Guardrail）
+        is_group_outbound = bool(
+            message.message_info
+            and message.message_info.group_info
+            and str(message.message_info.group_info.group_id or "").strip()
+        )
+        if is_group_outbound:
+            from src.companion_vault.output_guardrail import check_group_outbound_text
+
+            text_parts = [str(message.processed_plain_text or "")]
+            for comp in message.raw_message.components:
+                if isinstance(comp, TextComponent) and comp.text:
+                    text_parts.append(comp.text)
+            combined_outbound = "\n".join(text_parts)
+            allowed_outbound, hit_anchor = check_group_outbound_text(
+                combined_outbound,
+                is_group_chat=True,
+            )
+            if not allowed_outbound:
+                logger.error(
+                    f"[OutputGuardrail] 群聊出站消息命中硬机密特征锚点 ({hit_anchor!r})，已物理熔断拦截发送！"
+                    f" session_id={message.session_id}"
+                )
+                return None
+
         delivery_batch = await platform_io_manager.send_message(
             message,
             route_key,

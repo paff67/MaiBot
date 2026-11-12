@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import os
+import re
 import shutil
+import signal
 import subprocess
 from dataclasses import dataclass
 
@@ -17,19 +20,27 @@ class QuotaLimits:
 
 class ResourceQuotaWrapper:
     """
-    为 bwrap 沙盒进程提供基于 systemd cgroups v2 的细粒度资源硬配额。
-    [v3.1 修正] 仅在 system (root) 模式下附加 OOMScoreAdjust，避免 user 模式因权限不足启动失败。
+    为 bwrap 沙盒进程提供基于 systemd cgroups v2 的细粒度资源硬配额与确定性单元回收。
     """
 
     def __init__(self, limits: QuotaLimits | None = None) -> None:
         self.limits = limits or QuotaLimits()
         self._systemd_mode: str | None = None
 
+    @staticmethod
+    def sanitize_unit_name(unit_name: str) -> str:
+        raw = unit_name.strip()
+        if raw.endswith(".scope"):
+            raw = raw[:-6]
+        cleaned = re.sub(r"[^a-zA-Z0-9_.-]", "-", raw)
+        cleaned = re.sub(r"-{2,}", "-", cleaned).strip("-")
+        return cleaned[:96] or "maibot-fairy-scope"
+
     def _detect_systemd_scope_mode(self) -> str:
         if self._systemd_mode is not None:
             return self._systemd_mode
 
-        if not shutil.which("systemd-run"):
+        if not shutil.which("systemd-run") or not hasattr(os, "geteuid"):
             self._systemd_mode = "none"
             return self._systemd_mode
 
@@ -63,10 +74,11 @@ class ResourceQuotaWrapper:
         self._systemd_mode = "none"
         return self._systemd_mode
 
-    def wrap_command(self, base_cmd: list[str], unit_prefix: str = "maibot-ws") -> list[str]:
+    def wrap_command(self, base_cmd: list[str], unit_name: str = "maibot-fairy-scope") -> list[str]:
         if not self.limits.enabled:
             return list(base_cmd)
 
+        clean_unit = self.sanitize_unit_name(unit_name)
         mode = self._detect_systemd_scope_mode()
         if mode in ("system", "user"):
             cmd = ["systemd-run"]
@@ -76,6 +88,7 @@ class ResourceQuotaWrapper:
             mem_high_mb = int(self.limits.memory_max_mb * 0.85)
             cmd.extend([
                 "--scope",
+                f"--unit={clean_unit}",
                 "--quiet",
                 "--collect",
                 f"--property=CPUQuota={self.limits.cpu_quota_percent}%",
@@ -86,8 +99,7 @@ class ResourceQuotaWrapper:
             ])
             cmd.append("--")
 
-            # 使用 choom 调整进程级 OOM 分数（避免 scope 属性报错）
-            if os.geteuid() == 0 and self.limits.oom_score_adjust > 0 and shutil.which("choom"):
+            if hasattr(os, "geteuid") and os.geteuid() == 0 and self.limits.oom_score_adjust > 0 and shutil.which("choom"):
                 cmd.extend(["choom", "-n", str(self.limits.oom_score_adjust), "--"])
 
             cmd.extend(base_cmd)
@@ -102,3 +114,54 @@ class ResourceQuotaWrapper:
             ]
 
         return list(base_cmd)
+
+    async def stop_unit(
+        self,
+        unit_name: str,
+        proc: asyncio.subprocess.Process | None = None,
+    ) -> None:
+        """
+        优先通过 systemctl kill --kill-who=all <unit>.scope 原子清理整个 cgroup v2 进程树，
+        配合 os.killpg / proc.kill 兜底，确保 setsid 脱离的子进程也被彻底回收。
+        """
+        clean_unit = self.sanitize_unit_name(unit_name)
+        scope_unit = f"{clean_unit}.scope"
+        mode = self._detect_systemd_scope_mode() if self.limits.enabled else "none"
+
+        if mode in ("system", "user") and shutil.which("systemctl"):
+            kill_cmd = ["systemctl"]
+            if mode == "user":
+                kill_cmd.append("--user")
+            kill_cmd.extend(["kill", "--kill-who=all", "--signal=SIGKILL", scope_unit])
+            try:
+                killer = await asyncio.create_subprocess_exec(
+                    *kill_cmd,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await asyncio.wait_for(killer.wait(), timeout=3.0)
+            except Exception:
+                pass
+
+        if proc is not None and proc.returncode is None:
+            try:
+                if hasattr(os, "killpg"):
+                    os.killpg(proc.pid, signal.SIGTERM)
+                else:
+                    proc.terminate()
+                await asyncio.wait_for(proc.wait(), timeout=1.5)
+            except Exception:
+                try:
+                    if hasattr(os, "killpg"):
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    else:
+                        proc.kill()
+                except ProcessLookupError:
+                    pass
+                except Exception:
+                    pass
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=1.5)
+                except Exception:
+                    pass
+

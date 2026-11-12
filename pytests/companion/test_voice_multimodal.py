@@ -1,8 +1,5 @@
 import base64
-import io
-import time
 from types import SimpleNamespace
-from google.genai import types
 
 from src.companion_vault.truth_db import CompanionTruthDB
 from src.companion_vault.asset_pipeline import AssetPipeline

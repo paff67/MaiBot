@@ -24,7 +24,7 @@ from src.platform_io.types import (
 
 from .edge_client import WeChatEdgeClient
 from .ledger_source import LedgerSource
-from .projection import enrich_record_from_truth_db, project_message
+from .projection import enrich_record_from_truth_db, native_message_id, project_message
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +109,35 @@ class WeChatRootDriver(PlatformIODriver):
         self._poll_task: Optional[asyncio.Task[None]] = None
         self._directory_sync_ts: Dict[str, float] = {}
         self._group_names: Dict[str, str] = {}
+        self._revoke_handler: Optional[Any] = None
+
+    def set_revoke_handler(self, handler: Optional[Any]) -> None:
+        """注册可选的撤回回调钩子（供单测或上层监听）。"""
+        self._revoke_handler = handler
+
+    async def revoke_committed(self, *, chat_id: str, msg_id: str) -> bool:
+        """将账本观测到的微信撤回修订同步至活跃会话 Runtime，剔除防抖队列与 _chat_history。"""
+        clean_mid = str(msg_id or "").strip()
+        if not clean_mid:
+            return False
+        ext_id = native_message_id(self.edge.source, self.edge.account, clean_mid)
+        revoked_any = False
+        if callable(self._revoke_handler):
+            res = self._revoke_handler(ext_id)
+            if asyncio.iscoroutine(res):
+                res = await res
+            revoked_any = bool(res) or revoked_any
+        try:
+            from src.chat.heart_flow.heartflow_manager import heartflow_manager
+
+            for runtime in list(heartflow_manager.heartflow_chat_list.values()):
+                revoke_fn = getattr(runtime, "revoke_message", None)
+                if callable(revoke_fn):
+                    if await revoke_fn(ext_id):
+                        revoked_any = True
+        except Exception as exc:
+            logger.debug("WeChat revoke sync skipped: %s", exc)
+        return revoked_any
 
     def _is_chat_allowed(self, chat_id: Optional[str]) -> bool:
         if not chat_id:
@@ -186,7 +215,7 @@ class WeChatRootDriver(PlatformIODriver):
     async def send_message(
         self, message, route_key: RouteKey, metadata: Optional[Dict[str, Any]] = None
     ) -> DeliveryReceipt:
-        from src.mobile_agent.wechat_text import format_for_wechat
+        from .wechat_text import format_for_wechat
 
         try:
             from src.common.data_models.message_component_data_model import ReplyComponent, TextComponent

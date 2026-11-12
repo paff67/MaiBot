@@ -3,9 +3,13 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
+
+_SAFE_SLUG_RE = re.compile(r"^[a-zA-Z0-9_.-]{1,64}$")
+_LOG_SEP = "\x1f"
 
 
 @dataclass
@@ -37,17 +41,31 @@ class WorkspaceTimeMachine:
         self.workspaces_root = workspaces_root
 
     @staticmethod
-    def _git_dir(chat_ws_dir: Path, slug: str) -> Path:
-        snap_root = chat_ws_dir / "snapshots"
+    def _validate_slug(slug: str) -> str:
+        clean = (slug or "").strip()
+        if not _SAFE_SLUG_RE.fullmatch(clean) or clean in {".", ".."} or ".." in clean:
+            raise ValueError(f"非法项目标识 slug: {slug!r}")
+        return clean
+
+    @classmethod
+    def _git_dir(cls, chat_ws_dir: Path, slug: str) -> Path:
+        clean_slug = cls._validate_slug(slug)
+        ws_root = chat_ws_dir.resolve()
+        snap_root = (ws_root / "snapshots").resolve()
         snap_root.mkdir(parents=True, exist_ok=True)
-        return snap_root / f"{slug}.git"
+        git_dir = (snap_root / f"{clean_slug}.git").resolve()
+        if not git_dir.is_relative_to(snap_root):
+            raise ValueError(f"Git 快照路径越界: {slug!r}")
+        return git_dir
 
     async def _run_git(self, chat_ws_dir: Path, slug: str, args: list[str]) -> tuple[int, str, str]:
-        git_dir = self._git_dir(chat_ws_dir, slug)
+        clean_slug = self._validate_slug(slug)
+        ws_root = chat_ws_dir.resolve()
+        git_dir = self._git_dir(ws_root, clean_slug)
         cmd = [
             "git",
             f"--git-dir={git_dir}",
-            f"--work-tree={chat_ws_dir}",
+            f"--work-tree={ws_root}",
             "-c", "user.name=MaiBot TimeMachine",
             "-c", "user.email=workspace@maibot.local",
             "-c", "commit.gpgsign=false",
@@ -115,19 +133,20 @@ class WorkspaceTimeMachine:
     async def list_snapshots(
         self, chat_ws_dir: Path, slug: str, limit: int = 10
     ) -> list[SnapshotRecord]:
-        git_dir = self._git_dir(chat_ws_dir, slug)
+        clean_slug = self._validate_slug(slug)
+        git_dir = self._git_dir(chat_ws_dir, clean_slug)
         if not (git_dir / "HEAD").exists():
             return []
         code, out, _ = await self._run_git(
             chat_ws_dir,
-            slug,
-            ["log", f"-n{int(limit)}", "--pretty=format:%H|%h|%cI|%s"],
+            clean_slug,
+            ["log", f"-n{int(limit)}", "--pretty=format:%H%x1f%h%x1f%cI%x1f%s"],
         )
         if code != 0 or not out:
             return []
         records: list[SnapshotRecord] = []
         for line in out.splitlines():
-            parts = line.split("|", 3)
+            parts = line.split(_LOG_SEP, 3)
             if len(parts) == 4:
                 records.append(
                     SnapshotRecord(

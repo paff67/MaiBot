@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 import secrets
+import sqlite3
 import time
 from pathlib import Path
 from typing import Any
@@ -22,8 +22,7 @@ from .archive_manager import WorkspaceArchiveManager
 from .backend_supervisor import BackendSupervisor
 from .cli_bridge import CLIBridge, WorkspaceJobRequest
 from .compute_economy import ComputeEconomyManager
-from .fast_renderer import render_markdown_to_wechat_html
-from .gateway_server import WorkspaceGatewayServer
+from .gateway_server import WorkspaceGatewayServer, resolve_or_create_cookie_secret
 from .realtime_hub import GroupRealtimeHub
 from .resource_quota import QuotaLimits, ResourceQuotaWrapper
 from .subdomain_router import SubdomainRoute, SubdomainRouter
@@ -32,26 +31,29 @@ from .user_truth_writer import UserScopedTruthWriter
 
 
 class PluginSectionConfig(PluginConfigBase):
-    config_version: str = Field(default="1.0.0", description="插件配置版本")
+    config_version: str = Field(default="1.5.0", description="插件配置版本")
 
 
 class EmbodiedWorkspaceConfig(PluginConfigBase):
     plugin: PluginSectionConfig = Field(default_factory=PluginSectionConfig, description="插件元配置")
-    base_domain: str = Field(default="paff-67.top", description="交付基础域名（单级通配符）")
+    base_domain: str = Field(default="workspace.local", description="交付基础域名（单级通配符）")
     short_link_base_url: str = Field(default="", description="短链接基础域名（例如 https://xy.pages.dev）")
-    cookie_secret: str = Field(default="maibot-embodied-workspace-hmac-secret-2026", description="HMAC Cookie 签名秘钥")
+    cookie_secret: str = Field(default="", description="HMAC Cookie 签名秘钥（留空则在首次启动时自动生成随机密钥）")
+    default_issuer_name: str = Field(default="AI 助手", description="工作区页面默认署名角色显示名")
     gateway_port: int = Field(default=18790, description="本地网关监听端口")
     default_ttl_hours: int = Field(default=24, description="默认链接有效期（小时）")
     cli_backend: str = Field(default="agy", description="执行引擎：agy 或 codex")
-    cli_timeout_seconds: int = Field(default=10800, description="代码执行超时时间（秒，默认 3 小时 = 10800 秒）")
+    fairy_cli_model: str = Field(default="gemini-4-argon-high", description="慢轨编程 CLI 使用的模型名称")
+    cli_auth_dir: str = Field(default="~/.gemini", description="CLI 鉴权配置与插件根目录")
+    cli_timeout_seconds: int = Field(default=10800, description="代码执行超时时间（秒，默认 3 小时 = 10800 秒，最小 30 秒）")
     progress_report_interval_seconds: int = Field(default=180, description="慢轨长任务期间快轨巡检与回报的最小间隔秒数（默认 180 秒）")
-    workspaces_root: str = Field(default="/opt/maibot-brain/data/workspaces", description="会话工作区根目录")
-    truth_db_path: str = Field(default="/opt/maibot-brain/data/companion_truth.db", description="真值库路径")
-    ledger_db_path: str = Field(default="/opt/maibot-brain/data/message_ledger.db", description="消息账本路径")
-    router_db_path: str = Field(default="/opt/maibot-brain/data/workspaces/subdomain_routes.db", description="路由数据库路径")
-    gdrive_archive_root: str = Field(default="/mnt/gdrive/companion_vault/workspace_archives", description="Google Drive 归档目录")
-    wechat_source: str = Field(default="http://100.87.39.37:8765", description="微信驱动数据源地址")
-    wechat_account: str = Field(default="4d86ac1b06dd252fa3c7327eb5614865", description="微信账号目录哈希")
+    workspaces_root: str = Field(default="data/workspaces", description="会话工作区根目录")
+    truth_db_path: str = Field(default="data/companion_truth.db", description="真值库路径")
+    ledger_db_path: str = Field(default="data/message_ledger.db", description="消息账本路径")
+    router_db_path: str = Field(default="data/workspaces/subdomain_routes.db", description="路由数据库路径")
+    gdrive_archive_root: str = Field(default="data/workspace_archives", description="衍生文件归档目录")
+    wechat_source: str = Field(default="", description="微信驱动数据源地址")
+    wechat_account: str = Field(default="", description="微信账号目录哈希")
     enable_cgroup_quota: bool = Field(default=True, description="是否启用 cgroups v2 进程配额限制")
     cgroup_cpu_quota_percent: int = Field(default=150, description="CPU 配额百分比（150% = 1.5 核）")
     cgroup_memory_max_mb: int = Field(default=1024, description="物理内存硬上限 (MB)")
@@ -61,6 +63,7 @@ class EmbodiedWorkspaceConfig(PluginConfigBase):
 
 class EmbodiedWorkspacePlugin(MaiBotPlugin):
     config_model = EmbodiedWorkspaceConfig
+    config_reload_subscriptions = ("bot",)
 
     def __init__(self) -> None:
         super().__init__()
@@ -69,24 +72,33 @@ class EmbodiedWorkspacePlugin(MaiBotPlugin):
         self.time_machine: WorkspaceTimeMachine | None = None
         self.realtime_hub: GroupRealtimeHub | None = None
         self.compute_economy: ComputeEconomyManager | None = None
+        self._bot_nickname: str = ""
         self._notified_job_ids: set[str] = set()
         self._active_jobs: dict[str, dict[str, Any]] = {}
+        self._bg_tasks: set[asyncio.Task[Any]] = set()
 
-    @property
-    def ctx(self) -> Any:
-        if self._ctx is None:
-            raise RuntimeError("插件上下文尚未初始化，确保在 Runner 环境中运行")
-        return self._ctx
+    def _effective_timeout_seconds(self) -> int:
+        raw = self.config.cli_timeout_seconds
+        val = 10800 if raw is None else int(raw)
+        return max(30, val)
 
-    @ctx.setter
-    def ctx(self, value: Any) -> None:
-        self._set_context(value)
+    def _resolve_issuer_name(self, kwargs: dict[str, Any] | None = None) -> str:
+        if kwargs:
+            explicit = str(kwargs.get("issuer_name") or "").strip()
+            if explicit:
+                return explicit
+        if self._bot_nickname:
+            return self._bot_nickname
+        return (self.config.default_issuer_name or "").strip() or "AI 助手"
 
     async def on_load(self) -> None:
         ws_root = Path(self.config.workspaces_root)
         truth_path = Path(self.config.truth_db_path)
 
         self._notified_job_ids = set()
+        self._active_jobs = {}
+        self._bg_tasks = set()
+
         self.compute_economy = ComputeEconomyManager(
             truth_db_path=truth_path,
         )
@@ -115,10 +127,13 @@ class EmbodiedWorkspacePlugin(MaiBotPlugin):
         )
         self.quota_wrapper = ResourceQuotaWrapper(quota_limits)
         self.time_machine = WorkspaceTimeMachine(ws_root)
-        self.realtime_hub = GroupRealtimeHub(Path(self.config.ledger_db_path))
+        self.realtime_hub = GroupRealtimeHub(
+            Path(self.config.ledger_db_path),
+            wechat_source=self.config.wechat_source,
+            wechat_account=self.config.wechat_account,
+        )
         self.realtime_hub.start()
 
-        timeout_sec = max(10800, int(self.config.cli_timeout_seconds or 10800))
         self.cli_bridge = CLIBridge(
             workspaces_root=ws_root,
             truth_db_path=truth_path,
@@ -126,7 +141,9 @@ class EmbodiedWorkspacePlugin(MaiBotPlugin):
             wechat_source=self.config.wechat_source,
             wechat_account=self.config.wechat_account,
             cli_backend=self.config.cli_backend,
-            timeout_seconds=timeout_sec,
+            fairy_cli_model=self.config.fairy_cli_model,
+            cli_auth_dir=self.config.cli_auth_dir,
+            timeout_seconds=self._effective_timeout_seconds(),
             progress_report_interval_seconds=self.config.progress_report_interval_seconds,
             quota_wrapper=self.quota_wrapper,
             time_machine=self.time_machine,
@@ -134,6 +151,7 @@ class EmbodiedWorkspacePlugin(MaiBotPlugin):
         self.supervisor = BackendSupervisor(
             workspaces_root=ws_root,
             quota_wrapper=self.quota_wrapper,
+            cli_auth_dir=self.config.cli_auth_dir,
         )
         self.supervisor.start_janitor()
 
@@ -142,14 +160,24 @@ class EmbodiedWorkspacePlugin(MaiBotPlugin):
             supervisor=self.supervisor,
             truth_writer=self.truth_writer,
             cookie_secret=self.config.cookie_secret,
+            workspaces_root=ws_root,
+            default_issuer_name=self._resolve_issuer_name(),
             on_web_notify=self._handle_web_notify_callback,
             listen_port=self.config.gateway_port,
             realtime_hub=self.realtime_hub,
         )
         await self.gateway.start()
-        self._bg_tasks: set[asyncio.Task[Any]] = set()
 
     async def on_unload(self) -> None:
+        pending_tasks = [t for t in list(self._bg_tasks) if not t.done()]
+        for task in pending_tasks:
+            task.cancel()
+        if pending_tasks:
+            await asyncio.gather(*pending_tasks, return_exceptions=True)
+        self._bg_tasks.clear()
+        self._active_jobs.clear()
+        self._sync_active_jobs_to_truth_db()
+
         if hasattr(self, "compute_economy") and self.compute_economy:
             await self.compute_economy.stop_background_sync()
         if hasattr(self, "realtime_hub") and self.realtime_hub:
@@ -160,18 +188,63 @@ class EmbodiedWorkspacePlugin(MaiBotPlugin):
             await self.supervisor.stop_all()
 
     async def on_config_update(self, scope: str, config_data: dict[str, Any], version: str) -> None:
-        """配置热更新回调：同步配置并通知底层真值写入器等组件。"""
+        """配置热更新回调：同步插件与机器人署名配置至各底层组件。"""
         _ = version
+        if scope == "bot" and isinstance(config_data, dict):
+            nick = str(config_data.get("nickname") or "").strip()
+            if nick:
+                self._bot_nickname = nick
+                if hasattr(self, "gateway") and self.gateway:
+                    self.gateway.default_issuer_name = nick
+            return
+
         if scope == "self" and isinstance(config_data, dict):
             self.set_plugin_config(config_data)
+            ws_root = Path(self.config.workspaces_root)
             if hasattr(self, "compute_economy") and self.compute_economy:
                 self.compute_economy.truth_db_path = Path(self.config.truth_db_path)
             if hasattr(self, "truth_writer") and self.truth_writer:
+                self.truth_writer.truth_db_path = Path(self.config.truth_db_path)
                 self.truth_writer.wechat_source = self.config.wechat_source
                 self.truth_writer.wechat_account = self.config.wechat_account
+            if hasattr(self, "archive_mgr") and self.archive_mgr:
+                self.archive_mgr.gdrive_archive_root = Path(self.config.gdrive_archive_root)
+            if hasattr(self, "router") and self.router:
+                self.router.base_domain = self.config.base_domain.strip().lstrip(".")
+                self.router.short_link_base_url = self.config.short_link_base_url.strip().rstrip("/")
+            if hasattr(self, "quota_wrapper") and self.quota_wrapper:
+                self.quota_wrapper.limits.enabled = self.config.enable_cgroup_quota
+                self.quota_wrapper.limits.cpu_quota_percent = self.config.cgroup_cpu_quota_percent
+                self.quota_wrapper.limits.memory_max_mb = self.config.cgroup_memory_max_mb
+                self.quota_wrapper.limits.tasks_max = self.config.cgroup_tasks_max
+                self.quota_wrapper.limits.oom_score_adjust = self.config.cgroup_oom_score_adjust
+                self.quota_wrapper._systemd_mode = None
+            if hasattr(self, "realtime_hub") and self.realtime_hub:
+                self.realtime_hub.ledger_db_path = Path(self.config.ledger_db_path)
+                self.realtime_hub.wechat_source = self.config.wechat_source.strip()
+                self.realtime_hub.wechat_account = self.config.wechat_account.strip()
             if hasattr(self, "cli_bridge") and self.cli_bridge:
-                self.cli_bridge.timeout_seconds = max(10800, int(self.config.cli_timeout_seconds or 10800))
+                self.cli_bridge.workspaces_root = ws_root
+                self.cli_bridge.truth_db_path = Path(self.config.truth_db_path)
+                self.cli_bridge.ledger_db_path = Path(self.config.ledger_db_path)
+                self.cli_bridge.wechat_source = self.config.wechat_source
+                self.cli_bridge.wechat_account = self.config.wechat_account
+                self.cli_bridge.cli_backend = self.config.cli_backend
+                self.cli_bridge.fairy_cli_model = self.config.fairy_cli_model.strip() or "gemini-4-argon-high"
+                self.cli_bridge.cli_auth_dir = self.config.cli_auth_dir.strip() or "~/.gemini"
+                self.cli_bridge.timeout_seconds = self._effective_timeout_seconds()
                 self.cli_bridge.progress_report_interval_seconds = int(self.config.progress_report_interval_seconds or 180)
+            if hasattr(self, "supervisor") and self.supervisor:
+                self.supervisor.workspaces_root = ws_root
+                self.supervisor.cli_auth_dir = self.config.cli_auth_dir.strip() or "~/.gemini"
+            if hasattr(self, "gateway") and self.gateway:
+                resolved_secret = resolve_or_create_cookie_secret(self.config.cookie_secret, ws_root)
+                self.gateway.identity.secret_key = resolved_secret.encode("utf-8")
+                parts = self.router.base_domain.split(".")
+                self.gateway.identity.cookie_domain = (
+                    "." + ".".join(parts[-2:]) if len(parts) >= 2 else self.router.base_domain
+                )
+                self.gateway.default_issuer_name = self._resolve_issuer_name()
 
     @staticmethod
     def _resolve_chat_id(kwargs: dict[str, Any]) -> str:
@@ -181,40 +254,34 @@ class EmbodiedWorkspacePlugin(MaiBotPlugin):
             return group_id if group_id.endswith("@chatroom") else f"{group_id}@chatroom"
         return user_id
 
-    @staticmethod
-    def _extract_command_arg(kwargs: dict[str, Any]) -> str:
-        groups = kwargs.get("matched_groups")
-        if isinstance(groups, (list, tuple)) and groups:
-            return str(groups[0] or "").strip()
-        if isinstance(groups, dict) and groups:
-            for val in groups.values():
-                if val:
-                    return str(val).strip()
-        raw_text = str(kwargs.get("text") or kwargs.get("command_text") or "").strip()
-        parts = raw_text.split(maxsplit=1)
-        return parts[1].strip() if len(parts) > 1 else ""
+    def _resolve_sender_nickname(self, kwargs: dict[str, Any], sender_wxid: str) -> str:
+        msg = kwargs.get("message")
+        if isinstance(msg, dict):
+            msg_info = msg.get("message_info")
+            if isinstance(msg_info, dict):
+                user_info = msg_info.get("user_info")
+                if isinstance(user_info, dict):
+                    nick = str(user_info.get("user_nickname") or user_info.get("user_cardname") or "").strip()
+                    if nick:
+                        return nick
+        if hasattr(self, "truth_writer") and self.truth_writer and sender_wxid:
+            pub = self.truth_writer.get_public_nickname(sender_wxid)
+            if pub:
+                return pub
+        return sender_wxid
 
-    async def publish_document_page(
-        self,
-        title: str,
-        writing_instruction: str,
-        reference_text: str = "",
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-        """向后兼容转发接口：将快轨长文排版统一收敛至 run_agent_workspace(task_type='document')"""
-        token = self.router.generate_short_token(6)
-        slug = f"doc-{token}"
-        ref_part = f"\n参考材料：{reference_text}" if reference_text else ""
-        task_prompt = f"撰写并排版文章《{title}》\n需求：{writing_instruction}{ref_part}"
-        return await self.run_agent_workspace(
-            task_prompt=task_prompt,
-            project_slug=slug,
-            action="create",
-            access_policy="creator_only",
-            task_type="document",
-            context_notes=f"标题: {title} | 补充参考: {reference_text}",
-            **kwargs,
-        )
+    @staticmethod
+    def _extract_named_group(kwargs: dict[str, Any], group_name: str, fallback_index: int = 1) -> str:
+        groups = kwargs.get("matched_groups")
+        if isinstance(groups, dict):
+            val = groups.get(group_name)
+            if val is not None and str(val).strip():
+                return str(val).strip()
+        raw_text = str(kwargs.get("text") or "").strip()
+        if not raw_text:
+            return ""
+        parts = raw_text.split()
+        return parts[fallback_index].strip() if len(parts) > fallback_index else ""
 
     @Tool(
         name="run_agent_workspace",
@@ -297,20 +364,23 @@ class EmbodiedWorkspacePlugin(MaiBotPlugin):
         if self.cli_bridge.is_project_locked(chat_id, project_slug):
             return {
                 "ok": False,
-                "error": f"项目 {project_slug} 当前正在后台构建中，请等待构建完成后再提交新修改。",
+                "error": f"项目 {project_slug} 当前正在后台构建或回滚中，请等待完成后再提交新修改。",
             }
 
+        job_id = f"job_{int(time.time())}_{secrets.token_hex(3)}"
         codes = [c.strip().upper() for c in file_codes.split(",") if c.strip()]
         try:
             staged = self.cli_bridge.stage_authorized_files(
                 destination_chat_id=chat_id,
                 file_codes=codes,
+                job_id=job_id,
             )
         except Exception as exc:
+            self.cli_bridge.cleanup_job_inbox(chat_id, job_id)
             return {"ok": False, "error": f"附件权限校验或准备失败：{exc}"}
 
-        job_id = f"job_{int(time.time())}_{secrets.token_hex(3)}"
         effective_task_type = task_type if task_type in ("document", "webapp", "backend") else "webapp"
+        issuer_name = self._resolve_issuer_name(kwargs)
         req = WorkspaceJobRequest(
             job_id=job_id,
             stream_id=stream_id,
@@ -318,6 +388,7 @@ class EmbodiedWorkspacePlugin(MaiBotPlugin):
             target_id=target_id,
             source_message_id=source_message_id,
             creator_wxid=creator_wxid,
+            issuer_name=issuer_name,
             access_policy="member_collect" if access_policy == "member_collect" else "creator_only",
             project_slug=project_slug,
             action=action,
@@ -353,32 +424,41 @@ class EmbodiedWorkspacePlugin(MaiBotPlugin):
         self,
         stream_id: str,
         note: str,
-        target_id: str = "",
-        source_message_id: str = "",
+        *,
+        source_kind: str = "plugin:embodied_workspace",
     ) -> None:
-        kwargs: dict[str, Any] = {
-            "stream_id": stream_id,
-            "segments": [{"type": "text", "content": note}],
-            "visible_text": note,
-        }
-        if target_id:
-            kwargs["target_id"] = target_id
-        if source_message_id:
-            kwargs["source_message_id"] = source_message_id
-        await self.ctx.call_capability("maisaka.context.append", **kwargs)
+        await self.ctx.call_capability(
+            "maisaka.context.append",
+            stream_id=stream_id,
+            segments=[{"type": "text", "content": note}],
+            visible_text=note,
+            source_kind=source_kind,
+        )
 
-    def _update_truth_db_active_job(self, summary: str) -> None:
+    def get_active_jobs_summary(self) -> str:
+        if not self._active_jobs:
+            return ""
+        parts: list[str] = []
+        for item in self._active_jobs.values():
+            slug = str(item.get("project_slug") or "")
+            status = str(item.get("latest_status") or "")
+            parts.append(f"项目【{slug}】{status}")
+        return "；".join(parts)
+
+    def _sync_active_jobs_to_truth_db(self) -> None:
+        """仅在真值库已正规定义 fairy_active_job_summary 列时同步聚合多槽状态，严禁插件运行期执行 ALTER TABLE。"""
         try:
             truth_path = Path(self.config.truth_db_path)
             if not truth_path.exists():
                 return
-            with sqlite3.connect(str(truth_path)) as conn:
+            summary = self.get_active_jobs_summary()
+            with sqlite3.connect(str(truth_path), timeout=5.0) as conn:
                 cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(global_state)").fetchall()}
                 if "fairy_active_job_summary" not in cols:
-                    conn.execute("ALTER TABLE global_state ADD COLUMN fairy_active_job_summary TEXT DEFAULT ''")
+                    return
                 conn.execute(
                     "UPDATE global_state SET fairy_active_job_summary = ? WHERE row_id = 1",
-                    (summary.strip(),),
+                    (summary,),
                 )
                 conn.commit()
         except Exception:
@@ -401,28 +481,22 @@ class EmbodiedWorkspacePlugin(MaiBotPlugin):
             "target_id": req.target_id,
             "stream_id": req.stream_id,
             "started_at": time.time(),
-            "latest_status": "任务已派发，正在初始化沙箱环境与依赖...",
+            "latest_status": f"正在执行：{req.task_prompt[:40]}",
         }
-        self._update_truth_db_active_job(f"项目【{slug}】正在执行：{req.task_prompt[:40]}")
+        self._sync_active_jobs_to_truth_db()
 
         async def on_progress(status: str, elapsed_sec: int) -> None:
             elapsed_min = max(1, elapsed_sec // 60)
             elapsed_desc = f"{elapsed_min} 分钟"
             if req.job_id in self._active_jobs:
                 self._active_jobs[req.job_id]["latest_status"] = f"已运行 {elapsed_desc}：{status}"
-
-            self._update_truth_db_active_job(f"项目【{slug}】已运行 {elapsed_desc}：{status}")
+            self._sync_active_jobs_to_truth_db()
 
             progress_note = (
                 f"[Fairy工作区进度巡检] task_id={req.job_id} | 项目={slug} | 已耗时={elapsed_desc}\n"
                 f"当前客观进展：{status}"
             )
-            await self._append_context_note(
-                req.stream_id,
-                progress_note,
-                target_id=req.target_id,
-                source_message_id=req.source_message_id,
-            )
+            await self._append_context_note(req.stream_id, progress_note)
             intent = (
                 f"Fairy 慢轨工作区正在为用户执行后台长程任务（项目: {slug}，已运行 {elapsed_desc}）。\n"
                 f"当前客观进展：{status}。\n"
@@ -432,16 +506,16 @@ class EmbodiedWorkspacePlugin(MaiBotPlugin):
             await self.ctx.call_capability(
                 "maisaka.proactive.trigger",
                 stream_id=req.stream_id,
-                target_id=req.target_id,
-                source_message_id=req.source_message_id,
                 intent=intent,
             )
 
         try:
             res = await self.cli_bridge.run_cli_job(req, progress_callback=on_progress)
+        except asyncio.CancelledError:
+            raise
         finally:
             self._active_jobs.pop(req.job_id, None)
-            self._update_truth_db_active_job("")
+            self._sync_active_jobs_to_truth_db()
 
         quote_anchor = f"[引用: {req.source_message_id}]\n" if req.source_message_id else ""
         if res.ok and res.dist_dir and res.project_dir:
@@ -451,6 +525,7 @@ class EmbodiedWorkspacePlugin(MaiBotPlugin):
                 chat_id=req.chat_id,
                 stream_id=req.stream_id,
                 creator_wxid=req.creator_wxid,
+                issuer_name=req.issuer_name or self._resolve_issuer_name(),
                 access_policy=req.access_policy,
                 project_slug=slug,
                 title=res.title,
@@ -498,17 +573,10 @@ class EmbodiedWorkspacePlugin(MaiBotPlugin):
             intent = f"Fairy 后台任务 {req.job_id} 执行失败（{res.error_message}），请结合你的人设向用户简短说明情况。"
 
         self._notified_job_ids.add(req.job_id)
-        await self._append_context_note(
-            req.stream_id,
-            note,
-            target_id=req.target_id,
-            source_message_id=req.source_message_id,
-        )
+        await self._append_context_note(req.stream_id, note)
         await self.ctx.call_capability(
             "maisaka.proactive.trigger",
             stream_id=req.stream_id,
-            target_id=req.target_id,
-            source_message_id=req.source_message_id,
             intent=intent,
         )
 
@@ -534,77 +602,102 @@ class EmbodiedWorkspacePlugin(MaiBotPlugin):
                 intent=f"用户 {actor_wxid} 在网页《{route.title}》上完成了操作（{event_name}: {detail}{mem_note}），请自然地回应。",
             )
 
+    def _can_actor_mutate_route(self, route: SubdomainRoute | None, actor_wxid: str) -> bool:
+        if route is None or route.access_policy != "creator_only" or not route.creator_wxid:
+            return True
+        clean_actor = actor_wxid.strip()
+        if not clean_actor:
+            return False
+        if clean_actor == route.creator_wxid:
+            return True
+        return bool(hasattr(self, "truth_writer") and self.truth_writer and self.truth_writer.is_owner_wxid(clean_actor))
+
     async def _perform_project_rollback(
         self,
         chat_id: str,
         project_slug: str,
         target_spec: str = "1",
         fallback_stream_id: str = "",
-        fallback_creator_wxid: str = "",
+        actor_wxid: str = "",
     ) -> dict[str, Any]:
         slug = self.cli_bridge.safe_id(project_slug)
         ws_dir = self.cli_bridge.get_chat_workspace(chat_id)
-        token = self.router.find_active_token_by_slug(chat_id, slug)
-        old_route = self.router.get_route(token) if token else None
 
-        if token:
-            await self.supervisor.stop_backend(token)
+        if self.cli_bridge.is_project_locked(chat_id, slug):
+            return {
+                "ok": False,
+                "error": f"项目 `{slug}` 当前正在后台构建中，请等待构建完成后再执行回滚",
+            }
 
-        rb_res = await self.time_machine.rollback(ws_dir, slug, target_spec=target_spec)
-        if not rb_res.ok:
-            return {"ok": False, "error": rb_res.error}
+        async with self.cli_bridge.project_lock(chat_id, slug):
+            token = self.router.find_active_token_by_slug(chat_id, slug)
+            old_route = self.router.get_route(token) if token else None
 
-        meta = rb_res.restored_meta or {}
-        mode = str(meta.get("mode") or (old_route.mode if old_route else "static")).strip().lower()
-        start_cmd = (
-            [str(x) for x in meta.get("start_cmd", [])]
-            if isinstance(meta.get("start_cmd"), list)
-            else (json.loads(old_route.start_cmd_json) if old_route and old_route.start_cmd_json else [])
-        )
-        title = str(meta.get("title") or (old_route.title if old_route else slug))
-        summary = str(meta.get("summary_for_replyer") or f"已回滚至 {rb_res.target_commit}")
+            if not self._can_actor_mutate_route(old_route, actor_wxid):
+                return {
+                    "ok": False,
+                    "error": "该项目为创建者独占模式，仅创建者本人或 OWNER 可执行回滚",
+                }
 
-        # [v3.1 修正] 完整保留原路由的 creator_wxid、access_policy 与 stream_id
-        creator_wxid = (old_route.creator_wxid if old_route and old_route.creator_wxid else fallback_creator_wxid)
-        access_policy = (old_route.access_policy if old_route else "creator_only")
-        stream_id = (old_route.stream_id if old_route and old_route.stream_id else fallback_stream_id)
+            if token:
+                await self.supervisor.stop_backend(token)
 
-        dist_dir = ws_dir / "dist" / slug
-        project_dir = ws_dir / "projects" / slug
-        eff_token = token or self.router.generate_short_token(6)
+            rb_res = await self.time_machine.rollback(ws_dir, slug, target_spec=target_spec)
+            if not rb_res.ok:
+                return {"ok": False, "error": rb_res.error}
 
-        url = self.router.upsert_route(
-            token=eff_token,
-            chat_id=chat_id,
-            stream_id=stream_id,
-            creator_wxid=creator_wxid,
-            access_policy=access_policy,
-            project_slug=slug,
-            title=title,
-            summary=summary,
-            mode=mode,
-            dist_dir=dist_dir,
-            project_dir=project_dir,
-            start_cmd=start_cmd,
-            ttl_hours=self.config.default_ttl_hours,
-        )
-        if mode == "backend" and start_cmd:
-            route = self.router.get_route(eff_token)
-            if route:
-                try:
-                    await self.supervisor.ensure_running(route, start_cmd)
-                except Exception:
-                    pass
+            meta = rb_res.restored_meta or {}
+            mode = str(meta.get("mode") or (old_route.mode if old_route else "static")).strip().lower()
+            start_cmd = (
+                [str(x) for x in meta.get("start_cmd", [])]
+                if isinstance(meta.get("start_cmd"), list)
+                else (json.loads(old_route.start_cmd_json) if old_route and old_route.start_cmd_json else [])
+            )
+            title = str(meta.get("title") or (old_route.title if old_route else slug))
+            summary = str(meta.get("summary_for_replyer") or f"已回滚至 {rb_res.target_commit}")
 
-        return {
-            "ok": True,
-            "project_slug": slug,
-            "target_commit": rb_res.target_commit,
-            "restored_subject": rb_res.restored_subject,
-            "access_policy": access_policy,
-            "url": url,
-            "mode": mode,
-        }
+            creator_wxid = (old_route.creator_wxid if old_route and old_route.creator_wxid else actor_wxid)
+            issuer_name = (old_route.issuer_name if old_route and old_route.issuer_name else self._resolve_issuer_name())
+            access_policy = (old_route.access_policy if old_route else "creator_only")
+            stream_id = (old_route.stream_id if old_route and old_route.stream_id else fallback_stream_id)
+
+            dist_dir = ws_dir / "dist" / slug
+            project_dir = ws_dir / "projects" / slug
+            eff_token = token or self.router.generate_short_token(6)
+
+            url = self.router.upsert_route(
+                token=eff_token,
+                chat_id=chat_id,
+                stream_id=stream_id,
+                creator_wxid=creator_wxid,
+                issuer_name=issuer_name,
+                access_policy=access_policy,
+                project_slug=slug,
+                title=title,
+                summary=summary,
+                mode=mode,
+                dist_dir=dist_dir,
+                project_dir=project_dir,
+                start_cmd=start_cmd,
+                ttl_hours=self.config.default_ttl_hours,
+            )
+            if mode == "backend" and start_cmd:
+                route = self.router.get_route(eff_token)
+                if route:
+                    try:
+                        await self.supervisor.ensure_running(route, start_cmd)
+                    except Exception:
+                        pass
+
+            return {
+                "ok": True,
+                "project_slug": slug,
+                "target_commit": rb_res.target_commit,
+                "restored_subject": rb_res.restored_subject,
+                "access_policy": access_policy,
+                "url": url,
+                "mode": mode,
+            }
 
     @Tool(
         name="manage_workspace_projects",
@@ -680,11 +773,14 @@ class EmbodiedWorkspacePlugin(MaiBotPlugin):
         if act == "rollback":
             if not project_slug.strip():
                 return {"ok": False, "error": "执行回滚必须提供 project_slug"}
-            sender_wxid = str(kwargs.get("sender_wxid") or kwargs.get("user_id") or "")
+            sender_wxid = str(kwargs.get("user_id") or "").strip()
             stream_id = str(kwargs.get("stream_id") or "")
             return await self._perform_project_rollback(
-                chat_id, slug, target_spec=target_version,
-                fallback_stream_id=stream_id, fallback_creator_wxid=sender_wxid
+                chat_id,
+                slug,
+                target_spec=target_version,
+                fallback_stream_id=stream_id,
+                actor_wxid=sender_wxid,
             )
 
         return {"ok": False, "error": f"未知的 action: {action}"}
@@ -692,34 +788,25 @@ class EmbodiedWorkspacePlugin(MaiBotPlugin):
     @Command(
         name="rollback",
         description="一键将指定工作区项目回滚至上一稳定快照版本",
-        pattern=r"^(?:/rollback|/回滚|回滚)\s+([a-zA-Z0-9_.-]+)(?:\s+(\S+))?\s*$",
+        pattern=r"^(?:/rollback|/回滚|回滚)\s+(?P<slug>[a-zA-Z0-9_.-]+)(?:\s+(?P<version>\S+))?\s*$",
         aliases=["/rollback", "/回滚", "回滚"],
     )
     async def rollback_workspace_cmd(self, **kwargs: Any) -> str:
         chat_id = self._resolve_chat_id(kwargs)
-        groups = kwargs.get("matched_groups")
-        slug = ""
-        target_spec = "1"
-        if isinstance(groups, (list, tuple)) and groups:
-            slug = str(groups[0] or "").strip()
-            if len(groups) > 1 and groups[1]:
-                target_spec = str(groups[1]).strip()
-        else:
-            raw_text = str(kwargs.get("text") or kwargs.get("command_text") or "").strip()
-            parts = raw_text.split()
-            if len(parts) >= 2:
-                slug = parts[1]
-            if len(parts) >= 3:
-                target_spec = parts[2]
+        slug = self._extract_named_group(kwargs, "slug", fallback_index=1)
+        target_spec = self._extract_named_group(kwargs, "version", fallback_index=2) or "1"
 
         if not slug:
             return "请指定要回滚的项目标识，例如：/rollback camp-vote"
 
-        sender_wxid = str(kwargs.get("sender_wxid") or kwargs.get("user_id") or "")
+        sender_wxid = str(kwargs.get("user_id") or "").strip()
         stream_id = str(kwargs.get("stream_id") or "")
         res = await self._perform_project_rollback(
-            chat_id, slug, target_spec=target_spec,
-            fallback_stream_id=stream_id, fallback_creator_wxid=sender_wxid
+            chat_id,
+            slug,
+            target_spec=target_spec,
+            fallback_stream_id=stream_id,
+            actor_wxid=sender_wxid,
         )
         if res.get("ok"):
             return (
@@ -731,30 +818,45 @@ class EmbodiedWorkspacePlugin(MaiBotPlugin):
     @Command(
         name="claim",
         description="绑定跨设备/跨浏览器网页身份口令",
-        pattern=r"^(?:/claim|/认领|/绑定|认领|绑定)\s+([0-9]{4,8})\s*$",
+        pattern=r"^(?:/claim|/认领|/绑定|认领|绑定)\s+(?P<code>[0-9]{4,8})\s*$",
         aliases=["/claim", "/认领", "/绑定", "认领", "绑定"],
     )
     async def claim_web_identity_cmd(self, **kwargs: Any) -> str:
-        code = self._extract_command_arg(kwargs)
+        code = self._extract_named_group(kwargs, "code", fallback_index=1)
         sender_wxid = str(kwargs.get("user_id") or "").strip()
-        sender_name = str(kwargs.get("user_nickname") or sender_wxid)
+        sender_name = self._resolve_sender_nickname(kwargs, sender_wxid)
+        chat_id = self._resolve_chat_id(kwargs)
         if not code:
             return "请提供 4 位认领口令，例如：认领 8392"
-        ok = self.router.fulfill_claim_by_wechat(code, sender_wxid, sender_name)
+
+        claim_chat_id = self.router.get_claim_chat_id(code)
+        allowed_members: set[str] | None = None
+        if claim_chat_id.endswith("@chatroom"):
+            group_set = self.truth_writer.get_group_member_wxids(claim_chat_id)
+            if group_set:
+                allowed_members = group_set
+
+        ok = self.router.fulfill_claim_by_wechat(
+            code,
+            sender_wxid,
+            sender_name,
+            source_chat_id=chat_id,
+            allowed_group_members=allowed_members,
+        )
         if ok:
             return "✅ 微信身份绑定成功！你正在浏览的网页将在 1 秒内自动登录。"
-        return "❌ 认领口令无效或已过期，请在网页弹窗中重新点击获取。"
+        return "❌ 认领口令无效、已过期或不属于当前群聊成员，请在网页弹窗中重新获取。"
 
     @Command(
         name="pin",
         description="设置你在动态工作区网页的 4 位跨设备登录 PIN 码",
-        pattern=r"^(?:/pin|/设置pin|设置pin)\s+(\S+)\s*$",
+        pattern=r"^(?:/pin|/设置pin|设置pin)\s+(?P<pin>\S+)\s*$",
         aliases=["/pin", "/设置pin", "设置pin"],
     )
     async def set_web_pin_cmd(self, **kwargs: Any) -> str:
-        clean_pin = self._extract_command_arg(kwargs)
+        clean_pin = self._extract_named_group(kwargs, "pin", fallback_index=1)
         sender_wxid = str(kwargs.get("user_id") or "").strip()
-        sender_name = str(kwargs.get("user_nickname") or sender_wxid)
+        sender_name = self._resolve_sender_nickname(kwargs, sender_wxid)
         if len(clean_pin) < 4:
             return "❌ PIN 码长度至少需要 4 位，例如：/pin 6688"
         self.router.set_user_pin(sender_wxid, clean_pin, sender_name)
@@ -763,15 +865,24 @@ class EmbodiedWorkspacePlugin(MaiBotPlugin):
     @Command(
         name="revoke",
         description="立即撤销并销毁指定的限时子域名链接",
-        pattern=r"^(?:/revoke|/撤销|撤销)\s+(\S+)\s*$",
+        pattern=r"^(?:/revoke|/撤销|撤销)\s+(?P<token>\S+)\s*$",
         aliases=["/revoke", "/撤销", "撤销"],
     )
     async def revoke_link_cmd(self, **kwargs: Any) -> str:
-        raw_arg = self._extract_command_arg(kwargs)
+        raw_arg = self._extract_named_group(kwargs, "token", fallback_index=1)
         chat_id = self._resolve_chat_id(kwargs)
+        sender_wxid = str(kwargs.get("user_id") or "").strip()
         clean_token = raw_arg.strip().rstrip("/").split("/")[-1].split(".")[0].replace("https://", "")
         if not clean_token:
             return "请指定要销毁的短链标识，例如：/revoke k9x4m2"
+
+        route = self.router.get_route(clean_token)
+        if not route or route.chat_id != chat_id or route.revoked:
+            return f"未找到当前会话下可撤销的链接标识：{clean_token}"
+
+        if not self._can_actor_mutate_route(route, sender_wxid):
+            return "❌ 该链接为创建者独占模式，仅创建者本人或 OWNER 可撤销销毁。"
+
         ok = self.router.revoke_token(clean_token, chat_id=chat_id)
         if ok:
             await self.supervisor.stop_backend(clean_token)
@@ -781,34 +892,31 @@ class EmbodiedWorkspacePlugin(MaiBotPlugin):
     @HookHandler("maisaka.reply.before_post_process")
     async def protect_subdomain_url_hook(
         self,
-        event: dict[str, Any] | None = None,
         *,
         response: str = "",
-        session_id: str = "",
-        reply_message_id: str = "",
+        skip_post_process: bool = False,
+        enable_splitter: bool = True,
+        enable_chinese_typo: bool = True,
         **kwargs: Any,
     ) -> dict[str, Any]:
-        _ = session_id, reply_message_id
-        target = event if isinstance(event, dict) else kwargs
-        text = str(target.get("response") or response or "")
+        _ = enable_splitter, enable_chinese_typo
         short_host = self.config.short_link_base_url.replace("https://", "").replace("http://", "").strip("/")
-        matched = bool(self.config.base_domain in text or (short_host and short_host in text))
-
-        if isinstance(event, dict):
-            if matched:
-                event["enable_chinese_typo"] = False
-                event["enable_splitter"] = False
-            return event
-
-        if matched:
-            return {
-                "action": "continue",
-                "modified_kwargs": {
-                    "enable_chinese_typo": False,
-                    "enable_splitter": False,
-                },
-            }
-        return {"action": "continue"}
+        matched = bool(
+            (self.config.base_domain and self.config.base_domain in response)
+            or (short_host and short_host in response)
+        )
+        if not matched:
+            return {"action": "continue"}
+        return {
+            "action": "continue",
+            "modified_kwargs": {
+                **kwargs,
+                "response": response,
+                "skip_post_process": bool(skip_post_process),
+                "enable_splitter": False,
+                "enable_chinese_typo": False,
+            },
+        }
 
 
 def create_plugin() -> EmbodiedWorkspacePlugin:

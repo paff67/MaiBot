@@ -669,6 +669,10 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
     def _uses_retro_prompt(self) -> bool:
         return global_config.debug.replyer_retro_prompt
 
+    def _uses_st_preset_engine(self) -> bool:
+        """预留挂载点：与 _uses_retro_prompt 并列支持后续 STPresetEngine 一键热切。"""
+        return callable(getattr(self, "_st_preset_request_builder", None))
+
     @staticmethod
     def _build_recalled_messages(reply_tool_args: Optional[Dict[str, Any]]) -> List[ContextItem]:
         """装载层产物按原生文件句柄传入，不转换为文字描述。"""
@@ -714,6 +718,21 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
         reply_tool_args: Optional[Dict[str, Any]] = None,
         think_level: int = 1,
     ) -> List[ContextItem]:
+        # ST 预设引擎预留接管分支（默认未挂载时返回 False，零侵入现有路径）
+        if self._uses_st_preset_engine():
+            st_builder = self._st_preset_request_builder
+            return st_builder(
+                chat_history=chat_history,
+                reply_message=reply_message,
+                reply_reason=reply_reason,
+                expression_habits=expression_habits,
+                reply_requirements=reply_requirements,
+                stream_id=stream_id,
+                enable_visual_message=enable_visual_message,
+                reply_tool_args=reply_tool_args,
+                think_level=think_level,
+            )
+
         # 复古模式将人设与注意事项放在首条 system 消息，其余模板作为一条 user 消息发送
         if self._uses_retro_prompt():
             return self._build_retro_request_messages(

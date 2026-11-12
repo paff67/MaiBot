@@ -1,6 +1,7 @@
 # 生产环境运维与排障手册（Production Operations & Troubleshooting Manual）
 
-> **最后更新**：2026-11-08
+> **最后更新**：2026-11-11
+> **活跃生产分支**：`feat/embodied-workspace-phase4-twins`（提交基线 `2bbcae1d4`）
 > **生产微信账号目录哈希**：`4d86ac1b06dd252fa3c7327eb5614865`（`wxid_w5d0efdxczt322`）
 
 ---
@@ -189,26 +190,35 @@ PY'
 
 ## 六、 代码发布与上线标准流程（Release SOP）
 
-1. **本地回归验证**：
+> **⚠️ 净室重构上线前必填配置核对（重要）**：
+> 净室重构已彻底剥离源码中的个人域名、微信号与明文 API Key 硬编码默认值。首次部署重构版本至 `DMIT-US` 前，**必须确认以下两处生产配置已显式填写**：
+> 1. **`/etc/maibot-media.env`**（参考 `deploy/embodied/media.env.example`）：
+>    - `MAIBOT_SELF_WXID=wxid_w5d0efdxczt322`（自身底层微信号，供 `<自身账号与提及判定准则>` 与 `@` 解析使用）
+>    - `FAIRY_SANDBOX_API_KEY=<受限网关密钥>` 与 `FAIRY_SANDBOX_BASE_URL=https://api.0-0.pro`
+>    - `MAIBOT_FILES_API_ENABLED=0`（启用第三方网关 `<=15MB` 语音/附件零延迟内联直通，免除 Files API 404 往返）
+>    - `MAIBOT_DISABLE_AMEMORIX=1`（确保宿主 `A_memorix` 完全旁路，仅以 `shujuku` 真值库为单一记忆源）
+> 2. **`embodied_workspace` 插件配置（`config.toml`）**：
+>    - 显式设置 `base_domain = "paff-67.top"`、`workspaces_root = "/opt/maibot-brain/data/workspaces"`、`gdrive_archive_root = "/mnt/gdrive/companion_vault/workspace_archives"`、`wechat_source`、`wechat_account` 及 `cli_timeout_seconds = 10800`。
+
+1. **本地全量回归与静态门禁验证（142 项）**：
    ```bash
    cd /mnt/e/Gemini/MaiBot
-   pytest pytests/companion/ pytests/platform_io/test_adapter_policy.py -q
+   pytest pytests/companion pytests/platform_io/test_wechat_at_parsing.py pytests/platform_io/test_adapter_policy.py pytests/maisaka/test_reasoning_engine.py -q
+   ruff check plugins/embodied_workspace src/companion_vault src/platform_io/wechat
    ```
 2. **同步代码至云端 `DMIT-US`**：
+   > **规范提醒**：生产环境优先通过 Git 分支拉取（`git pull --ff-only`）保持提交可追溯；仅在单文件紧急验证时使用 `scp` 同步并务必回推 Git 分支。
    ```bash
-   scp -r /mnt/e/Gemini/MaiBot/src/companion_vault DMIT-US:/opt/maibot-brain/src/
-   scp -r /mnt/e/Gemini/MaiBot/src/platform_io/wechat DMIT-US:/opt/maibot-brain/src/platform_io/
-   scp -r /mnt/e/Gemini/MaiBot/src/phone_edge DMIT-US:/opt/maibot-brain/src/
-   scp -r /mnt/e/Gemini/MaiBot/deploy/embodied DMIT-US:/opt/maibot-brain/deploy/
+   ssh DMIT-US 'cd /opt/maibot-brain && git fetch origin && git checkout feat/embodied-workspace-phase4-twins && git pull --ff-only origin feat/embodied-workspace-phase4-twins'
    ```
 3. **如涉及手机边缘端（`src/phone_edge/`）变更，同步至小米 10**：
    ```bash
    adb push /mnt/e/Gemini/MaiBot/src/phone_edge/*.py /mnt/e/Gemini/MaiBot/src/phone_edge/message_capture.js /sdcard/Download/
    adb shell su -c "cp /sdcard/Download/*.py /sdcard/Download/message_capture.js /data/adb/maibot_edge/ && rm -f /sdcard/Download/*.py /sdcard/Download/message_capture.js"
    ```
-4. **重启云端服务并核验日志**：
+4. **重启云端服务并核验网关与核心守护进程状态**：
    ```bash
-   ssh DMIT-US 'systemctl restart maibot-main maibot-message-ingest maibot-message-media && systemctl is-active maibot-main maibot-message-ingest maibot-message-media'
+   ssh DMIT-US 'systemctl restart maibot-main maibot-message-ingest maibot-message-media && systemctl is-active maibot-main maibot-message-ingest maibot-message-media && ss -tlnp | grep 18790'
    ```
 
 ---
@@ -243,3 +253,35 @@ PY'
   1. **检查群名片**：在手机微信中进入群聊天信息，查看“我在本群的昵称”。若为空，建议设置并与 `bot_config.toml` 中的 `nickname` 保持完全一致；
   2. **检查真值库索引**：在 `DMIT-US` 查询 `companion_truth.db` 的 `person_info` 表，核实群内所有成员的 `person_name`、`wechat_remark` 与 `platform_ids`（wxid）映射关系是否健全；
   3. **人设热更与别名同步**：系统已实装动态别名机制，在修改 `bot_config.toml` 中的 `nickname` 或 `alias_names` 后，主程序毫秒级热更生效，Prompt 自动注入带有 `<重要角色索引>` 与强排他准则的身份上下文，彻底消除误判。
+
+### 3. 故障案例：群聊语音附件上传报 `404 Not Found`（Files API 不可用）
+- **现象特征**：
+  群友发送超过 10 秒的语音（24kHz PCM WAV 体积超过 `512KB`），日志报错上游 `/upload/v1beta/files` 返回 `404 Not Found`，导致模型未能听到语音内容。
+- **根本机理与已实装容错**：
+  第三方 OpenAI/Gemini 聚合中转网关通常未实现 Google 原生 `Files API` 上传端点。系统已在 `model_assets.py` 与 `quote_recall.py` 实装自动降级：当 Files API 上传抛出异常或未配置客户端、且文件 `<= 15MB` 时，自动回退为 `ContextAudioPart`（`audio_base64` 内联载荷）直传模型。
+- **巡检核验命令**：
+  ```bash
+  ssh DMIT-US 'journalctl -u maibot-main -n 100 --no-pager | grep -E "audio_base64|Files API|hydrate"'
+  ```
+
+### 4. 故障案例：慢轨工作区子域名无法访问、超时或沙盒进程排查
+- **巡检网关监听与活跃沙盒单元**：
+  ```bash
+  # 检查本地工作区网关 (:18790) 与 Nginx SNI 反代 (:4443)
+  ssh DMIT-US 'ss -tlnp | grep -E "18790|4443"'
+
+  # 查看当前运行中的确定性命名 cgroups v2 沙盒构建任务 (maibot-fairy-cli-*) 与后端进程 (maibot-fairy-be-*)
+  ssh DMIT-US 'systemctl list-units "maibot-fairy-*.scope" --state=running --no-pager'
+
+  # 查看具体会话工作区构建日志
+  ssh DMIT-US 'tail -n 60 /opt/maibot-brain/data/workspaces/*/projects/*/build.log'
+  ```
+
+### 5. 故障案例：验证微信撤回消息的内存防抖实时剔除与群聊出口熔断
+- **机制说明**：
+  1. **防抖窗口撤回同步**：当用户在发送消息后数秒内于微信端撤回（`kind=268445456`），`LedgerSource` 会立即调用 `WeChatRootDriver.revoke_committed` $\rightarrow$ `MaisakaHeartFlowChatting.revoke_message`，从待合批缓冲与内存 `_chat_history` 中剔除该 `msg_id` 并取消空批定时器。
+  2. **群聊敏感锚点出口熔断（`OutputGuardrail`）**：群聊发包前自动校验是否意外包含精确美元账单或 `MAIBOT_GROUP_SECRET_ANCHORS` 机密词表，命中即物理拦截。
+- **日志巡检命令**：
+  ```bash
+  ssh DMIT-US 'journalctl -u maibot-main -n 100 --no-pager | grep -E "已同步剔除撤回消息|OutputGuardrail"'
+  ```
