@@ -145,6 +145,11 @@ def get_tool_spec(context: Optional[ToolAvailabilityContext] = None) -> ToolSpec
             "description": "可选。控制本次回复的篇幅和表达方式",
             "enum": ["简短表达", "正常回复", "长回复"],
         },
+        "persona_slot": {
+            "type": "string",
+            "description": "可选。双子值班声带槽位标识（默认 sister_younger）。",
+            "enum": ["sister_younger", "sister_elder"],
+        },
     }
     properties.update({
         "memory_greenlights": {

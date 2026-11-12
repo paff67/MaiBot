@@ -12,9 +12,7 @@ from src.llm_models.payload_content.tool_option import ToolDefinitionInput
 from .context import BuiltinToolRuntimeContext
 from .device_sandbox_tools import (
     get_phone_action_tool_spec,
-    get_sandbox_task_tool_spec,
     handle_phone_action_tool,
-    handle_sandbox_task_tool,
 )
 from .query_person_profile import get_tool_spec as get_query_person_profile_tool_spec
 from .query_person_profile import handle_tool as handle_query_person_profile_tool
@@ -81,7 +79,6 @@ def _get_query_person_profile_tool_spec() -> ToolSpec:
 
 BUILTIN_TOOL_ENTRIES: List[BuiltinToolEntry] = [
     BuiltinToolEntry("phone_action", get_phone_action_tool_spec, handle_phone_action_tool, stage="action", chat_scope="private"),
-    BuiltinToolEntry("sandbox_task", get_sandbox_task_tool_spec, handle_sandbox_task_tool, stage="action", chat_scope="private"),
     BuiltinToolEntry("wait", get_wait_tool_spec, handle_wait_tool, stage="both"),
     BuiltinToolEntry("stop", get_stop_tool_spec, handle_stop_tool, stage="action"),
     BuiltinToolEntry("reply", get_reply_tool_spec, handle_reply_tool, stage="action"),

@@ -10,7 +10,7 @@ from src.phone_edge.message_media import MessageMediaResolver
 from src.companion_vault.asset_pipeline import AssetPipeline
 from src.companion_vault.truth_db import CompanionTruthDB
 from src.companion_vault.message_media_worker import MessageMediaQueue
-from src.mobile_agent.message_ingestor import MessageLedger
+from src.platform_io.wechat.message_ingestor import MessageLedger
 
 ACCOUNT = "a" * 32
 

@@ -2,8 +2,8 @@ import sqlite3
 
 import pytest
 
-from src.mobile_agent.wechat_screen_parser import WeChatScreenParser
-from src.mobile_agent.wechat_text import format_for_wechat
+from src.platform_io.wechat.screen_fallback import WeChatScreenParser
+from src.platform_io.wechat.wechat_text import format_for_wechat
 from src.companion_vault.truth_db import CompanionTruthDB
 
 

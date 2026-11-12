@@ -53,6 +53,7 @@ from src.llm_models.exceptions import (
 )
 from src.llm_models.payload_content.context_item import (
     AssistantMessageItem,
+    ContextAudioPart,
     ContextFileUriPart,
     ContextImagePart,
     ContextItem,
@@ -194,6 +195,15 @@ def _build_non_tool_parts(item: UserMessageItem | AssistantMessageItem) -> List[
                     mime_type=_normalize_image_mime_type(message_part.normalized_image_format),
                 )
             )
+            continue
+        if isinstance(message_part, ContextAudioPart):
+            converted_parts.append(
+                Part.from_bytes(
+                    data=base64.b64decode(message_part.audio_base64),
+                    mime_type=message_part.mime_type,
+                )
+            )
+            continue
     return converted_parts
 
 

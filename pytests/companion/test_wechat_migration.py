@@ -381,7 +381,7 @@ def test_route_c_ledger_consumer_and_truth_enrichment(tmp_path):
         assert len(envelopes) == 1
         user_info = envelopes[0].payload["message_info"]["user_info"]
         assert user_info["user_id"] == "wxid_test"
-        assert user_info["user_nickname"] == "明哥"
+        assert user_info["user_nickname"] == "小明"
         assert user_info["user_cardname"] == "明哥"
 
     try:
@@ -834,6 +834,120 @@ def test_multi_conversation_private_fallback_rate_backoff_and_scope_sync(tmp_pat
             tdb.close()
 
     asyncio.run(verify_auto_directory_sync())
+
+
+def test_wechat_quote_reply_resolution_and_dispatch(tmp_path):
+    import asyncio
+    import sqlite3
+    import httpx
+    from src.platform_io.wechat.edge_client import WeChatEdgeClient
+    from src.platform_io.wechat.driver import WeChatRootDriver
+    from src.common.data_models.message_component_data_model import ReplyComponent, TextComponent
+
+    ledger_path = str(tmp_path / "ledger.db")
+    with sqlite3.connect(ledger_path) as conn:
+        conn.execute(
+            "CREATE TABLE messages(source TEXT,account TEXT,msg_id TEXT,chat_id TEXT NOT NULL,"
+            "server_id TEXT,sender_id TEXT,direction TEXT,kind TEXT,body TEXT,raw_content TEXT,"
+            "revision TEXT,row_json TEXT NOT NULL,updated_at_ms INTEGER,PRIMARY KEY(source,account,msg_id))"
+        )
+        conn.execute(
+            "INSERT INTO messages VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "http://localhost:8765",
+                ACCOUNT,
+                "143229",
+                CHAT,
+                "9138388385056250904",
+                "wxid_friend",
+                "incoming",
+                "1",
+                "上次不是我吗",
+                "上次不是我吗",
+                "rev1",
+                json.dumps({"createTime": 1794142175000}),
+                1794142175000,
+            ),
+        )
+
+    truth_path = str(tmp_path / "truth.db")
+    with sqlite3.connect(truth_path) as conn:
+        conn.execute(
+            "CREATE TABLE person_info(person_id TEXT PRIMARY KEY, platform_ids TEXT DEFAULT '{}', person_name TEXT, wechat_remark TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO person_info VALUES(?, ?, ?, ?)",
+            ("p1", '{"wechat": "wxid_friend"}', "FriendName", "FriendRemark"),
+        )
+
+    calls = []
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        calls.append((request.method, request.url.path, json.loads(request.content.decode())))
+        return httpx.Response(
+            200,
+            json={
+                "ok": True,
+                "sent": True,
+                "status": "confirmed",
+                "request_id": "quote-req-1",
+                "msg_id": "143230",
+                "msg_svr_id": "999888777666",
+                "create_time": "1794143082828",
+                "send_layer": "AppMsgLogic:k0.I(type=57,svrid=9138388385056250904)",
+                "chatting_context_talker": "none",
+                "typing_delay_ms": 300,
+            },
+        )
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+            edge = WeChatEdgeClient(SOURCE, ACCOUNT, client=client, use_hook_send=True)
+            drv = WeChatRootDriver(
+                edge,
+                send_enabled=True,
+                allowed_chats=[CHAT],
+                ledger_path=ledger_path,
+                truth_path=truth_path,
+            )
+
+            class RawMsg:
+                def __init__(self, components):
+                    self.components = components
+
+            class MockGroup:
+                group_id = CHAT
+
+            class MockMsgInfo:
+                group_info = MockGroup()
+                user_info = None
+                additional_config = None
+
+            class MockMsg:
+                message_id = "reply_out_001"
+                message_info = MockMsgInfo()
+                raw_message = RawMsg([
+                    ReplyComponent(
+                        target_message_id="#wechat:scope:" + ACCOUNT + ":143229",
+                    ),
+                    TextComponent("怪不得哦"),
+                ])
+
+            receipt = await drv.send_message(MockMsg(), route_key=drv.descriptor.route_key)
+            assert receipt.status.name == "SENT"
+            assert receipt.external_message_id == "143230"
+            assert len(calls) == 1
+            method, path, body = calls[0]
+            assert path == "/wechat/send_quote"
+            assert body["text"] == "怪不得哦"
+            assert body["quote"]["server_id"] == "9138388385056250904"
+            assert body["quote"]["talker"] == CHAT
+            assert body["quote"]["sender_id"] == "wxid_friend"
+            assert body["quote"]["display_name"] == "FriendRemark"
+            assert body["quote"]["content"] == "上次不是我吗"
+
+    asyncio.run(run())
+
 
 
 

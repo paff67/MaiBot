@@ -41,6 +41,7 @@ sqlmodel>=0.0.24
 starlette>=1.3.1,<1.4
 structlog>=25.4.0
 tomlkit>=0.13.3
+tzdata>=2024.1
 typing-extensions
 urllib3>=2.7.0
 uvicorn>=0.35.0

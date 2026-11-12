@@ -669,6 +669,10 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
     def _uses_retro_prompt(self) -> bool:
         return global_config.debug.replyer_retro_prompt
 
+    def _uses_st_preset_engine(self) -> bool:
+        """预留挂载点：与 _uses_retro_prompt 并列支持后续 STPresetEngine 一键热切。"""
+        return callable(getattr(self, "_st_preset_request_builder", None))
+
     @staticmethod
     def _build_recalled_messages(reply_tool_args: Optional[Dict[str, Any]]) -> List[ContextItem]:
         """装载层产物按原生文件句柄传入，不转换为文字描述。"""
@@ -683,10 +687,21 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
             builder = ContextItemBuilder().set_role(RoleType.User)
             builder.add_text_part("【系统已为你挂载点亮的历史原文件，请直接查看原文件画面/音频/文档作答】")
             for part in file_parts:
-                if 'text' in part:
+                if 'text' in part and part['text']:
                     builder.add_text_part(part['text'])
-                else:
-                    builder.add_file_uri_part(part["file_uri"], part["mime_type"], part["file_code"])
+                elif 'image_base64' in part and part['image_base64']:
+                    builder.add_image_base64_part(
+                        image_format=part.get("image_format", "jpeg"),
+                        image_base64=part["image_base64"],
+                    )
+                elif 'audio_base64' in part and part['audio_base64']:
+                    builder.add_audio_base64_part(
+                        audio_base64=part["audio_base64"],
+                        mime_type=part.get("mime_type", "audio/wav"),
+                        file_code=part.get("file_code", ""),
+                    )
+                elif 'file_uri' in part and part['file_uri']:
+                    builder.add_file_uri_part(part["file_uri"], part["mime_type"], part.get("file_code", ""))
             items.append(builder.build())
         return items
 
@@ -703,6 +718,21 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
         reply_tool_args: Optional[Dict[str, Any]] = None,
         think_level: int = 1,
     ) -> List[ContextItem]:
+        # ST 预设引擎预留接管分支（默认未挂载时返回 False，零侵入现有路径）
+        if self._uses_st_preset_engine():
+            st_builder = self._st_preset_request_builder
+            return st_builder(
+                chat_history=chat_history,
+                reply_message=reply_message,
+                reply_reason=reply_reason,
+                expression_habits=expression_habits,
+                reply_requirements=reply_requirements,
+                stream_id=stream_id,
+                enable_visual_message=enable_visual_message,
+                reply_tool_args=reply_tool_args,
+                think_level=think_level,
+            )
+
         # 复古模式将人设与注意事项放在首条 system 消息，其余模板作为一条 user 消息发送
         if self._uses_retro_prompt():
             return self._build_retro_request_messages(

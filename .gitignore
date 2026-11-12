@@ -364,6 +364,7 @@ run_pet.bat
 !/plugins
 !/plugins/hello_world_plugin
 !/plugins/emoji_manage_plugin
+!/plugins/embodied_workspace
 !/plugins/__init__.py
 
 config.toml

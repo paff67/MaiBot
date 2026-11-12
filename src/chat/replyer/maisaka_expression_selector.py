@@ -64,6 +64,10 @@ class MaisakaExpressionSelector:
         return platform == "*" and item_id == "*"
 
     def _resolve_expression_group_scope(self, session_id: str) -> tuple[set[str], bool]:
+        # 防线三（LEAK-06 封堵）：私聊会话产生的表达习惯严禁进入跨会话共享池
+        if ChatConfigUtils.is_private_session_id(session_id):
+            return {session_id}, False
+
         related_session_ids = {session_id}
         has_global_share = False
         expression_groups = global_config.expression.expression_groups
@@ -92,10 +96,15 @@ class MaisakaExpressionSelector:
             if contains_current_session:
                 related_session_ids.update(group_session_ids)
 
+        private_ids = ChatConfigUtils.collect_known_private_session_ids()
+        related_session_ids.difference_update(private_ids)
+        related_session_ids.add(session_id)
         return related_session_ids, has_global_share
 
     def _load_all_expression_candidates(self, session_id: str) -> List[dict[str, Any]]:
         related_session_ids, has_global_share = self._resolve_expression_group_scope(session_id)
+        is_current_private = ChatConfigUtils.is_private_session_id(session_id)
+        forbidden_private_ids = set() if is_current_private else ChatConfigUtils.collect_known_private_session_ids()
 
         with get_db_session(auto_commit=False) as session:
             base_query = select(
@@ -103,6 +112,7 @@ class MaisakaExpressionSelector:
                 Expression.situation,
                 Expression.style,
                 Expression.count,
+                Expression.session_id,
             )
             if has_global_share:
                 scoped_query = base_query
@@ -118,7 +128,10 @@ class MaisakaExpressionSelector:
             rows = session.exec(scoped_query).all()
 
         all_candidates: List[dict[str, Any]] = []
-        for expression_id, situation, style, count in rows:
+        for expression_id, situation, style, count, row_session_id in rows:
+            # 群聊选择器物理拦截任何私聊 session_id 来源条目（即使开启了 ("*", "*") 全局共享）
+            if row_session_id and str(row_session_id) in forbidden_private_ids and str(row_session_id) != session_id:
+                continue
             normalized_style = normalize_expression_style_for_learning(str(style or ""))
             if (
                 expression_id is None

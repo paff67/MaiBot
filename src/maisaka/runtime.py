@@ -224,15 +224,18 @@ class MaisakaHeartFlowChatting(MaisakaRuntimeDisplayMixin):
 
     @property
     def _enable_expression_learning(self) -> bool:
-        """返回当前会话实时生效的表达学习开关。"""
+        """返回当前会话实时生效的表达学习开关（微信私聊物理禁用旁路采样防口癖跨聊外泄）。"""
+        if not self.chat_stream.is_group_session and str(self.chat_stream.platform or "").strip().lower() == "wechat":
+            return False
 
         _, enable_learning = ExpressionConfigUtils.get_expression_config_for_chat(self.session_id)
         return enable_learning
 
-
     @property
     def _enable_jargon_learning(self) -> bool:
-        """返回当前会话实时生效的黑话学习开关。"""
+        """返回当前会话实时生效的黑话学习开关（微信私聊物理禁用旁路采样防私密黑话外泄）。"""
+        if not self.chat_stream.is_group_session and str(self.chat_stream.platform or "").strip().lower() == "wechat":
+            return False
 
         _, enable_learning = JargonConfigUtils.get_jargon_config_for_chat(self.session_id)
         return enable_learning
@@ -1044,6 +1047,65 @@ class MaisakaHeartFlowChatting(MaisakaRuntimeDisplayMixin):
         self._request_planner_interrupt_for_message(message)
         if self._running:
             self._schedule_message_turn()
+
+    def _revoke_message_unlocked(self, target_message_id: str) -> bool:
+        """在持有入站锁或单线程测试下，从防抖缓存与内存上下文即时剔除已撤回消息。"""
+        clean_id = str(target_message_id or "").strip()
+        if not clean_id:
+            return False
+
+        removed = False
+        if self.message_cache:
+            kept_cache: list[SessionMessage] = []
+            removed_before_processed = 0
+            for idx, msg in enumerate(self.message_cache):
+                if str(msg.message_id or "").strip() == clean_id:
+                    removed = True
+                    if idx < self._last_processed_index:
+                        removed_before_processed += 1
+                    continue
+                kept_cache.append(msg)
+            if removed:
+                self.message_cache = kept_cache
+                self._last_processed_index = max(0, self._last_processed_index - removed_before_processed)
+
+        if self._chat_history:
+            kept_history = []
+            for item in self._chat_history:
+                item_mid = str(getattr(item, "message_id", "") or "").strip()
+                raw_obj = getattr(item, "raw_message_obj", None)
+                raw_mid = str(getattr(raw_obj, "message_id", "") or "").strip() if raw_obj is not None else ""
+                if clean_id in (item_mid, raw_mid):
+                    removed = True
+                    continue
+                kept_history.append(item)
+            self._chat_history = kept_history
+
+        if self._focus_group is not None and hasattr(self._focus_group, "history"):
+            fg_hist = getattr(self._focus_group, "history", None)
+            if isinstance(fg_hist, list):
+                fg_kept = [
+                    it
+                    for it in fg_hist
+                    if str(getattr(it, "message_id", "") or "").strip() != clean_id
+                ]
+                if len(fg_kept) != len(fg_hist):
+                    removed = True
+                    fg_hist[:] = fg_kept
+
+        if removed and not self._has_pending_messages():
+            self._fixed_message_debouncer.consume()
+            self._mark_message_turn_unscheduled()
+            self._cancel_deferred_message_turn_task()
+
+        if removed:
+            logger.info(f"{self.log_prefix} 已同步剔除撤回消息: message_id={clean_id}")
+        return removed
+
+    async def revoke_message(self, target_message_id: str) -> bool:
+        """收到平台撤回事件时，串行剔除防抖队列及内存 _chat_history 中的对应消息。"""
+        async with self._message_ingest_lock:
+            return self._revoke_message_unlocked(target_message_id)
 
     def _is_focus_mode_active_for_current_chat(self) -> bool:
         return focus_mode_manager.is_enabled_for_session(

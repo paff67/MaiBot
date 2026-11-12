@@ -1,12 +1,11 @@
 """Resolve explicit reply references through the same-chat memory retrieval boundary."""
 
 from typing import Any, Dict, List, Sequence, Tuple
-import base64
 import json
 import sqlite3
-import io
 import time
 
+from .asset_encoder import encode_inline_descriptor, is_files_api_enabled
 from .asset_pipeline import AssetPipeline
 
 
@@ -132,7 +131,8 @@ def load_original_descriptors(assets, file_rows, *, client=None):
         mime = source_row.get("mime_type") or row.get("mime_type") or "application/octet-stream"
         suffix = path.suffix.lower()
         if (
-            uri
+            is_files_api_enabled()
+            and uri
             and expires_at > time.time() + 600
             and not (
                 mime.startswith("text/")
@@ -163,56 +163,21 @@ def load_original_descriptors(assets, file_rows, *, client=None):
                     }
                 )
             elif part.inline_data:
-                img_data = part.inline_data.data
-                img_mime = part.inline_data.mime_type
-                if img_mime.startswith("image/"):
-                    fmt = img_mime.split("/")[-1].lower()
-                    if fmt == "jpeg":
-                        fmt = "jpg"
-                    descriptors.append(
-                        {
-                            "file_code": code,
-                            "semantic_name": semantic_name,
-                            "image_format": fmt,
-                            "image_base64": base64.b64encode(img_data).decode("ascii"),
-                            "mime_type": img_mime,
-                            "part_index": index,
-                        }
-                    )
-                    continue
-                if client is None:
-                    raise ValueError("Original attachment requires configured Files client")
-                uploaded = client.files.upload(
-                    file=io.BytesIO(part.inline_data.data), config={"mime_type": part.inline_data.mime_type}
+                descriptor, new_uri, new_expiry = encode_inline_descriptor(
+                    file_code=code,
+                    semantic_name=semantic_name,
+                    raw_bytes=part.inline_data.data,
+                    mime_type=part.inline_data.mime_type,
+                    part_index=index,
+                    client=client,
                 )
-                deadline = time.monotonic() + 120
-                while uploaded.state and uploaded.state.name == "PROCESSING":
-                    if time.monotonic() > deadline:
-                        raise TimeoutError("Attachment processing timeout")
-                    time.sleep(1)
-                    uploaded = client.files.get(name=uploaded.name)
-                if not uploaded.uri or (uploaded.state and uploaded.state.name == "FAILED"):
-                    raise ValueError("Attachment processing failed")
-                if len(parts) == 1 and mime == part.inline_data.mime_type:
-                    expiry = (
-                        uploaded.expiration_time.timestamp()
-                        if getattr(uploaded, "expiration_time", None)
-                        else time.time() + 47 * 3600
-                    )
+                if new_uri is not None and new_expiry is not None and len(parts) == 1 and mime == part.inline_data.mime_type:
                     with assets.db.conn:
                         assets.db.conn.execute(
                             "UPDATE media_vault SET gemini_file_uri=?, uri_expires_at=? WHERE file_code=?",
-                            (uploaded.uri, expiry, code),
+                            (new_uri, new_expiry, code),
                         )
-                descriptors.append(
-                    {
-                        "file_code": code,
-                        "semantic_name": semantic_name,
-                        "file_uri": uploaded.uri,
-                        "mime_type": part.inline_data.mime_type,
-                        "part_index": index,
-                    }
-                )
+                descriptors.append(descriptor)
             else:
                 raise ValueError("Unsupported original part")
     return descriptors

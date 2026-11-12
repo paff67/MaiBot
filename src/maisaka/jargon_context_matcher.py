@@ -15,7 +15,7 @@ from src.common.data_models.message_component_data_model import TextComponent
 from src.common.database.database import get_db_session
 from src.common.database.database_model import HighFrequencyTerm, Jargon
 from src.common.logger import get_logger
-from src.common.utils.utils_config import JargonConfigUtils
+from src.common.utils.utils_config import ChatConfigUtils, JargonConfigUtils
 from src.chat.utils.utils import is_bot_self
 from src.maisaka.context.messages import LLMContextMessage, ReferenceMessage, ReferenceMessageType, SessionBackedMessage
 
@@ -186,6 +186,8 @@ def match_jargons_for_context(
 
 def _load_scoped_jargon_candidates(session_id: str) -> list[_JargonCandidate]:
     related_session_ids, _ = JargonConfigUtils.resolve_jargon_group_scope(session_id)
+    is_current_private = ChatConfigUtils.is_private_session_id(session_id)
+    forbidden_private_ids = set() if is_current_private else ChatConfigUtils.collect_known_private_session_ids()
     candidates: list[_JargonCandidate] = []
 
     with get_db_session(auto_commit=False) as session:
@@ -201,7 +203,16 @@ def _load_scoped_jargon_candidates(session_id: str) -> list[_JargonCandidate]:
         meaning = str(record.meaning or "").strip()
         if not content or not meaning:
             continue
-        if not record.is_global and not _jargon_in_scope(str(record.session_id_dict or "{}"), related_session_ids):
+        raw_sid_dict = str(record.session_id_dict or "{}")
+        if forbidden_private_ids:
+            try:
+                parsed_sids = set(json.loads(raw_sid_dict).keys())
+            except Exception:
+                parsed_sids = set()
+            # 若该黑话完全源自私聊会话，群聊严禁读取（即便被误标 is_global=True）
+            if parsed_sids and parsed_sids.issubset(forbidden_private_ids):
+                continue
+        if not record.is_global and not _jargon_in_scope(raw_sid_dict, related_session_ids):
             continue
         candidates.append(
             _JargonCandidate(
@@ -209,7 +220,7 @@ def _load_scoped_jargon_candidates(session_id: str) -> list[_JargonCandidate]:
                 meaning=meaning,
                 count=int(record.count or 0),
                 is_global=bool(record.is_global),
-                session_id_dict=str(record.session_id_dict or "{}"),
+                session_id_dict=raw_sid_dict,
             )
         )
 

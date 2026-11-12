@@ -6,8 +6,8 @@ import csv
 import io
 import subprocess
 import tempfile
-import time
 
+from .asset_encoder import encode_media_part
 from .asset_pipeline import AssetPipeline
 
 
@@ -70,27 +70,17 @@ def build_original_parts(pipeline: AssetPipeline, file_code: str, client: Any) -
         return build_original_parts(pipeline, derived[0], client)
     if not (mime in {"image/jpeg", "image/png", "image/webp", "application/pdf"} or mime.startswith(("audio/", "video/"))):
         raise ValueError(f"{file_code}: {mime} 原件已归档，模型不支持直接读取")
-    if path.stat().st_size <= 512 * 1024:
-        return [types.Part.from_bytes(data=path.read_bytes(), mime_type=mime)]
-    if not row["gemini_file_uri"] or row["uri_expires_at"] <= time.time() + 600:
-        if client is None:
-            raise ValueError("Original attachment requires configured Files client")
-        uploaded = client.files.upload(file=str(path), config={"mime_type": mime})
-        deadline = time.monotonic() + 120
-        while uploaded.state and uploaded.state.name == "PROCESSING":
-            if time.monotonic() >= deadline:
-                raise TimeoutError("Files API 处理超时")
-            time.sleep(2)
-            uploaded = client.files.get(name=uploaded.name)
-        if uploaded.state and uploaded.state.name == "FAILED":
-            raise ValueError("Files API 处理失败")
-        if not uploaded.uri:
-            raise ValueError("Files API 未返回 URI")
-        expiry = uploaded.expiration_time.timestamp() if uploaded.expiration_time else time.time() + 47 * 3600
+    part, new_uri, new_expiry = encode_media_part(
+        path,
+        mime_type=mime,
+        client=client,
+        cached_uri=str(row["gemini_file_uri"] or ""),
+        uri_expires_at=float(row["uri_expires_at"] or 0),
+    )
+    if new_uri is not None and new_expiry is not None:
         with pipeline.db.conn:
-            pipeline.db.conn.execute("UPDATE media_vault SET gemini_file_uri=?,uri_expires_at=? WHERE file_code=?",
-                                     (uploaded.uri, expiry, file_code))
-        uri = uploaded.uri
-    else:
-        uri = row["gemini_file_uri"]
-    return [types.Part.from_uri(file_uri=uri, mime_type=mime)]
+            pipeline.db.conn.execute(
+                "UPDATE media_vault SET gemini_file_uri=?,uri_expires_at=? WHERE file_code=?",
+                (new_uri, new_expiry, file_code),
+            )
+    return [part]

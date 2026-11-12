@@ -240,19 +240,21 @@ class EdgeRequestHandler(BaseHTTPRequestHandler):
             "/touch/swipe",
             "/touch/input_text",
             "/wechat/send_text",
+            "/wechat/send_quote",
             "/backlight",
         ):
             self._json({"ok": False, "error": "接口不存在"}, 404)
             return
         try:
             payload = self._read_json()
-            if path == "/wechat/send_text":
+            if path in ("/wechat/send_text", "/wechat/send_quote"):
                 text = payload["text"]
                 if not isinstance(text, str) or not text.strip():
                     raise ValueError("text 必须是非空字符串")
                 expected_account = payload.get("expected_account")
                 expected_chat = payload.get("expected_chat_id")
                 request_id = payload.get("request_id", "")
+                quote = payload.get("quote")
                 if not expected_account or not expected_chat:
                     raise ValueError("自动发送必须提供目标账号和 Chat_User")
                 if (
@@ -264,6 +266,8 @@ class EdgeRequestHandler(BaseHTTPRequestHandler):
                 if find_active_wechat_account_dir().name != expected_account:
                     raise ValueError("手机端微信活跃账号校验失败")
                 digest_payload = {"text": text, "account": expected_account, "chat_id": expected_chat}
+                if quote:
+                    digest_payload["quote"] = quote
                 with self.server.input_lock:
                     previous = self.server.send_ledger.lookup(request_id, digest_payload)
                     if previous is not None:
@@ -309,16 +313,18 @@ class EdgeRequestHandler(BaseHTTPRequestHandler):
                         if (self.server.allowed_send_chats and "*" not in self.server.allowed_send_chats)
                         else [expected_chat]
                     )
-                    enqueue_send_spool(
-                        {
-                            "request_id": request_id,
-                            "account": expected_account,
-                            "chat_id": expected_chat,
-                            "content": text,
-                            "max_per_minute": max_per_min,
-                            "allowed_chats": spool_allowed_chats,
-                        }
-                    )
+                    spool_data = {
+                        "request_id": request_id,
+                        "account": expected_account,
+                        "chat_id": expected_chat,
+                        "content": text,
+                        "max_per_minute": max_per_min,
+                        "allowed_chats": spool_allowed_chats,
+                    }
+                    if quote:
+                        spool_data["msg_type"] = "quote"
+                        spool_data["quote"] = quote
+                    enqueue_send_spool(spool_data)
                     timeout_s = float(payload.get("timeout_s", 18.0))
                     deadline = time.monotonic() + timeout_s
                     outbox = None

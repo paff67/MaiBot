@@ -44,6 +44,94 @@ def _resolve_trust_role_sync(db_path: str, person_id: str, user_id: str, platfor
         db.close()
 
 
+def build_owner_persona_overlay(
+    db: CompanionTruthDB,
+    *,
+    is_group_chat: bool,
+    sender_trust_role: str,
+    user_id: str,
+    platform: str,
+    overlay_text: str = "",
+) -> str:
+    """
+    OwnerPersonaOverlay：仅在 OWNER 本人私聊（not is_group_chat and sender_trust_role == 'OWNER'）时挂载，
+    与普通好友私聊及一切群聊保持物理隔离。
+    """
+    if is_group_chat or str(sender_trust_role or "").upper() != "OWNER":
+        return ""
+
+    clean_uid = str(user_id or "").strip()
+    clean_plat = str(platform or "").strip()
+    owner_notes = ""
+    try:
+        if clean_uid and clean_plat:
+            row = db.conn.execute(
+                "SELECT owner_private_notes, impression FROM person_info "
+                "WHERE trust_role = 'OWNER' AND (person_id = ? OR json_extract(platform_ids, ?) = ?) LIMIT 1",
+                (clean_uid, f"$.{clean_plat}", clean_uid),
+            ).fetchone()
+        else:
+            row = db.conn.execute(
+                "SELECT owner_private_notes, impression FROM person_info WHERE trust_role = 'OWNER' LIMIT 1"
+            ).fetchone()
+        if row is not None:
+            owner_notes = str(row["owner_private_notes"] or row["impression"] or "").strip()
+    except Exception:
+        owner_notes = ""
+
+    configured_overlay = (overlay_text or os.environ.get("MAIBOT_OWNER_PERSONA_OVERLAY", "")).strip()
+    if not owner_notes and not configured_overlay:
+        return ""
+
+    parts: list[str] = ["<Owner专属关系与私密记忆层>"]
+    if owner_notes:
+        parts.append(f"- 专属关系印象：{owner_notes}")
+    if configured_overlay:
+        parts.append(configured_overlay)
+    parts.append("</Owner专属关系与私密记忆层>")
+    return "\n".join(parts)
+
+
+def get_twin_routing_state(db_path: str = DEFAULT_TRUTH_DB_PATH) -> Dict[str, Any]:
+    """读取 global_state 中的双子角色槽位、离场弧光状态与对话执行模式预留状态。"""
+    default_state: Dict[str, Any] = {
+        "timezone_name": "Asia/Tokyo",
+        "active_persona_slot": "sister_younger",
+        "elder_away_arc": "",
+        "chat_execution_mode": "dual_director",
+        "fairy_compute_tier": "STANDARD",
+        "force_younger_planner": False,
+    }
+    if not Path(db_path).is_file():
+        return default_state
+    db = _open_truth_db(db_path)
+    try:
+        row = db.conn.execute(
+            "SELECT timezone_name, active_persona_slot, elder_away_arc, chat_execution_mode, "
+            "fairy_compute_tier, fairy_remote_balance_usd, fairy_unsettled_cost_usd "
+            "FROM global_state WHERE row_id = 1"
+        ).fetchone()
+        if row is None:
+            return default_state
+        tier = str(row["fairy_compute_tier"] or "STANDARD")
+        eff_bal = max(0.0, float(row["fairy_remote_balance_usd"] or 5.0) - float(row["fairy_unsettled_cost_usd"] or 0.0))
+        force_younger = tier in ("THRIFTY", "HIBERNATING") or eff_bal < 3.0
+        slot = "sister_younger" if force_younger else (str(row["active_persona_slot"] or "sister_younger").strip() or "sister_younger")
+        mode = str(row["chat_execution_mode"] or "dual_director").strip()
+        if mode not in ("dual_director", "one_pass_st"):
+            mode = "dual_director"
+        return {
+            "timezone_name": str(row["timezone_name"] or "Asia/Tokyo"),
+            "active_persona_slot": slot,
+            "elder_away_arc": str(row["elder_away_arc"] or ""),
+            "chat_execution_mode": mode,
+            "fairy_compute_tier": tier,
+            "force_younger_planner": force_younger,
+        }
+    finally:
+        db.close()
+
+
 async def build_planner_truth_catalog_async(
     *,
     session_id: str,
@@ -55,15 +143,28 @@ async def build_planner_truth_catalog_async(
     account: str = "",
     chat_id: str = "",
     ledger_path: str = "data/message_ledger.db",
+    owner_overlay_text: str = "",
 ) -> str:
     def build() -> str:
         db = _open_truth_db(db_path)
         try:
+            sender_role = _resolve_trust_role(db, "", user_id, platform)
             catalog = db.build_planner_catalog_injection(
                 is_group_chat=is_group_chat,
-                sender_trust_role=_resolve_trust_role(db, "", user_id, platform),
+                sender_trust_role=sender_role,
                 include_unscoped_media_and_events=(platform != "wechat"),
+                chat_id=chat_id,
             )
+            overlay_block = build_owner_persona_overlay(
+                db,
+                is_group_chat=is_group_chat,
+                sender_trust_role=sender_role,
+                user_id=user_id,
+                platform=platform,
+                overlay_text=owner_overlay_text,
+            )
+            if overlay_block:
+                catalog = f"{catalog}\n\n{overlay_block}"
             if platform == "wechat" and anchor_message_id:
                 from .wechat_recall import memory_scope
                 from .consolidator import read_scoped_memories

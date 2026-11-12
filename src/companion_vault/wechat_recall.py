@@ -156,8 +156,11 @@ async def build_quote_context_async(
         from .asset_pipeline import AssetPipeline
         from .quote_recall import recall_quotes, recall_message_attachments, load_original_descriptors
 
+        ledger_file = Path(ledger_path)
+        if not ledger_file.is_file():
+            return "", []
         db = CompanionTruthDB(db_path)
-        ledger = sqlite3.connect(Path(ledger_path).resolve().as_uri() + "?mode=ro", uri=True)
+        ledger = sqlite3.connect(ledger_file.resolve().as_uri() + "?mode=ro", uri=True)
         assets = AssetPipeline(db, os.environ.get("MAIBOT_ASSET_SPOOL", "data/companion_assets"))
         client = None
         blocks = []
@@ -446,6 +449,12 @@ def _append_descriptor_part(builder, part: Dict[str, Any]) -> None:
         builder.add_image_base64_part(
             image_format=part.get("image_format", "jpeg"),
             image_base64=part["image_base64"],
+        )
+    elif "audio_base64" in part:
+        builder.add_audio_base64_part(
+            audio_base64=part["audio_base64"],
+            mime_type=part.get("mime_type", "audio/wav"),
+            file_code=part.get("file_code", ""),
         )
     else:
         builder.add_file_uri_part(part["file_uri"], part["mime_type"], part["file_code"])

@@ -2,7 +2,7 @@ import json
 import sqlite3
 
 from src.phone_edge.notification_queue import read_notifications
-from src.mobile_agent.notification_router import NotificationInbox
+from src.phone_edge.notification_inbox import NotificationInbox
 
 
 def event(seq, key, title, text, fields=None):

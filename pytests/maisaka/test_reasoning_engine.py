@@ -601,7 +601,24 @@ def test_companion_truth_person_profile_unification(tmp_path) -> None:
     conn.commit()
     conn.close()
 
-    hit = _query_companion_truth_profile("wechat", "wxid_test_owner", "", db_path=str(db_file))
+    # 默认 Fail-Closed (is_group_chat=True) 屏蔽私密 impression，仅暴露公开简介
+    hit_group_default = _query_companion_truth_profile("wechat", "wxid_test_owner", "", db_path=str(db_file))
+    assert hit_group_default is not None
+    display_name_g, profile_text_g = hit_group_default
+    assert display_name_g == "paff"
+    assert "OWNER" in profile_text_g
+    assert "麦麦的创造者与主人" in profile_text_g
+    assert "亲近信任的创造者" not in profile_text_g
+
+    # OWNER 私聊 (is_group_chat=False) 正常挂载私密 impression
+    hit = _query_companion_truth_profile(
+        "wechat",
+        "wxid_test_owner",
+        "",
+        db_path=str(db_file),
+        is_group_chat=False,
+        requester_user_id="wxid_test_owner",
+    )
     assert hit is not None
     display_name, profile_text = hit
     assert display_name == "paff"
@@ -610,15 +627,38 @@ def test_companion_truth_person_profile_unification(tmp_path) -> None:
     assert "麦麦的创造者与主人" in profile_text
 
     class DummyToolCtx:
+        def __init__(self, *, is_group_session: bool = True, platform: str = "", user_id: str = ""):
+            self.runtime = SimpleNamespace(
+                chat_stream=SimpleNamespace(
+                    is_group_session=is_group_session,
+                    platform=platform,
+                    user_id=user_id,
+                )
+            )
+
         def build_success_result(self, tool_name, content, *, structured_content=None):
             return SimpleNamespace(success=True, tool_name=tool_name, content=content, structured_content=structured_content)
 
         def build_failure_result(self, tool_name, error_message, *, structured_content=None):
             return SimpleNamespace(success=False, tool_name=tool_name, error_message=error_message, structured_content=structured_content)
 
+    # 群聊 / 未鉴权默认上下文：物理屏蔽私密 impression
+    res_group = asyncio.run(
+        handle_query_person_profile(
+            DummyToolCtx(is_group_session=True, platform="wechat", user_id="wxid_other"),
+            ToolInvocation(
+                tool_name="query_person_profile",
+                arguments={"person_name": "paff", "db_path": str(db_file)},
+            ),
+        )
+    )
+    assert res_group.success is True
+    assert "亲近信任的创造者" not in res_group.content
+
+    # OWNER 本人私聊上下文：允许读取私密 impression
     res = asyncio.run(
         handle_query_person_profile(
-            DummyToolCtx(),
+            DummyToolCtx(is_group_session=False, platform="wechat", user_id="wxid_test_owner"),
             ToolInvocation(
                 tool_name="query_person_profile",
                 arguments={"person_name": "paff", "db_path": str(db_file)},

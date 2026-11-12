@@ -319,7 +319,9 @@ def test_unified_greenlight_asset_pipeline_descriptors(tmp_path, monkeypatch):
             )
 
     closed = []
-    factory = lambda: SimpleNamespace(files=FakeFiles(), close=lambda: closed.append(True))
+
+    def factory():
+        return SimpleNamespace(files=FakeFiles(), close=lambda: closed.append(True))
 
     async def load(codes, use_factory=True):
         return await load_reply_greenlights_async(

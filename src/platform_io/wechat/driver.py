@@ -4,8 +4,11 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 import asyncio
 import hashlib
+import json
 import logging
 import os
+import re
+import sqlite3
 import time
 
 from src.companion_vault.group_members import sync_chat_directory_async
@@ -21,7 +24,7 @@ from src.platform_io.types import (
 
 from .edge_client import WeChatEdgeClient
 from .ledger_source import LedgerSource
-from .projection import enrich_record_from_truth_db, project_message
+from .projection import enrich_record_from_truth_db, native_message_id, project_message
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +109,35 @@ class WeChatRootDriver(PlatformIODriver):
         self._poll_task: Optional[asyncio.Task[None]] = None
         self._directory_sync_ts: Dict[str, float] = {}
         self._group_names: Dict[str, str] = {}
+        self._revoke_handler: Optional[Any] = None
+
+    def set_revoke_handler(self, handler: Optional[Any]) -> None:
+        """注册可选的撤回回调钩子（供单测或上层监听）。"""
+        self._revoke_handler = handler
+
+    async def revoke_committed(self, *, chat_id: str, msg_id: str) -> bool:
+        """将账本观测到的微信撤回修订同步至活跃会话 Runtime，剔除防抖队列与 _chat_history。"""
+        clean_mid = str(msg_id or "").strip()
+        if not clean_mid:
+            return False
+        ext_id = native_message_id(self.edge.source, self.edge.account, clean_mid)
+        revoked_any = False
+        if callable(self._revoke_handler):
+            res = self._revoke_handler(ext_id)
+            if asyncio.iscoroutine(res):
+                res = await res
+            revoked_any = bool(res) or revoked_any
+        try:
+            from src.chat.heart_flow.heartflow_manager import heartflow_manager
+
+            for runtime in list(heartflow_manager.heartflow_chat_list.values()):
+                revoke_fn = getattr(runtime, "revoke_message", None)
+                if callable(revoke_fn):
+                    if await revoke_fn(ext_id):
+                        revoked_any = True
+        except Exception as exc:
+            logger.debug("WeChat revoke sync skipped: %s", exc)
+        return revoked_any
 
     def _is_chat_allowed(self, chat_id: Optional[str]) -> bool:
         if not chat_id:
@@ -183,7 +215,7 @@ class WeChatRootDriver(PlatformIODriver):
     async def send_message(
         self, message, route_key: RouteKey, metadata: Optional[Dict[str, Any]] = None
     ) -> DeliveryReceipt:
-        from src.mobile_agent.wechat_text import format_for_wechat
+        from .wechat_text import format_for_wechat
 
         try:
             from src.common.data_models.message_component_data_model import ReplyComponent, TextComponent
@@ -241,8 +273,15 @@ class WeChatRootDriver(PlatformIODriver):
                 status=DeliveryStatus.FAILED,
                 error="Only text transport verified; never silently discard attachments/replies",
             )
+        reply_comp = next((c for c in components if _is_reply(c)), None)
+        quote_target: Optional[Dict[str, Any]] = None
+        if reply_comp and self.ledger_path:
+            quote_target = self._resolve_quote_target(reply_comp, chat)
         try:
-            result = await self.edge.send_text(chat, text, message.message_id)
+            if quote_target:
+                result = await self.edge.send_quote(chat, text, quote_target, message.message_id)
+            else:
+                result = await self.edge.send_text(chat, text, message.message_id)
         except ValueError as exc:
             return DeliveryReceipt(**receipt, status=DeliveryStatus.FAILED, error=str(exc))
         return DeliveryReceipt(
@@ -251,6 +290,72 @@ class WeChatRootDriver(PlatformIODriver):
             external_message_id=str(result["msg_id"]) if result.get("msg_id") else None,
             metadata=result,
         )
+
+    def _resolve_quote_target(self, reply_comp: Any, chat: str) -> Optional[Dict[str, Any]]:
+        target_id_raw = getattr(reply_comp, "target_message_id", None)
+        if not target_id_raw or not self.ledger_path or not Path(self.ledger_path).exists():
+            return None
+        clean_id = target_id_raw.strip().lstrip("#")
+        parts = clean_id.split(":")
+        target_msg_id = parts[-1]
+        target_account = parts[-2] if len(parts) >= 3 else self.edge.account
+        if not target_msg_id.isdigit():
+            return None
+        try:
+            with sqlite3.connect(self.ledger_path) as conn:
+                conn.row_factory = sqlite3.Row
+                cur = conn.execute(
+                    "SELECT server_id, sender_id, body, updated_at_ms, row_json FROM messages WHERE account = ? AND msg_id = ?",
+                    (target_account, target_msg_id),
+                )
+                row = cur.fetchone()
+                if not row:
+                    cur = conn.execute(
+                        "SELECT server_id, sender_id, body, updated_at_ms, row_json FROM messages WHERE msg_id = ? ORDER BY updated_at_ms DESC LIMIT 1",
+                        (target_msg_id,),
+                    )
+                    row = cur.fetchone()
+                if not row or not row["server_id"] or str(row["server_id"]) == "0":
+                    return None
+                row_json = json.loads(row["row_json"]) if row["row_json"] else {}
+                createtime = (
+                    int(row["updated_at_ms"]) // 1000
+                    if row["updated_at_ms"]
+                    else int(row_json.get("createTime", 0)) // 1000
+                )
+                body = row["body"] or ""
+                if body.startswith("<?xml") and "<title>" in body:
+                    m = re.search(r"<title>(.*?)</title>", body, re.DOTALL)
+                    if m:
+                        body = m.group(1).strip()
+                sender_id = str(row["sender_id"] or "")
+                display_name = (
+                    getattr(reply_comp, "target_message_sender_cardname", None)
+                    or getattr(reply_comp, "target_message_sender_nickname", None)
+                )
+                if not display_name and self.truth_path and Path(self.truth_path).exists() and sender_id:
+                    try:
+                        with sqlite3.connect(self.truth_path) as truth_conn:
+                            tcur = truth_conn.execute(
+                                "SELECT wechat_remark, person_name FROM person_info WHERE platform_ids LIKE ?",
+                                (f"%{sender_id}%",),
+                            )
+                            tr = tcur.fetchone()
+                            if tr and (tr[0] or tr[1]):
+                                display_name = tr[0] or tr[1]
+                    except Exception:
+                        pass
+                return {
+                    "server_id": str(row["server_id"]),
+                    "talker": chat,
+                    "sender_id": sender_id,
+                    "display_name": display_name or sender_id,
+                    "content": body[:200],
+                    "createtime": createtime,
+                }
+        except Exception as e:
+            logger.warning("Failed to resolve quote target for %s: %s", target_id_raw, e)
+            return None
 
 
 def configured_wechat_drivers(config_path: str) -> list[WeChatRootDriver]:

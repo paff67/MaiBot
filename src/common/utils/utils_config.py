@@ -67,11 +67,14 @@ class JargonConfigUtils:
 
     @staticmethod
     def resolve_jargon_group_scope(session_id: Optional[str]) -> tuple[set[str], bool]:
-        """解析当前会话可共享黑话的会话范围，以及是否命中全平台全目标通配。"""
+        """解析当前会话可共享黑话的会话范围（硬性守卫：私聊会话严禁进入跨会话共享池，群聊严禁读取私聊来源）。"""
         related_session_ids = {session_id} if session_id else set()
         has_global_share = False
         if not session_id:
             return related_session_ids, has_global_share
+
+        if ChatConfigUtils.is_private_session_id(session_id):
+            return {session_id}, False
 
         for jargon_group in global_config.jargon.jargon_groups:
             target_items = jargon_group.targets
@@ -94,6 +97,9 @@ class JargonConfigUtils:
             if contains_current_session:
                 related_session_ids.update(group_session_ids)
 
+        private_ids = ChatConfigUtils.collect_known_private_session_ids()
+        related_session_ids.difference_update(private_ids)
+        related_session_ids.add(session_id)
         return related_session_ids, has_global_share
 
 
@@ -396,6 +402,56 @@ class ChatConfigUtils:
             return chat_stream_platform == platform and chat_stream_target_id == item_id
 
         return session_id in ChatConfigUtils.resolve_existing_session_ids(platform, item_id, rule_type)
+
+    @staticmethod
+    def is_private_session_id(session_id: Optional[str]) -> bool:
+        """判断给定 session_id 是否为私聊会话（内存会话与数据库 ChatSession 双重核验）。"""
+        clean_sid = str(session_id or "").strip()
+        if not clean_sid:
+            return False
+
+        chat_stream = ChatConfigUtils._get_existing_chat_stream(clean_sid)
+        if chat_stream is not None:
+            return not bool(chat_stream.is_group_session)
+
+        try:
+            from sqlmodel import select
+            from src.common.database.database import get_db_session
+            from src.common.database.database_model import ChatSession
+
+            with get_db_session(auto_commit=False) as session:
+                row = session.exec(select(ChatSession).where(ChatSession.session_id == clean_sid).limit(1)).first()
+                if row is not None:
+                    return not bool(str(row.group_id or "").strip())
+        except Exception as exc:
+            logger.debug(f"判断私聊会话类型失败: session_id={clean_sid} error={exc}")
+        return False
+
+    @staticmethod
+    def collect_known_private_session_ids() -> set[str]:
+        """收集当前已知的全部私聊 session_id，供群聊选择器执行物理剔除。"""
+        private_ids: set[str] = set()
+        try:
+            from src.chat.message_receive.chat_manager import chat_manager
+
+            for chat_stream in chat_manager.sessions.values():
+                if not bool(chat_stream.is_group_session) and str(chat_stream.session_id or "").strip():
+                    private_ids.add(str(chat_stream.session_id).strip())
+        except Exception as exc:
+            logger.debug(f"收集内存私聊会话失败: error={exc}")
+
+        try:
+            from sqlmodel import select
+            from src.common.database.database import get_db_session
+            from src.common.database.database_model import ChatSession
+
+            with get_db_session(auto_commit=False) as session:
+                for row in session.exec(select(ChatSession)).all():
+                    if not str(row.group_id or "").strip() and str(row.session_id or "").strip():
+                        private_ids.add(str(row.session_id).strip())
+        except Exception as exc:
+            logger.debug(f"收集数据库私聊会话失败: error={exc}")
+        return private_ids
 
     @staticmethod
     def target_matches_session_with_wildcards(
