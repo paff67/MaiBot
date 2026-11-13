@@ -1,10 +1,10 @@
 #!/system/bin/sh
 set -eu
 
-echo -1000 > /proc/$$/oom_score_adj
-sysctl -w fs.inotify.max_user_watches=131072
-settings put secure accessibility_enabled 0
-settings put secure enabled_accessibility_services ""
+echo -1000 > /proc/$$/oom_score_adj || true
+sysctl -w fs.inotify.max_user_watches=131072 || true
+settings put secure accessibility_enabled 0 || true
+settings put secure enabled_accessibility_services "" || true
 
 backlight_off() {
     echo 0 > /sys/class/backlight/panel0-backlight/brightness
