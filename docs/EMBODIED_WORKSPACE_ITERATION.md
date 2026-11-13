@@ -544,7 +544,8 @@ python3 -m compileall -q plugins/embodied_workspace
 | **Phase 2** | `feat/embodied-workspace-phase2` | `c82ba349d` | 单级泛域名、CF Pages 边缘 2A 跳板、真值库 8 表 Schema 严格对齐、四级无感身份接力（抗预取）、FUSE 归档直写与 5 项专项测试。 | `agy` (Antigravity) |
 | **Phase 3** | `feat/embodied-workspace-phase3` | `f97f6a4ce` / `fc4f9a693` | cgroups v2 硬隔离包装器、宿主独立 Git 时光机双目录快照与回滚、群组全双工 WebSocket 实时总线、bwrap 内 AGY CLI 配置。 | `agy` (Antigravity) |
 | **Mention Fix** | `feat/wechat-at-mention-identity-fix` | `52afe283f` / `03eb454fc` | 微信群聊 @mention XML 提取、昵称与备注名解耦双保留、RBAC 群聊脱敏花名册注入与 AppMsg 57 引用回复秒级降级兜底。 | `agy` (Antigravity) |
-| **Phase 4** | `feat/embodied-workspace-phase4-twins` | `71a37c6eb` .. `2bbcae1d4` | 统一慢轨三类交付、杂志级排版套件、算力经济监控去硬编码、3 小时超时与快轨进度汇报、联网 Grounding 及内联音频 `audio_base64` 回退。 | `agy` / Cline Audit |
+| **Phase 4** | `feat/embodied-workspace-phase4-twins` | `71a37c6eb` .. `9b054f781` | 统一慢轨三类交付、杂志级排版套件、算力经济监控去硬编码、四道物理记忆防串线（`LEAK-01`~`06` 清零）、内联音频 `audio_base64` 回退并合入 `main`。 | `agy` / Cline Audit |
+| **Phase 5 (ST & Twins)** | `feat/twins-st-preset-engine` | Merged to `main` | SillyTavern 预设注入引擎（`STPresetEngine`，含 `Meowssiah-2.0.11` 工具信封与 `/v1`·`/v1beta` 自适应协议）、双子 LLM 动态叙事路由器（`TwinNarrativeDirector`）及 MaiBot v2 原生 WebUI 插件（`plugins/st_preset_engine`：`@HomeCard` + `webui.json` 工作台）。 | Cline Architect |
 
 
 ---

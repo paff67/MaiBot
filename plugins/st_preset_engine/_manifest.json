@@ -1,0 +1,29 @@
+{
+  "manifest_version": 2,
+  "id": "maibot-team.st-preset-engine",
+  "name": "ST 酒馆预设引擎与双子叙事工作台",
+  "version": "1.0.0",
+  "description": "在 MaiBot 原生 WebUI 中提供首页状态卡片、SillyTavern 预设在线编辑与编译预览，以及双子动态离场/回归叙事方向配置",
+  "author": {
+    "name": "MaiBot Architect",
+    "url": "https://github.com/paff67/MaiBot"
+  },
+  "license": "GPL-v3.0-or-later",
+  "urls": {
+    "repository": "https://github.com/paff67/MaiBot"
+  },
+  "host_application": {
+    "min_version": "1.3.0",
+    "max_version": "1.3.99"
+  },
+  "sdk": {
+    "min_version": "2.0.0",
+    "max_version": "2.99.99"
+  },
+  "dependencies": [],
+  "capabilities": [],
+  "i18n": {
+    "default_locale": "zh-CN",
+    "supported_locales": ["zh-CN"]
+  }
+}

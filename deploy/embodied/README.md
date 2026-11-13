@@ -25,6 +25,10 @@
 5. **全能动态沙盒工作区与限时子域交付（`plugins/embodied_workspace`）**：
    - 统一收敛至异步慢轨工具 `run_agent_workspace`（支持 `document` 杂志级长文、`webapp` 交互式单页、`backend` Scale-to-Zero 临时后端），最长达 3 小时（10800s）执行窗口并由快轨模型按人设周期播报客观进展。
    - 采用 Bubblewrap (`bwrap`) 只读根命名空间 + `systemd-run --scope` cgroups v2 资源硬配额 + 宿主侧外部 Git 时光机快照回滚 + 单级泛域名网关（`:18790`）与四级免登身份接力 + 全双工 WebSocket 实时协作总线。
+6. **SillyTavern 酒馆预设引擎、双子动态叙事路由与原生 WebUI 工作台（`st_preset_engine`）**：
+   - [`src/companion_vault/st_preset_engine.py`](../../src/companion_vault/st_preset_engine.py) 无损编译社区 SillyTavern 预设（支持 `Meowssiah-2.0.11.json` 零 System Prompt `soliumbra_reply` 工具信封协议与标准 `@D` 轮次深度插槽，并根据 `/v1` OpenAI 通道与 `/v1beta` Gemini 通道自动选择最佳载荷模式）；
+   - [`src/companion_vault/twin_narrative_router.py`](../../src/companion_vault/twin_narrative_router.py) 由 LLM 结合东京实时时间、近期对话语境、算力水位与可编辑方向约束 Prompt 动态生成姐姐离场、场外演进与回归衔接叙事；
+   - [`plugins/st_preset_engine/`](../../plugins/st_preset_engine/) 基于 MaiBot v2 原生 `@HomeCard` 与 `webui.json`（`schema_version: 2`）在原生 WebUI 首页注册卡片、顶部工作区概览卡片页与侧边栏在线编辑/实时编译预览工作台。
 
 ---
 

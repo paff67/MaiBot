@@ -1,0 +1,147 @@
+{
+  "schema_version": 2,
+  "required_capabilities": ["declarative_basic", "custom_pages", "structured_arguments"],
+  "workspace_title": "ST 预设引擎",
+  "pages": [
+    {
+      "id": "overview",
+      "title": "ST 预设与双子概览",
+      "description": "展示 STPresetEngine 激活状态、双子预设映射与已加载预设条目统计卡片。",
+      "placement": "workspace",
+      "mode": "declarative",
+      "icon": "chart",
+      "queries": {
+        "summary": { "api": "webui_summary", "version": "1" }
+      },
+      "actions": {
+        "toggle_engine": {
+          "api": "webui_quick_toggle",
+          "version": "1",
+          "parameters": { "enabled": { "type": "boolean", "required": true } }
+        }
+      },
+      "content": [
+        {
+          "type": "grid",
+          "columns": 4,
+          "children": [
+            { "type": "stat", "label": "引擎接管状态", "value": { "source": "summary", "field": "enabled_label" } },
+            { "type": "stat", "label": "当前激活预设", "value": { "source": "summary", "field": "active_preset_label" } },
+            { "type": "stat", "label": "预设编译协议", "value": { "source": "summary", "field": "protocol_label" } },
+            { "type": "stat", "label": "已导入预设数", "value": { "source": "summary", "field": "preset_count" } }
+          ]
+        },
+        {
+          "type": "card",
+          "label": "快速控制与双子预设绑定摘要",
+          "children": [
+            { "type": "text", "value": { "source": "summary", "field": "binding_summary" } },
+            { "type": "switch", "name": "enabled", "label": "启用 STPresetEngine 全局接管", "value": true },
+            { "type": "button", "label": "应用开关状态", "action": "toggle_engine" }
+          ]
+        },
+        {
+          "type": "card",
+          "label": "当前预设条目一览",
+          "children": [
+            {
+              "type": "table",
+              "value": { "source": "summary", "field": "entry_rows" },
+              "columns": [
+                { "field": "order_index", "label": "顺序" },
+                { "field": "name", "label": "条目名称" },
+                { "field": "state_text", "label": "状态" },
+                { "field": "group_text", "label": "分组 / 角色" }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "studio",
+      "title": "ST 预设与叙事工作台",
+      "description": "在线导入编辑 SillyTavern 预设条目、调整双子动态离场/回归约束 Prompt 并实时预览编译结果。",
+      "placement": "sidebar",
+      "mode": "custom",
+      "layout": "document",
+      "icon": "settings",
+      "entry": "webui/studio.html",
+      "queries": {
+        "status": { "api": "webui_status", "version": "1" },
+        "inspect": {
+          "api": "webui_inspect_preset",
+          "version": "1",
+          "parameters": { "preset_name": { "type": "string", "required": true, "max_length": 120 } }
+        }
+      },
+      "actions": {
+        "save_config": {
+          "api": "webui_save_config",
+          "version": "1",
+          "parameters": {
+            "enabled": { "type": "boolean", "required": true },
+            "active_preset": { "type": "string", "max_length": 120 },
+            "sister_elder_preset": { "type": "string", "max_length": 120 },
+            "output_mode": { "type": "string", "choices": ["im_clean", "raw_preset"] },
+            "away_direction_prompt": { "type": "string", "max_length": 8000 },
+            "evolve_direction_prompt": { "type": "string", "max_length": 8000 },
+            "return_direction_prompt": { "type": "string", "max_length": 8000 }
+          }
+        },
+        "update_entry": {
+          "api": "webui_update_entry",
+          "version": "1",
+          "parameters": {
+            "preset_name": { "type": "string", "required": true, "max_length": 120 },
+            "identifier": { "type": "string", "required": true, "max_length": 120 },
+            "enabled": { "type": "boolean" },
+            "name": { "type": "string", "max_length": 200 },
+            "role": { "type": "string", "choices": ["system", "user", "assistant"] },
+            "injection_position": { "type": "integer", "minimum": 0, "maximum": 1 },
+            "injection_depth": { "type": "integer", "minimum": 0, "maximum": 50 },
+            "scope_guard": { "type": "string", "choices": ["all", "owner_only", "group_only"] },
+            "content": { "type": "string", "max_length": 60000 }
+          }
+        },
+        "reorder_entries": {
+          "api": "webui_reorder_entries",
+          "version": "1",
+          "parameters": {
+            "preset_name": { "type": "string", "required": true, "max_length": 120 },
+            "ordered_identifiers": {
+              "type": "array",
+              "required": true,
+              "max_items": 200,
+              "items": { "type": "string", "max_length": 120 }
+            }
+          }
+        },
+        "import_preset_raw": {
+          "api": "webui_import_preset_raw",
+          "version": "1",
+          "parameters": {
+            "name": { "type": "string", "required": true, "max_length": 120 },
+            "raw_json_str": { "type": "string", "required": true, "max_length": 65536 }
+          }
+        },
+        "import_local_path": {
+          "api": "webui_import_local_path",
+          "version": "1",
+          "parameters": {
+            "file_path": { "type": "string", "required": true, "max_length": 500 },
+            "alias_name": { "type": "string", "max_length": 120 }
+          }
+        },
+        "preview_compile": {
+          "api": "webui_preview_compile",
+          "version": "1",
+          "parameters": {
+            "preset_name": { "type": "string", "required": true, "max_length": 120 },
+            "last_user_message": { "type": "string", "required": true, "max_length": 4000 }
+          }
+        }
+      }
+    }
+  ]
+}

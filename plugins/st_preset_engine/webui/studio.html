@@ -1,0 +1,264 @@
+<style>
+  :root {
+    --panel: rgba(128, 128, 128, 0.08);
+    --border: rgba(128, 128, 128, 0.22);
+    --accent: #6366f1;
+    --muted: rgba(128, 128, 128, 0.85);
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 14px; font-family: system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 13px; }
+  .layout { display: grid; grid-template-columns: 340px 1fr; gap: 14px; }
+  @media (max-width: 900px) { .layout { grid-template-columns: 1fr; } }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px; margin-bottom: 14px; }
+  h3 { margin: 0 0 10px 0; font-size: 14px; }
+  label { display: block; font-size: 12px; opacity: 0.8; margin: 8px 0 4px; }
+  input[type="text"], select, textarea {
+    width: 100%; padding: 7px 9px; border-radius: 7px; border: 1px solid var(--border);
+    background: transparent; color: inherit; font-size: 13px;
+  }
+  textarea { font-family: Consolas, monospace; min-height: 100px; resize: vertical; }
+  button {
+    background: var(--accent); color: #fff; border: none; border-radius: 7px;
+    padding: 6px 12px; font-size: 12px; font-weight: 600; cursor: pointer;
+  }
+  button.sec { background: rgba(128, 128, 128, 0.25); color: inherit; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .entry {
+    display: flex; justify-content: space-between; align-items: center; gap: 6px;
+    padding: 7px 9px; border: 1px solid var(--border); border-radius: 7px; margin-bottom: 5px; cursor: pointer;
+  }
+  .entry.active { border-color: var(--accent); background: rgba(99, 102, 241, 0.1); }
+  .tag { font-size: 11px; padding: 2px 6px; border-radius: 4px; border: 1px solid var(--border); }
+  pre {
+    background: rgba(0, 0, 0, 0.2); border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px; max-height: 360px; overflow: auto; white-space: pre-wrap; font-size: 12px;
+  }
+</style>
+
+<div class="layout">
+  <div>
+    <div class="card">
+      <h3>1. 预设库与全局接管开关 <span id="status-tag" class="tag">连接中...</span></h3>
+      <div class="row" style="margin-bottom:6px">
+        <input type="checkbox" id="cfg-enabled" />
+        <span>全局启用 STPresetEngine 接管</span>
+      </div>
+      <label>当前激活预设（妹妹 / 默认）</label>
+      <select id="cfg-active"></select>
+      <label>姐姐（Argon）专属预设（留空则共用）</label>
+      <input id="cfg-elder" type="text" placeholder="可选预设名" />
+      <label>输出解包模式</label>
+      <select id="cfg-outmode">
+        <option value="im_clean">im_clean（提取纯净正文供微信发送）</option>
+        <option value="raw_preset">raw_preset（保留 think_nya / game / summary）</option>
+      </select>
+      <label>从服务器本地路径导入预设（如 E:\Downloads\Meowssiah-2.0.11.json）</label>
+      <div class="row">
+        <input id="imp-path" type="text" placeholder="服务器本地 .json 完整路径" style="flex:1" />
+        <button class="sec" id="btn-imp-path">路径导入</button>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <button id="btn-save-cfg">保存引擎配置</button>
+        <button class="sec" id="btn-refresh">刷新</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>2. 预设条目列表（勾选启停 / 点击编辑）</h3>
+      <div id="entries-box" style="max-height:500px;overflow-y:auto"></div>
+    </div>
+  </div>
+
+  <div>
+    <div class="card">
+      <h3>条目在线编辑器 <span id="ed-id" class="tag">未选择</span></h3>
+      <div class="row">
+        <div style="flex:2"><label>条目名称</label><input id="ed-name" type="text" /></div>
+        <div style="flex:1"><label>Role</label><select id="ed-role"><option>system</option><option>user</option><option>assistant</option></select></div>
+        <div style="flex:1"><label>位置</label><select id="ed-pos"><option value="0">0-相对</option><option value="1">1-@D深度</option></select></div>
+        <div style="flex:1"><label>Depth</label><input id="ed-depth" type="text" value="4" /></div>
+        <div style="flex:1"><label>隐私守卫</label><select id="ed-guard"><option value="all">all</option><option value="owner_only">owner_only</option><option value="group_only">group_only</option></select></div>
+      </div>
+      <label>条目正文</label>
+      <textarea id="ed-content" style="min-height:150px"></textarea>
+      <div class="row" style="margin-top:8px">
+        <button id="btn-save-entry">保存条目修改</button>
+        <button class="sec" id="btn-up">↑ 上移</button>
+        <button class="sec" id="btn-down">↓ 下移</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>3. 双子离场 / 演进 / 回归 LLM 动态方向约束 Prompt</h3>
+      <label>跌破阈值（&lt; 3 USD）姐姐动态离场约束</label>
+      <textarea id="tw-away"></textarea>
+      <label>妹妹值班期间场外状态演进约束</label>
+      <textarea id="tw-evolve"></textarea>
+      <label>经费恢复后姐姐自然回归衔接约束</label>
+      <textarea id="tw-return"></textarea>
+      <div style="margin-top:8px"><button id="btn-save-twin">保存双子动态叙事约束</button></div>
+    </div>
+
+    <div class="card">
+      <h3>4. 实时编译请求结构预览（Dry-Run Inspector）</h3>
+      <div class="row">
+        <input id="pv-msg" type="text" value="夜深了，刚洗完澡出来，过来坐近一点陪我待会儿。" style="flex:1" />
+        <button id="btn-preview">编译预览</button>
+      </div>
+      <pre id="pv-out">点击“编译预览”查看真实 ContextItem 与工具信封载荷...</pre>
+    </div>
+  </div>
+</div>
+<script>
+  const $ = (id) => document.getElementById(id);
+  let curPreset = "", curEntries = [], curIdx = -1;
+  const setTag = (t) => { $("status-tag").textContent = t; };
+
+  async function refreshAll() {
+    setTag("同步中...");
+    const st = await window.maibot.query("status", {});
+    const cfg = st.engine_config || {};
+    $("cfg-enabled").checked = !!cfg.enabled;
+    $("cfg-elder").value = cfg.sister_elder_preset || "";
+    $("cfg-outmode").value = cfg.output_mode || "im_clean";
+    const sel = $("cfg-active");
+    sel.innerHTML = "";
+    const presets = st.available_presets || [];
+    presets.forEach((p) => {
+      const opt = document.createElement("option");
+      opt.value = p; opt.textContent = p;
+      sel.appendChild(opt);
+    });
+    curPreset = cfg.active_preset || presets[0] || "";
+    if (curPreset) sel.value = curPreset;
+    const tw = (st.twin_narrative && st.twin_narrative.config) || {};
+    $("tw-away").value = tw.away_direction_prompt || "";
+    $("tw-evolve").value = tw.evolve_direction_prompt || "";
+    $("tw-return").value = tw.return_direction_prompt || "";
+    if (curPreset) await loadPreset(curPreset);
+    setTag("已就绪");
+  }
+
+  async function loadPreset(name) {
+    curPreset = name;
+    const data = await window.maibot.query("inspect", { preset_name: name });
+    curEntries = data.entries || [];
+    renderEntries();
+    if (curEntries.length && (curIdx < 0 || curIdx >= curEntries.length)) selectEntry(0);
+    else if (curIdx >= 0 && curIdx < curEntries.length) selectEntry(curIdx);
+  }
+
+  function renderEntries() {
+    const box = $("entries-box");
+    box.innerHTML = "";
+    curEntries.forEach((e, idx) => {
+      const row = document.createElement("div");
+      row.className = "entry" + (idx === curIdx ? " active" : "");
+      const left = document.createElement("div"); left.className = "row";
+      const chk = document.createElement("input"); chk.type = "checkbox"; chk.checked = !!e.enabled;
+      chk.onclick = async (ev) => {
+        ev.stopPropagation();
+        const res = await window.maibot.action("update_entry", { preset_name: curPreset, identifier: e.identifier, enabled: chk.checked });
+        curEntries = res.preset.entries; renderEntries();
+      };
+      const title = document.createElement("span"); title.textContent = `${idx + 1}. ${e.name}`;
+      left.appendChild(chk); left.appendChild(title);
+      const tag = document.createElement("span"); tag.className = "tag";
+      tag.textContent = e.control_group ? `互斥:${e.control_group}` : e.role;
+      row.appendChild(left); row.appendChild(tag);
+      row.onclick = () => selectEntry(idx);
+      box.appendChild(row);
+    });
+  }
+
+  function selectEntry(idx) {
+    curIdx = idx; const e = curEntries[idx]; if (!e) return;
+    $("ed-id").textContent = e.identifier;
+    $("ed-name").value = e.name || ""; $("ed-role").value = e.role || "system";
+    $("ed-pos").value = String(e.injection_position || 0);
+    $("ed-depth").value = String(e.injection_depth ?? 4);
+    $("ed-guard").value = e.scope_guard || "all";
+    $("ed-content").value = e.content || "";
+    renderEntries();
+  }
+  $("cfg-active").onchange = (ev) => { if (ev.target.value) loadPreset(ev.target.value); };
+  $("btn-refresh").onclick = () => refreshAll();
+
+  $("btn-save-cfg").onclick = async () => {
+    await window.maibot.action("save_config", {
+      enabled: $("cfg-enabled").checked,
+      active_preset: $("cfg-active").value || "",
+      sister_elder_preset: $("cfg-elder").value.trim(),
+      output_mode: $("cfg-outmode").value,
+    });
+    setTag("引擎配置已保存");
+  };
+
+  $("btn-imp-path").onclick = async () => {
+    const p = $("imp-path").value.trim();
+    if (!p) return;
+    setTag("正在导入...");
+    const res = await window.maibot.action("import_local_path", { file_path: p });
+    await refreshAll();
+    if (res.preset_name) {
+      $("cfg-active").value = res.preset_name;
+      await loadPreset(res.preset_name);
+    }
+    setTag(`已导入 ${res.preset_name}`);
+  };
+
+  $("btn-save-entry").onclick = async () => {
+    if (curIdx < 0 || !curPreset) return;
+    const e = curEntries[curIdx];
+    const res = await window.maibot.action("update_entry", {
+      preset_name: curPreset,
+      identifier: e.identifier,
+      name: $("ed-name").value,
+      role: $("ed-role").value,
+      injection_position: parseInt($("ed-pos").value, 10) || 0,
+      injection_depth: parseInt($("ed-depth").value, 10) || 0,
+      scope_guard: $("ed-guard").value,
+      content: $("ed-content").value,
+    });
+    curEntries = res.preset.entries;
+    renderEntries();
+    setTag("条目已保存");
+  };
+
+  async function moveEntry(delta) {
+    if (curIdx < 0 || !curPreset) return;
+    const target = curIdx + delta;
+    if (target < 0 || target >= curEntries.length) return;
+    const ids = curEntries.map((x) => x.identifier);
+    const tmp = ids[curIdx]; ids[curIdx] = ids[target]; ids[target] = tmp;
+    const res = await window.maibot.action("reorder_entries", { preset_name: curPreset, ordered_identifiers: ids });
+    curEntries = res.preset.entries;
+    selectEntry(target);
+  }
+  $("btn-up").onclick = () => moveEntry(-1);
+  $("btn-down").onclick = () => moveEntry(1);
+
+  $("btn-save-twin").onclick = async () => {
+    await window.maibot.action("save_config", {
+      enabled: $("cfg-enabled").checked,
+      active_preset: $("cfg-active").value || "",
+      sister_elder_preset: $("cfg-elder").value.trim(),
+      output_mode: $("cfg-outmode").value,
+      away_direction_prompt: $("tw-away").value,
+      evolve_direction_prompt: $("tw-evolve").value,
+      return_direction_prompt: $("tw-return").value,
+    });
+    setTag("双子动态约束已保存");
+  };
+
+  $("btn-preview").onclick = async () => {
+    if (!curPreset) return;
+    const res = await window.maibot.action("preview_compile", {
+      preset_name: curPreset,
+      last_user_message: $("pv-msg").value,
+    });
+    $("pv-out").textContent = JSON.stringify(res, null, 2);
+  };
+
+  window.maibot.ready.then(() => refreshAll()).catch((err) => setTag("桥接异常: " + err.message));
+</script>

@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field, replace
 from datetime import datetime
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Literal, Optional, Tuple
 
 import asyncio
 import random
@@ -37,8 +37,10 @@ from src.llm_models.payload_content.context_item import (
     CONTEXT_ITEM_SCHEMA_VERSION,
     ContextItem,
     ContextItemBuilder,
+    ContextTextPart,
     ReasoningItem,
     RoleType,
+    get_item_text,
     get_response_text,
     replace_output_projection,
 )
@@ -670,8 +672,109 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
         return global_config.debug.replyer_retro_prompt
 
     def _uses_st_preset_engine(self) -> bool:
-        """预留挂载点：与 _uses_retro_prompt 并列支持后续 STPresetEngine 一键热切。"""
-        return callable(getattr(self, "_st_preset_request_builder", None))
+        """当挂载了自定义构建器或在 STPresetRuntimeManager 中开启预设引擎时返回 True。"""
+        if callable(getattr(self, "_st_preset_request_builder", None)):
+            return True
+        try:
+            from src.companion_vault.st_preset_engine import get_st_preset_manager
+
+            eng, _ = get_st_preset_manager().get_active_engine()
+            return eng is not None
+        except Exception:
+            return False
+
+    def _compile_st_preset_for_replyer(
+        self,
+        *,
+        chat_history: List[LLMContextMessage],
+        reply_message: Optional[SessionMessage],
+        reply_reason: str,
+        expression_habits: str = "",
+        reply_requirements: str = "",
+        stream_id: Optional[str] = None,
+        enable_visual_message: bool = False,
+        reply_tool_args: Optional[Dict[str, Any]] = None,
+    ) -> List[ContextItem]:
+        from src.companion_vault.st_preset_engine import (
+            STCompileContext,
+            STHistoryTurn,
+            get_st_preset_manager,
+        )
+
+        args = reply_tool_args or {}
+        persona_slot = str(args.get("persona_slot") or "sister_younger").strip()
+        engine, cfg = get_st_preset_manager().get_active_engine(persona_slot=persona_slot)
+        if engine is None:
+            raise RuntimeError("STPresetEngine 未激活或未找到对应预设文件")
+
+        session_id = self._resolve_session_id(stream_id)
+        is_group_chat, _ = get_chat_type_and_target_info(session_id) if session_id else (False, None)
+        bot_name = global_config.bot.nickname or "许妍"
+        user_name = "群友" if is_group_chat else "你"
+        last_user_msg = ""
+        if reply_message is not None and reply_message.message_info and reply_message.message_info.user_info:
+            uinfo = reply_message.message_info.user_info
+            user_name = str(uinfo.user_cardname or uinfo.user_nickname or uinfo.user_id or user_name)
+            last_user_msg = str(reply_message.processed_plain_text or "").strip()
+
+        turns: List[STHistoryTurn] = []
+        raw_hist_items = self._build_history_messages(chat_history, enable_visual_message)
+        for item in raw_hist_items:
+            t_role: Literal["user", "assistant"] = "assistant" if item.role == RoleType.Assistant else "user"
+            t_text = get_item_text(item).strip()
+            m_parts = [p for p in getattr(item, "parts", ()) if not isinstance(p, ContextTextPart)]
+            if t_text or m_parts:
+                turns.append(STHistoryTurn(role=t_role, text=t_text, media_parts=m_parts))
+
+        if not last_user_msg and turns and turns[-1].role == "user":
+            last_user_msg = turns[-1].text
+
+        director_parts = [
+            self._build_reply_reference_message(reply_reason, str(args.get("reply_reference") or "")),
+            reply_requirements.strip(),
+            expression_habits.strip(),
+        ]
+        director_note = "\n".join(p for p in director_parts if p)
+
+        detected_client_type = "openai"
+        try:
+            from src.config.config import model_config as _mc
+
+            task_cfg = getattr(_mc.model_task_config, getattr(self.express_model, "task_name", "replyer"), None)
+            if task_cfg and getattr(task_cfg, "model_list", None):
+                first_model = _mc.get_model_info(task_cfg.model_list[0])
+                prov = _mc.get_provider(first_model.api_provider)
+                detected_client_type = str(getattr(prov, "client_type", "openai") or "openai").lower()
+        except Exception:
+            detected_client_type = "openai"
+
+        raw_proto = str(cfg.get("protocol_mode") or "auto").strip().lower()
+        proto_mode: Literal["auto", "spreset_tool_envelope", "standard_chat"] = (
+            raw_proto if raw_proto in {"auto", "spreset_tool_envelope", "standard_chat"} else "auto"
+        )
+
+        ctx = STCompileContext(
+            char_name=bot_name,
+            user_name=user_name,
+            char_description=self._build_personality_prompt(),
+            char_personality=self._select_reply_style(),
+            shujuku_recalled=str(args.get("_recalled_memory_block") or ""),
+            director_note=director_note,
+            chat_history=turns,
+            last_user_message=last_user_msg,
+            model_name=str(getattr(self.express_model, "task_name", "") or "gemini-3.8-flash"),
+            is_group_chat=bool(is_group_chat),
+            is_owner_private=not bool(is_group_chat),
+            oracle_mode="chat" if cfg.get("oracle_mode") == "chat" else "theater",
+            deep_think=bool(cfg.get("deep_think", False)),
+            output_mode="raw_preset" if cfg.get("output_mode") == "raw_preset" else "im_clean",
+            protocol_mode=proto_mode,
+            client_type=detected_client_type,
+        )
+        compiled = engine.compile_to_context_items(ctx)
+        self._last_st_compiled_request = compiled
+        self._last_st_output_mode = ctx.output_mode
+        return compiled.context_items
 
     @staticmethod
     def _build_recalled_messages(reply_tool_args: Optional[Dict[str, Any]]) -> List[ContextItem]:
@@ -718,10 +821,22 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
         reply_tool_args: Optional[Dict[str, Any]] = None,
         think_level: int = 1,
     ) -> List[ContextItem]:
-        # ST 预设引擎预留接管分支（默认未挂载时返回 False，零侵入现有路径）
+        # ST 预设引擎接管分支（默认未启用时返回 False，零侵入现有路径）
         if self._uses_st_preset_engine():
-            st_builder = self._st_preset_request_builder
-            return st_builder(
+            custom_builder = getattr(self, "_st_preset_request_builder", None)
+            if callable(custom_builder):
+                return custom_builder(
+                    chat_history=chat_history,
+                    reply_message=reply_message,
+                    reply_reason=reply_reason,
+                    expression_habits=expression_habits,
+                    reply_requirements=reply_requirements,
+                    stream_id=stream_id,
+                    enable_visual_message=enable_visual_message,
+                    reply_tool_args=reply_tool_args,
+                    think_level=think_level,
+                )
+            return self._compile_st_preset_for_replyer(
                 chat_history=chat_history,
                 reply_message=reply_message,
                 reply_reason=reply_reason,
@@ -730,7 +845,6 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
                 stream_id=stream_id,
                 enable_visual_message=enable_visual_message,
                 reply_tool_args=reply_tool_args,
-                think_level=think_level,
             )
 
         # 复古模式将人设与注意事项放在首条 system 消息，其余模板作为一条 user 消息发送
@@ -1054,7 +1168,15 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
             result.output_items = preview.payload["output_items"]
 
     def _build_generation_options(self, model_name: Optional[str]) -> LLMGenerationOptions:
-        """构建本次请求选项，供长文等专用 Replyer 明确指定生成模型。"""
+        """构建本次请求选项；若当前启用了 STPresetEngine 工具信封则自动附带工具声明与采样温度。"""
+        st_compiled = getattr(self, "_last_st_compiled_request", None)
+        if st_compiled is not None and self._uses_st_preset_engine():
+            return LLMGenerationOptions(
+                model_name=model_name,
+                tool_options=st_compiled.tool_definitions or None,
+                temperature=st_compiled.temperature,
+                max_tokens=st_compiled.max_tokens,
+            )
         return LLMGenerationOptions(model_name=model_name)
 
     async def generate_reply_with_context(
@@ -1347,6 +1469,16 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
             result.request_messages = serialize_context_items_snapshot(request_messages)
             llm_ms = round((time.perf_counter() - llm_started_at) * 1000, 2)
             response_text = (generation_result.response or "").strip()
+            if self._uses_st_preset_engine() and (generation_result.tool_calls or "<game" in response_text or "<think_nya" in response_text):
+                from src.companion_vault.st_preset_engine import STPresetEngine
+
+                unwrapped = STPresetEngine.unwrap_response(
+                    response_text=response_text,
+                    tool_calls=generation_result.tool_calls,
+                    output_mode=getattr(self, "_last_st_output_mode", "im_clean"),
+                )
+                if unwrapped.visible_text.strip():
+                    response_text = unwrapped.visible_text.strip()
             hook_original_response = response_text
             serialized_output_items = serialize_prompt_items(generation_result.output_items)
 

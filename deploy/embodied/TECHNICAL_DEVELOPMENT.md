@@ -1,7 +1,7 @@
 # 技术开发与架构规范文档（Technical Development & Architecture Specification）
 
-> **适用版本**：MaiBot `1.3.19`（活跃分支 `feat/embodied-workspace-phase4-twins`，底座分支 `feat/embodied-shujuku-v1`）
-> **最后更新**：2026-11-11
+> **适用版本**：MaiBot `1.3.19`（活跃开发分支 `feat/twins-st-preset-engine`，生产主干 `main` @ `9b054f781`）
+> **最后更新**：2026-11-13
 
 ---
 
@@ -59,7 +59,8 @@ flowchart LR
 | [`src/companion_vault/`](../../src/companion_vault/) | 真值记忆与资产层 | 运行于 `DMIT-US`。负责 8 张真值表管理（`truth_db.py`）、会话级 RBAC 权限校验（`access_policy.py`）、通讯录与群成员同步（`group_members.py`）、后台多表 SQL 记忆整合（`consolidator.py`）、消息媒体异步拉取入库（`message_media_worker.py`）、历史多模态原件就地挂载与引用召回（`wechat_recall.py`, `quote_recall.py`, `runtime_bridge.py`）。 |
 | [`src/maisaka/`](../../src/maisaka/) | 推理与工具核心层 | Maisaka Planner / Replyer 循环（`reasoning_engine.py`, `runtime.py`）、上下文确定性降级压缩（`context/compaction.py`）、历史多模态原位构建（`context/messages.py`）、内置工具与绿灯装载（`builtin_tool/reply.py`）。 |
 | [`plugins/embodied_workspace/`](../../plugins/embodied_workspace/) | 动态工作区与沙盒插件层 | 基于 `maibot-plugin-sdk` v2 的全栈交付系统：统一慢轨构建桥接（`cli_bridge.py`）、Bubblewrap + cgroups v2 资源配额（`resource_quota.py`）、Scale-to-Zero 后端监管（`backend_supervisor.py`）、单级泛域名路由与四级免登网关（`subdomain_router.py`, `gateway_server.py`）、外部 Git 时光机（`time_machine.py`）、全双工实时协作总线（`realtime_hub.py`）与算力经济监控（`compute_economy.py`）。 |
-| [`pytests/companion/`](../../pytests/companion/) | 专项测试套件 | 覆盖账本同步、媒体解析、群成员与私聊 RBAC 隔离、SQL 记忆巩固、引用召回、内联音频多模态回退、驱动迁移及具身工作区 Phase 1~4 的端到端单元测试。 |
+| [`plugins/st_preset_engine/`](../../plugins/st_preset_engine/) | 酒馆预设与双子叙事 WebUI 插件层 | 基于 MaiBot v2 原生 `@HomeCard` 与 `webui.json`（`schema_version: 2`），提供首页状态卡片、顶部工作区概览页及侧边栏 SillyTavern 预设在线编辑、互斥条目切换、双子动态叙事约束配置与 Dry-Run 编译预览工作台。 |
+| [`pytests/companion/`](../../pytests/companion/) | 专项测试套件 | 覆盖账本同步、媒体解析、群成员与私聊 RBAC 隔离、SQL 记忆巩固、引用召回、内联音频多模态回退、驱动迁移、具身工作区 Phase 1~4 以及 `STPresetEngine` 与原生插件 WebUI 的端到端单元测试。 |
 
 ---
 

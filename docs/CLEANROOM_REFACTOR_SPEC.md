@@ -196,6 +196,8 @@
      - **`dual_director`（双层导演模式，默认）**：Planner 完成 RP 心理推演后输出工具调用 `reply(persona_slot=..., reply_reference=...)` / `run_agent_workspace(...)` / `wait()`；Replyer 挂载演员侧 ST 预设直出微信口语气泡（彻底取代原生 `maisaka_generator_base.py` 末尾生硬的 6 连 User 说教块）。
      - **`one_pass_st`（Owner 可切换一步直出模式）**：单次模型请求内跑完完整 ST RP CoT 并直出 `<reply>...</reply>`，经 `regex_scripts` 后处理清洗后直接发送，实现零传话损耗的酒馆级沉浸私聊体验。
 
-### 3. 主干零侵入挂载点（预留对接位）
-- **Planner 侧**：`src/maisaka/chat_loop_service.py`（通过可插拔 `PromptComposer` 策略或 `maisaka.planner.before_request` 接管）；
-- **Replyer 侧**：`src/chat/replyer/maisaka_generator_base.py`（在 `_build_request_messages` 中与现有 `_uses_retro_prompt()` 并列增加 `_uses_st_preset_engine()` 分支，支持一键热切与回退对比）。
+### 3. 主干零侵入挂载点（已实装落地）
+- **核心预设引擎**：[`src/companion_vault/st_preset_engine.py`](../src/companion_vault/st_preset_engine.py)（`STPresetEngine` 与 `STPresetRuntimeManager`），支持 `Meowssiah-2.0.11.json` 零 System Prompt `soliumbra_reply` 工具信封协议与标准 `@D` 轮次深度插槽编译，并提供 `protocol_mode="auto"` 根据 `/v1` OpenAI 通道与 `/v1beta` Gemini 通道自动选择最佳载荷模式；
+- **双子 LLM 动态叙事路由器**：[`src/companion_vault/twin_narrative_router.py`](../src/companion_vault/twin_narrative_router.py)（`TwinNarrativeDirector`），由 LLM 结合东京时间（`Asia/Tokyo`）、算力水位、近期对话与可在线编辑的 3 段方向约束 Prompt 动态生成离场、演进与回归叙事；
+- **Replyer 侧无损接线**：[`src/chat/replyer/maisaka_generator_base.py`](../src/chat/replyer/maisaka_generator_base.py)（在 `_build_request_messages` 中与 `_uses_retro_prompt()` 并列提供 `_uses_st_preset_engine()` 分支，未启用时 100% 保持原装 Replyer 行为不变）；
+- **原生 WebUI 扩展插件**：[`plugins/st_preset_engine/`](../plugins/st_preset_engine/)，基于 MaiBot v2 原生 `@HomeCard` 与 `webui.json`（`schema_version: 2`）提供首页状态卡片、顶部工作区概览卡片页与侧边栏在线编辑/Dry-Run 编译预览工作台。
