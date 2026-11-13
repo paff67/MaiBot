@@ -1,7 +1,7 @@
 # 生产环境运维与排障手册（Production Operations & Troubleshooting Manual）
 
-> **最后更新**：2026-11-11
-> **活跃生产分支**：`feat/embodied-workspace-phase4-twins`（提交基线 `2bbcae1d4`）
+> **最后更新**：2026-11-13
+> **活跃生产分支**：`main`（包含 `embodied_workspace` Phase 1~4 净室重构、`STPresetEngine` 酒馆预设注入引擎、`TwinNarrativeDirector` 双子动态叙事路由与 `plugins/st_preset_engine` 原生 WebUI 工作台）
 > **生产微信账号目录哈希**：`4d86ac1b06dd252fa3c7327eb5614865`（`wxid_w5d0efdxczt322`）
 
 ---
@@ -209,7 +209,7 @@ PY'
 2. **同步代码至云端 `DMIT-US`**：
    > **规范提醒**：生产环境优先通过 Git 分支拉取（`git pull --ff-only`）保持提交可追溯；仅在单文件紧急验证时使用 `scp` 同步并务必回推 Git 分支。
    ```bash
-   ssh DMIT-US 'cd /opt/maibot-brain && git fetch origin && git checkout feat/embodied-workspace-phase4-twins && git pull --ff-only origin feat/embodied-workspace-phase4-twins'
+   ssh DMIT-US 'cd /opt/maibot-brain && git fetch origin && git checkout main && git pull --ff-only origin main'
    ```
 3. **如涉及手机边缘端（`src/phone_edge/`）变更，同步至小米 10**：
    ```bash
