@@ -1,10 +1,20 @@
 # 生产环境运维与排障手册（Production Operations & Troubleshooting Manual）
 
-> **最后更新**：2026-11-13
-> **活跃生产分支**：`main`（包含 `embodied_workspace` Phase 1~4 净室重构、`STPresetEngine` 酒馆预设注入引擎、`TwinNarrativeDirector` 双子动态叙事路由与 `plugins/st_preset_engine` 原生 WebUI 工作台）
-> **生产微信账号目录哈希**：`4d86ac1b06dd252fa3c7327eb5614865`（`wxid_w5d0efdxczt322`）
+> **最后更新**：2026-11-19
+> **生产版本边界**：运行目录不是 Git 工作树。不能用远端 `main` 的提交推定线上版本；以发布清单、文件摘要和服务探针为准。
+> **当前热修复**：`feat/phase6-twins-native-runtime` 上的 `ed77a1304`；本次仅发布该提交中的 9 个运行时文件，不含测试和前端产物。
 
 ---
+
+## 2026-11-19 微信直答修复发布记录
+
+DMIT-US 的 `maibot-main` 从 `/opt/maibot-brain` 运行。本次从发布包更新了 9 个 Python 文件，仅重启主服务。部署前校验旧文件及备份摘要，替换后逐一核对新文件 SHA-256。主进程进入 `active/running`，WebUI 本机探针 `http://127.0.0.1:8001/openapi.json` 返回 200，消息采集服务保持 active。
+
+排查微信 `one_pass_st` 空回复时，先看本轮的 `generation_attempts`。`missing_required_tool_args` 表示工具调用缺少当次声明的必填键，`empty_st_visible_reply` 表示清洗后没有可发送正文。两者都在单次尝试记为成功前触发现有重试。顺序策略下，主渠道耗尽后才会选择备用。工具执行后的生成重试复用已有 observations。
+
+离线回归覆盖了主渠道连续三次返回空参、备用生成成功且只发送一次的场景。生产发布验收覆盖文件与进程健康。后续遇到自然失败时，可按同一回合的尝试序列与发送回执核对实际切换结果。
+
+回滚包在 DMIT-US 的 `/opt/maibot-backups/one-pass-st-20261119-LWys5b/before.tar`。回滚这次发布时，先检查归档内的九个路径并核对当前版本，从运行目录恢复该包，重启 `maibot-main`，再检查服务状态和上述 HTTP 探针。
 
 ## 一、 生产节点与网络访问矩阵
 
@@ -285,3 +295,28 @@ PY'
   ```bash
   ssh DMIT-US 'journalctl -u maibot-main -n 100 --no-pager | grep -E "已同步剔除撤回消息|OutputGuardrail"'
   ```
+
+---
+
+## 八、Phase 6 双子运行时与原生 WebUI 运维指南
+
+1. **ST 微信预设模板自举检查**：
+   - 版本库内权威模板位于 `plugins/st_preset_engine/templates/Meowssiah-WeChat-IM.json`，运行期自举同步至 `data/presets/Meowssiah-WeChat-IM.json`。
+   - 若更新了模板，请核对 `data/presets/Meowssiah-WeChat-IM.json` 已同步覆盖，且 `[43]` 历史回顾、`[20~26]` 风格组、`[47] <summary>` 与 `[48] <comment>` 仍为启用状态。
+
+2. **启用本地构建的原生 WebUI 面板（`MAIBOT_USE_LOCAL_DASHBOARD=1`）**：
+   - 修改前端代码后需在 `dashboard/` 目录执行 `npm run build` 生成 `dashboard/dist`；
+   - 在环境变量（参考 `deploy/embodied/media.env.example`）中配置 `MAIBOT_USE_LOCAL_DASHBOARD=1`，`src/webui/app.py`（`_is_local_dashboard_enabled()`）即优先挂载本地 `dashboard/dist` 构建产物。
+
+3. **`/config/bot` 双子槽位与 `TwinEconomyConfig` 配置校验**：
+   - 打开 WebUI `/config/bot` ->「身份与人格」，在顶部双子槽位控制台绑定 `younger_slot_profile`（妹妹）与 `elder_slot_profile`（姐姐）并启用 `twin_mode_enabled`；
+   - `owner_private_prompt` 仅当 `not is_group_chat` 且 `MAIBOT_TRUTH_DB_PATH` 对应 `sender_trust_role == "OWNER"` 时才会挂载生效；
+   - 在模型配置（`model_config.toml`）中为 `planner` / `planner_flash` / `replyer` / `replyer_elder` 配置真实有效的提供商密钥（未配置 `planner_flash` / `replyer_elder` 时系统会自动回退到默认任务槽位，但多模型路由需要独立模型条目）。
+
+4. **`/chat` 监控页 `st_telemetry` 排障**：
+   - 在 `/chat`（`maisaka-monitor.tsx`）展开对应轮次的 `PlannerToolResultCard`，可查看当前值班姐妹徽章（支持 `sister_younger` 🌸 妹妹值班 / `sister_elder` 🌙 姐姐值班）、实际调用模型、`thinking` 折叠思维链、`📏 小总结`、`🐱 猫猫留言` 以及 `📊 MVU 状态演进`（`<Analysis>` 归因与变量 Diff）；
+   - 这些遥测字段通过 `src/maisaka/monitor/events.py` 挂载在 `tool` 顶层 `st_telemetry` 键上，确保不会影响微信出站 `visible_text` 的纯净 `<game>` 气泡。
+
+5. **Persona V2 卡片模板自举与 3 层共享 MVU 运维**：
+   - 内置角色卡片模板位于 `plugins/st_preset_engine/templates/personas/*.json`，启动或访问 `GET /api/webui/persona-v2/cards` 时自动自举同步至 `data/personas/*.json` 并登记至 `config/bot_config.toml`；
+   - 双子核心卡（`maibot_xuyue` / `maibot_xuyan` 及其全量副本 `*_qianling_full`）共用 `shared_namespace = "twin_xu"`：在 `companion_truth.db` 的 `mvu_variables` 表中，`apartment_scene`（`PUBLIC`）与 `love_locked`（`PRIVATE` / `twin_harmony_locked`）写入 `card_id = 'shared:twin_xu'`，支持通过 `/config/bot`「Persona V2 立体人设工作台」在线查看、修改与重置实时变量（注：系统只读变量 `balance_tier` 与 `phone_holder` 由算力账本与值班槽位实时映射，不可由模型或手动覆盖）。
