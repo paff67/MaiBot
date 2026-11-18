@@ -84,7 +84,7 @@ async def _send_message(message: SessionMessage, show_log: bool = True) -> bool:
         if is_webui_message and chat_manager is not None:
             # WebUI 聊天室消息（包括虚拟身份模式），通过 WebSocket 广播
             import time
-            from src.config.config import global_config
+            from src.webui.routers.chat.service import resolve_bot_persona_identity
 
             # 解析消息段，获取富文本内容
             message_segments = serialize_message_sequence(message.raw_message)
@@ -107,6 +107,8 @@ async def _send_message(message: SessionMessage, show_log: bool = True) -> bool:
             if raw_target_user_id:
                 target_user_id = str(raw_target_user_id).strip()
 
+            persona_slot, persona_name = resolve_bot_persona_identity(message)
+
             await chat_manager.broadcast_to_group(
                 group_id=group_id or default_group_id or "",
                 message={
@@ -116,10 +118,13 @@ async def _send_message(message: SessionMessage, show_log: bool = True) -> bool:
                     "segments": segments,  # 富文本消息段
                     "timestamp": time.time(),
                     "group_id": group_id,  # 包含群 ID 以便前端区分不同的聊天标签
+                    "persona_slot": persona_slot,
                     "sender": {
-                        "name": global_config.bot.nickname,
+                        "name": persona_name,
                         "avatar": None,
+                        "user_id": f"bot:{persona_slot}" if persona_slot else "bot",
                         "is_bot": True,
+                        "persona_slot": persona_slot,
                     },
                 },
                 user_id=target_user_id,

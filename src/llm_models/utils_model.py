@@ -425,6 +425,7 @@ class LLMOrchestrator:
         interrupt_flag: asyncio.Event | None = None,
         session_id: str = "",
         force_stream_mode: bool = False,
+        extra_params: Optional[Dict[str, Any]] = None,
     ) -> LLMResponseResult:
         """异步生成文本响应。
 
@@ -462,6 +463,7 @@ class LLMOrchestrator:
             response_format=response_format,
             interrupt_flag=interrupt_flag,
             force_stream_mode=force_stream_mode,
+            extra_params=extra_params,
             session_id=session_id,
         )
         response = execution_result.api_response
@@ -498,6 +500,7 @@ class LLMOrchestrator:
         interrupt_flag: asyncio.Event | None = None,
         session_id: str = "",
         force_stream_mode: bool = False,
+        extra_params: Optional[Dict[str, Any]] = None,
     ) -> LLMResponseResult:
         """基于外部消息工厂异步生成响应。
 
@@ -530,6 +533,7 @@ class LLMOrchestrator:
             response_format=response_format,
             interrupt_flag=interrupt_flag,
             force_stream_mode=force_stream_mode,
+            extra_params=extra_params,
             session_id=session_id,
         )
         response = execution_result.api_response
@@ -736,6 +740,7 @@ class LLMOrchestrator:
         temperature: Optional[float],
         max_tokens: Optional[int],
         trace_context: RequestTraceContext,
+        extra_params: Optional[Dict[str, Any]] = None,
     ) -> ResponseRequest:
         """构建统一响应请求对象。
 
@@ -753,6 +758,7 @@ class LLMOrchestrator:
         Returns:
             ResponseRequest: 统一响应请求对象。
         """
+        merged_extra = {**dict(model_info.extra_params), **dict(extra_params or {})}
         return ResponseRequest(
             model_info=model_info,
             context_items=list(context_items),
@@ -763,7 +769,7 @@ class LLMOrchestrator:
             stream_response_handler=stream_response_handler,
             async_response_parser=async_response_parser,
             interrupt_flag=interrupt_flag,
-            extra_params=dict(model_info.extra_params),
+            extra_params=merged_extra,
             trace_context=trace_context,
         )
 
@@ -851,6 +857,7 @@ class LLMOrchestrator:
         image_preprocess_version: str | None,
         audio_base64: str | None,
         trace_context: RequestTraceContext,
+        extra_params: Optional[Dict[str, Any]] = None,
     ) -> ClientRequest:
         """按请求类型构建统一客户端请求对象。
 
@@ -886,6 +893,7 @@ class LLMOrchestrator:
                 temperature=temperature,
                 max_tokens=max_tokens,
                 trace_context=trace_context,
+                extra_params=extra_params,
             )
         if request_type == RequestType.EMBEDDING:
             if embedding_input is None:
@@ -1352,6 +1360,7 @@ class LLMOrchestrator:
         interrupt_flag: asyncio.Event | None = None,
         session_id: str = "",
         force_stream_mode: bool = False,
+        extra_params: Optional[Dict[str, Any]] = None,
     ) -> LLMExecutionResult:
         """执行一次完整的模型调度请求。
 
@@ -1424,6 +1433,7 @@ class LLMOrchestrator:
                     image_preprocess_version=image_preprocess_version,
                     audio_base64=audio_base64,
                     trace_context=trace_context,
+                    extra_params=extra_params,
                 )
                 if self.request_type.startswith("maisaka."):
                     logger.debug(

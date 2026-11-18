@@ -9,6 +9,12 @@ from src.config.model_configs import TaskConfig
 logger = get_logger("service_task_resolver")
 
 
+TASK_EMPTY_FALLBACK_MAP: Dict[str, str] = {
+    "planner_flash": "planner",
+    "replyer_elder": "replyer",
+}
+
+
 def get_available_models() -> Dict[str, TaskConfig]:
     """获取当前所有可用的模型任务配置。
 
@@ -19,7 +25,7 @@ def get_available_models() -> Dict[str, TaskConfig]:
         models = config_manager.get_model_config().model_task_config
         available_models: Dict[str, TaskConfig] = {}
         for attr_name in dir(models):
-            if attr_name.startswith("__"):
+            if attr_name.startswith("__") or attr_name in {"model_fields", "model_computed_fields"}:
                 continue
             try:
                 attr_value = getattr(models, attr_name)
@@ -56,4 +62,11 @@ def resolve_task_name(task_name: str = "") -> str:
         return next(iter(models.keys()))
     if normalized_task_name not in models:
         raise ValueError(f"未找到名为 `{normalized_task_name}` 的模型配置")
+    if normalized_task_name in TASK_EMPTY_FALLBACK_MAP:
+        target_cfg = models[normalized_task_name]
+        if not getattr(target_cfg, "model_list", None):
+            fallback_name = TASK_EMPTY_FALLBACK_MAP[normalized_task_name]
+            if fallback_name in models:
+                logger.debug(f"任务 `{normalized_task_name}` 未分配模型，自动回退至 `{fallback_name}`")
+                return fallback_name
     return normalized_task_name

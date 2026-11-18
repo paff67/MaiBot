@@ -37,6 +37,7 @@ from google.genai.types import (
     Part,
     SafetySetting,
     ThinkingConfig,
+    ThinkingLevel,
     Tool,
     ToolConfig,
 )
@@ -131,10 +132,13 @@ GEMINI_SAFE_SETTINGS: List[SafetySetting] = [
 
 GENERATE_CONFIG_RESERVED_EXTRA_PARAMS = {
     "thinking_budget",
+    "thinking_level",
+    "think_level",
     "include_thoughts",
     "enable_google_search",
     "transcription_prompt",
     "audio_mime_type",
+    "tool_config",
 }
 """由当前客户端自行处理、不再直接透传给 `GenerateContentConfig` 的额外参数。"""
 
@@ -394,7 +398,7 @@ def _convert_messages(items: List[ContextItem]) -> Tuple[ContentListUnion, str |
                     response=_normalize_function_response_payload(item),
                 )
             )
-            contents.append(Content(role="tool", parts=[function_response_part]))
+            contents.append(Content(role="user", parts=[function_response_part]))
             index += 1
             continue
 
@@ -608,8 +612,12 @@ def _build_stream_api_response(
     reasoning_buffer.close()
 
     _warn_if_max_tokens_truncated(last_response, content or None, tool_calls_buffer or None)
-    if not content and not tool_calls_buffer and not reasoning_content:
-        raise EmptyResponseException(last_response)
+    if not content and not tool_calls_buffer:
+        finish_reason = _extract_finish_reason(last_response)
+        raise EmptyResponseException(
+            last_response,
+            f"响应中既无可见文本内容也无工具调用 (finish_reason={finish_reason}, has_reasoning={bool(reasoning_content)})",
+        )
     context_tool_calls = [
         ContextToolCall.create(
             call_id=tool_call.call_id,
@@ -713,8 +721,12 @@ def _default_normal_response_parser(
 
     usage_record = _extract_usage_record(response)
     _warn_if_max_tokens_truncated(response, content, tool_calls or None)
-    if not content and not tool_calls and not reasoning_content:
-        raise EmptyResponseException(response, "响应中既无文本内容也无工具调用")
+    if not content and not tool_calls:
+        finish_reason = _extract_finish_reason(response)
+        raise EmptyResponseException(
+            response,
+            f"响应中既无可见文本内容也无工具调用 (finish_reason={finish_reason}, has_reasoning={bool(reasoning_content)})",
+        )
     context_tool_calls = [
         ContextToolCall.create(
             call_id=tool_call.call_id,
@@ -876,6 +888,60 @@ class GeminiClient(AdapterClient[AsyncIterator[GenerateContentResponse], Generat
         return thinking_budget
 
     @staticmethod
+    def _uses_thinking_budget_model(model_id: str) -> bool:
+        """判断当前模型是否属于仅使用 thinking_budget 的 Gemini 2.5 系列。"""
+        clean_id = str(model_id or "").strip()
+        if clean_id in THINKING_BUDGET_LIMITS:
+            return True
+        for candidate_prefix in THINKING_BUDGET_LIMITS:
+            if clean_id == candidate_prefix or clean_id.startswith(f"{candidate_prefix}-"):
+                return True
+        return False
+
+    @staticmethod
+    def resolve_thinking_level(
+        extra_params: Dict[str, Any] | None,
+        model_id: str = "",
+    ) -> ThinkingLevel:
+        """解析 Gemini thinking_level（兼容 thinking_level / think_level，默认 HIGH）。"""
+        del model_id
+        raw_level: Any = None
+        if extra_params:
+            if "thinking_level" in extra_params and extra_params["thinking_level"] is not None:
+                raw_level = extra_params["thinking_level"]
+            elif "think_level" in extra_params and extra_params["think_level"] is not None:
+                raw_level = extra_params["think_level"]
+
+        if isinstance(raw_level, ThinkingLevel):
+            return raw_level
+
+        if isinstance(raw_level, int) and not isinstance(raw_level, bool):
+            int_map = {
+                0: ThinkingLevel.MINIMAL,
+                1: ThinkingLevel.LOW,
+                2: ThinkingLevel.MEDIUM,
+                3: ThinkingLevel.HIGH,
+            }
+            return int_map.get(raw_level, ThinkingLevel.HIGH if raw_level > 0 else ThinkingLevel.MINIMAL)
+
+        if isinstance(raw_level, str):
+            normalized = raw_level.strip().upper()
+            str_map = {
+                "MINIMAL": ThinkingLevel.MINIMAL,
+                "LOW": ThinkingLevel.LOW,
+                "MEDIUM": ThinkingLevel.MEDIUM,
+                "HIGH": ThinkingLevel.HIGH,
+                "UNSPECIFIED": ThinkingLevel.THINKING_LEVEL_UNSPECIFIED,
+                "THINKING_LEVEL_UNSPECIFIED": ThinkingLevel.THINKING_LEVEL_UNSPECIFIED,
+            }
+            if normalized in str_map:
+                return str_map[normalized]
+            if normalized:
+                logger.warning(f"无效的 thinking_level/think_level={raw_level!r}，已回退为默认 HIGH")
+
+        return ThinkingLevel.HIGH
+
+    @staticmethod
     def _resolve_model_identifier(model_identifier: str, extra_params: Dict[str, Any]) -> Tuple[str, bool]:
         """解析请求实际使用的 Gemini 模型标识。
 
@@ -933,10 +999,20 @@ class GeminiClient(AdapterClient[AsyncIterator[GenerateContentResponse], Generat
         if "safety_settings" not in config_payload:
             config_payload["safety_settings"] = GEMINI_SAFE_SETTINGS
         if "thinking_config" not in config_payload:
-            config_payload["thinking_config"] = ThinkingConfig(
-                include_thoughts=bool(extra_params.get("include_thoughts", True)),
-                thinking_budget=self.clamp_thinking_budget(extra_params, model_identifier),
+            include_thoughts = bool(extra_params.get("include_thoughts", True))
+            has_explicit_level = bool(
+                extra_params and ("thinking_level" in extra_params or "think_level" in extra_params)
             )
+            if has_explicit_level or not self._uses_thinking_budget_model(model_identifier):
+                config_payload["thinking_config"] = ThinkingConfig(
+                    include_thoughts=include_thoughts,
+                    thinking_level=self.resolve_thinking_level(extra_params, model_identifier),
+                )
+            else:
+                config_payload["thinking_config"] = ThinkingConfig(
+                    include_thoughts=include_thoughts,
+                    thinking_budget=self.clamp_thinking_budget(extra_params, model_identifier),
+                )
 
         tools = _build_tools(tool_options) if tool_options else []
         if enable_google_search:
@@ -950,6 +1026,26 @@ class GeminiClient(AdapterClient[AsyncIterator[GenerateContentResponse], Generat
                     config_payload["tools"] = [existing_tools, *tools]
             else:
                 config_payload["tools"] = tools
+
+            raw_tool_cfg = extra_params.get("tool_config")
+            if (
+                isinstance(raw_tool_cfg, dict)
+                and "tool_config" not in config_payload
+                and "hydrogen" not in model_identifier.lower()
+            ):
+                fc_cfg = raw_tool_cfg.get("function_calling_config")
+                if isinstance(fc_cfg, dict):
+                    fc_kwargs: Dict[str, Any] = {}
+                    if fc_cfg.get("mode"):
+                        fc_kwargs["mode"] = str(fc_cfg["mode"])
+                    if fc_cfg.get("allowed_function_names"):
+                        fc_kwargs["allowed_function_names"] = [
+                            str(name) for name in fc_cfg["allowed_function_names"] if str(name)
+                        ]
+                    if fc_kwargs:
+                        config_payload["tool_config"] = ToolConfig(
+                            function_calling_config=FunctionCallingConfig(**fc_kwargs)
+                        )
 
         if response_format is not None:
             if response_format.format_type == RespFormatType.TEXT:

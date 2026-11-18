@@ -49,6 +49,7 @@ from src.config.official_configs import (
     ResponsePostProcessConfig,
     ResponseSplitterConfig,
     TelemetryConfig,
+    TwinEconomyConfig,
     VisualConfig,
     VoiceConfig,
     WebUIConfig,
@@ -1325,6 +1326,7 @@ def get_config_section_schema(section_name: str):
     section_map = {
         "bot": BotConfig,
         "personality": PersonalityConfig,
+        "twin_economy": TwinEconomyConfig,
         "chat": ChatConfig,
         "visual": VisualConfig,
         "message_receive": MessageReceiveConfig,
@@ -1377,6 +1379,9 @@ def get_bot_config():
 
         with open(config_path, "r", encoding="utf-8") as f:
             config_data = tomlkit.load(f)
+
+        if "twin_economy" not in config_data:
+            config_data["twin_economy"] = TwinEconomyConfig().model_dump()
 
         return {"success": True, "config": config_data}
     except HTTPException:
@@ -1591,7 +1596,10 @@ def update_bot_config_section(section_name: str, section_data: SectionBody):
 
         # 更新指定节
         if section_name not in config_data:
-            raise HTTPException(status_code=404, detail=f"配置节 '{section_name}' 不存在")
+            if section_name in Config.model_fields:
+                config_data[section_name] = {}
+            else:
+                raise HTTPException(status_code=404, detail=f"配置节 '{section_name}' 不存在")
 
         # 使用递归合并保留注释（对于字典类型）
         # 对于数组类型（如 platforms, aliases），直接替换

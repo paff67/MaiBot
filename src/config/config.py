@@ -54,6 +54,7 @@ from .official_configs import (
     ResponsePostProcessConfig,
     ResponseSplitterConfig,
     TelemetryConfig,
+    TwinEconomyConfig,
     VisualConfig,
     VoiceConfig,
     WebUIConfig,
@@ -120,6 +121,9 @@ class Config(ConfigBase):
 
     personality: PersonalityConfig = Field(default_factory=PersonalityConfig)
     """人格配置类"""
+
+    twin_economy: TwinEconomyConfig = Field(default_factory=TwinEconomyConfig)
+    """双子叙事与算力经济配置"""
 
     chat: ChatConfig = Field(default_factory=ChatConfig)
     """聊天配置类"""

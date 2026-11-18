@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import datetime
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable
@@ -103,12 +104,36 @@ class ComputeLedger:
         self._is_available: bool = True
         self._active_persona_slot: str = PERSONA_SLOT_YOUNGER
         self._elder_away_arc: str = ""
+        self._elder_away_updated_ts: float = 0.0
         self._chat_execution_mode: str = "dual_director"
         self._last_known_remote_balance: float | None = None
+        self._last_sync_ts: float = 0.0
         self._poll_task: asyncio.Task[None] | None = None
 
         self._ensure_truth_db_initialized()
         self._load_persisted_state()
+
+    @staticmethod
+    def _resolve_economy_settings() -> tuple[float, float, float, str, float, bool]:
+        """读取 TwinEconomyConfig 热配置（hibernating, thrifty, supercharged, api_url, poll_sec, enabled）。"""
+        hib, thr, sup = 0.5, THRIFTY_BALANCE_THRESHOLD_USD, 15.0
+        api_url = ""
+        poll_sec = 90.0
+        enabled = True
+        try:
+            from src.config.config import global_config
+
+            eco = getattr(global_config, "twin_economy", None)
+            if eco is not None:
+                hib = float(getattr(eco, "hibernating_threshold_usd", hib))
+                thr = float(getattr(eco, "thrifty_threshold_usd", thr))
+                sup = float(getattr(eco, "supercharged_threshold_usd", sup))
+                api_url = str(getattr(eco, "balance_api_url", "") or "").strip().rstrip("/")
+                poll_sec = float(getattr(eco, "poll_interval_sec", poll_sec))
+                enabled = bool(getattr(eco, "enabled", True))
+        except Exception:
+            pass
+        return hib, thr, sup, api_url, poll_sec, enabled
 
     def _ensure_truth_db_initialized(self) -> None:
         self.truth_db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -135,18 +160,21 @@ class ComputeLedger:
                     self._active_persona_slot = str(row["active_persona_slot"]).strip()
                 if "elder_away_arc" in keys and row["elder_away_arc"] is not None:
                     self._elder_away_arc = str(row["elder_away_arc"])
+                    if self._elder_away_arc.strip():
+                        self._elder_away_updated_ts = time.time()
                 if "chat_execution_mode" in keys and str(row["chat_execution_mode"] or "").strip():
                     self._chat_execution_mode = str(row["chat_execution_mode"]).strip()
         finally:
             db.close()
 
-    @staticmethod
-    def _compute_tier(effective_balance: float, is_available: bool) -> tuple[str, str]:
-        if not is_available or effective_balance <= 0.05:
+    @classmethod
+    def _compute_tier(cls, effective_balance: float, is_available: bool) -> tuple[str, str]:
+        hib, thr, sup, _, _, _ = cls._resolve_economy_settings()
+        if not is_available or effective_balance < hib:
             return "HIBERNATING", "断粮休眠态"
-        if effective_balance < THRIFTY_BALANCE_THRESHOLD_USD:
+        if effective_balance < thr:
             return "THRIFTY", "吃紧省流态"
-        if effective_balance >= 20.0:
+        if effective_balance >= sup:
             return "SUPERCHARGED", "充裕超频态"
         return "STANDARD", "日常标准态"
 
@@ -226,6 +254,40 @@ class ComputeLedger:
         """预留的模型调用瞬时折算钩子：实时将 Token 消耗计入本地未结算缓存。"""
         cost = _estimate_token_cost_usd(model_name, prompt_tokens, completion_tokens)
         return self.record_local_cost(cost)
+
+    def record_token_usage(self, model_name: str, prompt_tokens: int, completion_tokens: int) -> ComputeLedgerSnapshot:
+        """全局 LLMServiceClient 实时 Token 计费写入入口。"""
+        return self.on_token_usage(model_name, prompt_tokens, completion_tokens)
+
+    def set_elder_away_arc(self, arc: str) -> ComputeLedgerSnapshot:
+        """设置或清空姐姐的动态离场状态弧线并持久化到 companion_truth.db。"""
+        clean = str(arc or "").strip()
+        self._elder_away_arc = clean
+        self._elder_away_updated_ts = time.time() if clean else 0.0
+        snap = self.get_snapshot()
+        self._persist_snapshot(snap)
+        return snap
+
+    def get_elder_away_elapsed_seconds(self) -> float:
+        if not self._elder_away_arc.strip() or self._elder_away_updated_ts <= 0:
+            return 0.0
+        return max(0.0, time.time() - self._elder_away_updated_ts)
+
+    async def sync_remote_balance_if_due(self) -> ComputeLedgerSnapshot:
+        """若距离上次远端余额查询已超过 poll_interval_sec 且已配置 API Key，则校准余额。"""
+        _, _, _, api_url, poll_sec, enabled = self._resolve_economy_settings()
+        if not enabled:
+            return self.get_snapshot()
+        if api_url:
+            self.api_base_url = api_url
+        if poll_sec >= 15.0:
+            self.poll_interval_sec = poll_sec
+
+        now = time.time()
+        if self._last_sync_ts > 0 and (now - self._last_sync_ts) < self.poll_interval_sec:
+            return self.get_snapshot()
+        self._last_sync_ts = now
+        return await self.sync_remote_balance_once()
 
     async def apply_remote_balance_reading(self, remote_balance: float, is_available: bool = True) -> ComputeLedgerSnapshot:
         prev_remote = self._last_known_remote_balance
@@ -313,5 +375,32 @@ class ComputeLedger:
             except Exception:
                 pass
             await asyncio.sleep(self.poll_interval_sec)
+
+
+_SHARED_COMPUTE_LEDGER: ComputeLedger | None = None
+
+
+def get_shared_compute_ledger(truth_db_path: str | Path = "") -> ComputeLedger:
+    """获取进程级共享 ComputeLedger 单例（按 TwinEconomyConfig 对齐 URL 与轮询间隔）。"""
+    global _SHARED_COMPUTE_LEDGER
+    if _SHARED_COMPUTE_LEDGER is None:
+        resolved_path = (
+            Path(truth_db_path)
+            if str(truth_db_path or "").strip()
+            else Path(os.environ.get("MAIBOT_TRUTH_DB_PATH", "data/companion_truth.db"))
+        )
+        _, _, _, api_url, poll_sec, _ = ComputeLedger._resolve_economy_settings()
+        _SHARED_COMPUTE_LEDGER = ComputeLedger(
+            truth_db_path=resolved_path,
+            api_base_url=api_url or "https://api.0-0.pro",
+            poll_interval_sec=poll_sec,
+        )
+        if not os.environ.get("PYTEST_CURRENT_TEST"):
+            try:
+                asyncio.get_running_loop()
+                _SHARED_COMPUTE_LEDGER.start_background_sync()
+            except RuntimeError:
+                pass
+    return _SHARED_COMPUTE_LEDGER
 
 

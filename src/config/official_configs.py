@@ -164,6 +164,18 @@ class PersonalityProfile(ConfigBase):
     """备用表达风格。"""
     multiple_probability: float = Field(default=0, ge=0, le=1)
     """备用表达风格触发概率。"""
+    nickname: str = Field(default="")
+    """该角色独立显示与自称的名字（为空时回退 bot.nickname）。"""
+    alias_names: List[str] = Field(default_factory=list)
+    """该角色专属别名列表，用于群聊与 @ 提及识别。"""
+    owner_private_prompt: str = Field(default="")
+    """Owner 专属私密提示词（仅限最高信任角色一对一私聊挂载，普通好友私聊与群聊物理隔离）。"""
+    st_preset_file: str = Field(default="")
+    """可选绑定的专属 SillyTavern 预设文件名（为空则使用全局激活预设）。"""
+    persona_v2_card_id: str = Field(default="")
+    """绑定的 Persona V2 结构化人设卡 ID（对应 data/personas/<card_id>.json）。"""
+    mvu_enabled: bool = Field(default=True)
+    """是否为该槽位启用原生 MVU 动态状态变量引擎。"""
 
 
 class PersonalityConfig(ConfigBase):
@@ -171,6 +183,15 @@ class PersonalityConfig(ConfigBase):
 
     __ui_parent__ = "bot"
     __ui_label__ = "人格"
+
+    twin_mode_enabled: bool = Field(default=True, json_schema_extra={"x-widget": "custom"})
+    """是否启用双子（妹妹/姐姐）双人格槽位协作架构。"""
+
+    younger_slot_profile: str = Field(default="", json_schema_extra={"x-widget": "custom"})
+    """妹妹槽位（日常高频值班/省流常驻）绑定的备选人设名称；为空时自动匹配首个人设或当前主配置。"""
+
+    elder_slot_profile: str = Field(default="", json_schema_extra={"x-widget": "custom"})
+    """姐姐槽位（高算力深度共情/危机接管）绑定的备选人设名称；为空时自动匹配第二个人设或当前主配置。"""
 
     profiles: List[PersonalityProfile] = Field(default_factory=list, json_schema_extra={"x-widget": "custom"})
     """备选人设库，由 WebUI 保存与切换；运行时使用下方当前人设字段。"""
@@ -184,6 +205,18 @@ class PersonalityConfig(ConfigBase):
         names = [profile.name for profile in self.profiles]
         if len(names) != len(set(names)):
             raise ValueError("备选人设名称不能重复")
+
+    background_story: str = Field(
+        default="",
+        json_schema_extra={
+            "label": {"zh_CN": "项目背景设定", "en_US": "Project background setting", "ja_JP": "プロジェクト背景設定"},
+            "x-widget": "textarea",
+            "x-textarea-min-height": 72,
+            "x-textarea-rows": 3,
+            "x-description-display": "icon",
+        },
+    )
+    """项目的统一世界观与生活背景设定，支持在线动态修改，默认留空。"""
 
     personality: str = Field(
         default="是女大学生，现在正在上网聊天。一般不包容且善良，但有时候有点一反常态，表现出锐利攻击性。善于用人类的角度思考问题，聊天比较日常。",
@@ -271,6 +304,222 @@ class PersonalityConfig(ConfigBase):
         },
     )
     """随机启用备用风格的概率；0 表示不随机切换。"""
+
+    owner_private_prompt: str = Field(
+        default="",
+        json_schema_extra={
+            "label": {
+                "zh_CN": "Owner 专属私密提示词",
+                "en_US": "Owner private prompt",
+                "ja_JP": "オーナー専用プライベートプロンプト",
+            },
+            "x-widget": "textarea",
+            "x-textarea-min-height": 64,
+            "x-textarea-rows": 2,
+            "x-description-display": "icon",
+        },
+    )
+    """仅在 Owner（最高信任等级）一对一私聊时挂载的私密关系与专属设定提示词，普通好友私聊与一切群聊物理隔离。"""
+
+    persona_v2_card_id: str = Field(default="", json_schema_extra={"x-widget": "custom"})
+    """当前主配置绑定的 Persona V2 结构化人设卡 ID。"""
+
+    mvu_enabled: bool = Field(default=True, json_schema_extra={"x-widget": "custom"})
+    """是否启用原生 MVU 状态机与变量更新引擎。"""
+
+
+def resolve_personality_slot_profile(
+    self: PersonalityConfig,
+    slot: str,
+    bot_cfg: Optional["BotConfig"] = None,
+    reply_style_cfg: Optional["ChatReplyStyleConfig"] = None,
+) -> PersonalityProfile:
+    """按双子槽位名 (`sister_younger` / `sister_elder`) 解析完整人设档案，缺省时优雅回退。"""
+    base_nickname = str(getattr(bot_cfg, "nickname", "") or "").strip() or "麦麦"
+    base_aliases = list(getattr(bot_cfg, "alias_names", []) or [])
+    base_group_prompt = str(getattr(reply_style_cfg, "group_chat_prompt", "") or "")
+    base_private_prompt = str(getattr(reply_style_cfg, "private_chat_prompts", "") or "")
+
+    profile_map = {profile.name: profile for profile in self.profiles}
+    matched: Optional[PersonalityProfile] = None
+
+    normalized_slot = str(slot or "").strip()
+    if self.twin_mode_enabled:
+        if normalized_slot == "sister_elder":
+            if self.elder_slot_profile and self.elder_slot_profile in profile_map:
+                matched = profile_map[self.elder_slot_profile]
+            elif len(self.profiles) >= 2:
+                matched = self.profiles[1]
+        elif normalized_slot == "sister_younger":
+            if self.younger_slot_profile and self.younger_slot_profile in profile_map:
+                matched = profile_map[self.younger_slot_profile]
+            elif self.profiles:
+                matched = self.profiles[0]
+
+    if matched is None and self.selected_profile and self.selected_profile in profile_map:
+        matched = profile_map[self.selected_profile]
+
+    if matched is not None:
+        copied = matched.model_copy(deep=True)
+        if not copied.nickname.strip():
+            copied.nickname = base_nickname
+        if not copied.alias_names:
+            copied.alias_names = base_aliases
+        if not copied.group_chat_prompt.strip():
+            copied.group_chat_prompt = base_group_prompt
+        if not copied.private_chat_prompts.strip():
+            copied.private_chat_prompts = base_private_prompt
+        if not copied.owner_private_prompt.strip() and self.selected_profile == copied.name:
+            copied.owner_private_prompt = self.owner_private_prompt
+        if not copied.persona_v2_card_id.strip() and self.selected_profile == copied.name:
+            copied.persona_v2_card_id = self.persona_v2_card_id
+        return copied
+
+    return PersonalityProfile(
+        name=self.selected_profile or normalized_slot or base_nickname,
+        personality=self.personality,
+        behavior_style=self.behavior_style,
+        reply_style=self.reply_style,
+        group_chat_prompt=base_group_prompt,
+        private_chat_prompts=base_private_prompt,
+        multiple_reply_style=list(self.multiple_reply_style),
+        multiple_probability=float(self.multiple_probability),
+        nickname=base_nickname,
+        alias_names=base_aliases,
+        owner_private_prompt=self.owner_private_prompt,
+        st_preset_file="",
+        persona_v2_card_id=self.persona_v2_card_id,
+        mvu_enabled=bool(self.mvu_enabled),
+    )
+
+
+PersonalityConfig.resolve_slot_profile = resolve_personality_slot_profile  # type: ignore[attr-defined]
+
+
+class TwinEconomyConfig(ConfigBase):
+    """双子叙事与算力经济配置"""
+
+    __ui_parent__ = "bot"
+    __ui_label__ = "双子与算力"
+    __ui_icon__ = "sparkles"
+
+    enabled: bool = Field(
+        default=True,
+        json_schema_extra={
+            "x-widget": "switch",
+            "label": {"zh_CN": "启用双子算力联动路由", "en_US": "Enable twin economy routing"},
+        },
+    )
+    """是否启用算力水位联动与双子动态切模路由。"""
+
+    balance_api_url: str = Field(
+        default="https://api.0-0.pro",
+        json_schema_extra={
+            "x-widget": "input",
+            "label": {"zh_CN": "算力网关余额地址", "en_US": "Balance API URL"},
+        },
+    )
+    """中转或算力网关余额查询地址。"""
+
+    poll_interval_sec: float = Field(
+        default=90.0,
+        ge=15.0,
+        le=3600.0,
+        json_schema_extra={
+            "x-widget": "input",
+            "label": {"zh_CN": "余额校准轮询间隔（秒）", "en_US": "Balance poll interval (sec)"},
+        },
+    )
+    """后台余额查询校准间隔秒数。"""
+
+    supercharged_threshold_usd: float = Field(
+        default=15.0,
+        ge=0.0,
+        json_schema_extra={
+            "x-widget": "input",
+            "label": {"zh_CN": "充裕超频水位线 (USD)", "en_US": "Supercharged threshold (USD)"},
+        },
+    )
+    """高于该余额时进入充裕超频态（积极调度高算力模型）。"""
+
+    thrifty_threshold_usd: float = Field(
+        default=3.0,
+        ge=0.0,
+        json_schema_extra={
+            "x-widget": "input",
+            "label": {"zh_CN": "省流离场水位线 (USD)", "en_US": "Thrifty threshold (USD)"},
+        },
+    )
+    """低于该余额时进入省流态并由 LLM 触发姐姐动态离场弧线。"""
+
+    hibernating_threshold_usd: float = Field(
+        default=0.5,
+        ge=0.0,
+        json_schema_extra={
+            "x-widget": "input",
+            "label": {"zh_CN": "断粮休眠水位线 (USD)", "en_US": "Hibernating threshold (USD)"},
+        },
+    )
+    """低于该余额时进入断粮休眠态：非 Owner 会话 0 Token 静默休眠，Owner 私聊放行低功耗求援。"""
+
+    strict_flash_in_thrifty: bool = Field(
+        default=True,
+        json_schema_extra={
+            "x-widget": "switch",
+            "label": {"zh_CN": "省流态严格锁定妹妹 Flash", "en_US": "Strict Flash in thrifty"},
+        },
+    )
+    """低于省流水位线时，是否连同 Owner 私聊与 @ 提及也物理锁定为 Flash 妹妹。"""
+
+    away_evolve_interval_hours: float = Field(
+        default=6.0,
+        ge=0.5,
+        json_schema_extra={
+            "x-widget": "input",
+            "label": {"zh_CN": "姐姐场外状态演进间隔（小时）", "en_US": "Away arc evolve interval (hours)"},
+        },
+    )
+    """省流持续期间，每隔多少小时在后台用 LLM 推进一次姐姐的场外动态弧线。"""
+
+    chat_execution_mode: Literal["dual_director", "one_pass_st"] = Field(
+        default="dual_director",
+        json_schema_extra={
+            "x-widget": "discrete-slider",
+            "label": {"zh_CN": "对话执行模式", "en_US": "Chat execution mode"},
+            "x-option-labels": {"dual_director": "双层导演", "one_pass_st": "统一 ST 一步直出"},
+        },
+    )
+    """dual_director 为 Planner + Replyer 双层协作；one_pass_st 在私聊与群聊中均启用统一 ST-Agent 一步直出与原生工具循环（全局启用 STPresetEngine 时亦自动切换）。"""
+
+    away_direction_prompt: str = Field(
+        default="",
+        json_schema_extra={
+            "x-widget": "textarea",
+            "x-textarea-rows": 4,
+            "label": {"zh_CN": "姐姐首次离场方向约束 Prompt", "en_US": "Elder away direction prompt"},
+        },
+    )
+    """跌破省流水位线时，引导 LLM 动态构思姐姐离场事由的方向约束（严禁硬编码固定文案）。"""
+
+    evolve_direction_prompt: str = Field(
+        default="",
+        json_schema_extra={
+            "x-widget": "textarea",
+            "x-textarea-rows": 4,
+            "label": {"zh_CN": "姐姐场外演进方向约束 Prompt", "en_US": "Elder away evolve prompt"},
+        },
+    )
+    """长时间省流期间，引导 LLM 推进姐姐场外动态进展的方向约束。"""
+
+    return_direction_prompt: str = Field(
+        default="",
+        json_schema_extra={
+            "x-widget": "textarea",
+            "x-textarea-rows": 4,
+            "label": {"zh_CN": "充值回归衔接方向约束 Prompt", "en_US": "Elder return direction prompt"},
+        },
+    )
+    """经费补充恢复后，引导 LLM 生成姐姐自然回归情境锚点的方向约束。"""
 
 
 class ImageCacheCleanupConfig(ConfigBase):

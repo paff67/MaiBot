@@ -454,6 +454,12 @@ class ModelTaskConfig(ConfigBase):
     )
     """回复模型，影响麦麦的回复表现"""
 
+    replyer_elder: TaskConfig = Field(
+        default_factory=TaskConfig,
+        json_schema_extra={"x-widget": "custom", "label": {"zh_CN": "姐姐专属回复模型 (replyer_elder)"}},
+    )
+    """双子模式下姐姐（sister_elder）开口使用的精锐回复模型（如 Gemini Argon）；未分配时自动回退至 replyer"""
+
     planner: TaskConfig = Field(
         default_factory=TaskConfig,
         json_schema_extra={
@@ -461,6 +467,12 @@ class ModelTaskConfig(ConfigBase):
         },
     )
     """规划模型，决定麦麦的行动，需要有一定Agent能力的模型"""
+
+    planner_flash: TaskConfig = Field(
+        default_factory=TaskConfig,
+        json_schema_extra={"x-widget": "custom", "label": {"zh_CN": "轻快/省流规划模型 (planner_flash)"}},
+    )
+    """双子模式下日常群聊与省流态（<阈值）使用的 Flash 规划模型；未分配时自动回退至 planner"""
 
     memory: TaskConfig = Field(
         default_factory=TaskConfig,

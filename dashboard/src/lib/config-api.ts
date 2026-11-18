@@ -85,6 +85,10 @@ function invalidateConfigDataCache(key?: string): void {
   configDataCache.clear()
 }
 
+export function invalidateBotConfigCache(): void {
+  invalidateConfigDataCache('bot')
+}
+
 function notifyBotConfigUpdated(): void {
   if (typeof window !== 'undefined') {
     window.dispatchEvent(new Event(BOT_CONFIG_UPDATED_EVENT))

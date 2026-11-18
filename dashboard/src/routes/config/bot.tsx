@@ -55,6 +55,7 @@ import {
   getBotConfigCached,
   getBotConfigRaw,
   getBotConfigSchema,
+  invalidateBotConfigCache,
   updateBotConfig,
   updateBotConfigRaw,
 } from '@/lib/config-api'
@@ -92,6 +93,7 @@ import {
 import { CommandPermissions } from './bot/CommandPermissions'
 import { GlobalLearningSettings } from './bot/GlobalLearningSettings'
 import { PersonalityProfiles } from './bot/PersonalityProfiles'
+import { PersonaV2Workbench } from './bot/PersonaV2Workbench'
 import { MemorySwitchGuard, MemorySwitchProvider } from './bot/MemorySwitchGuard'
 
 type ConfigSectionData = Record<string, unknown>
@@ -300,9 +302,12 @@ function BotConfigPageContent() {
   }, [toast])
 
   // 加载配置
-  const loadConfig = useCallback(async (): Promise<boolean> => {
+  const loadConfig = useCallback(async (options?: { silent?: boolean }): Promise<boolean> => {
+    const silent = Boolean(options?.silent)
     try {
-      setLoading(true)
+      if (!silent) {
+        setLoading(true)
+      }
       // 用 allSettled：主配置为必需，schema 为可选，二者失败互不影响
       const [result, schemaResult] = await Promise.allSettled([
         getBotConfigCached(),
@@ -314,7 +319,9 @@ function BotConfigPageContent() {
           description: result.reason instanceof Error ? result.reason.message : '加载配置失败',
           variant: 'destructive',
         })
-        setLoading(false)
+        if (!silent) {
+          setLoading(false)
+        }
         return false
       }
       parseAndSetConfig(result.value)
@@ -335,7 +342,9 @@ function BotConfigPageContent() {
       })
       return false
     } finally {
-      setLoading(false)
+      if (!silent) {
+        setLoading(false)
+      }
     }
   }, [toast, parseAndSetConfig])
 
@@ -532,6 +541,7 @@ function BotConfigPageContent() {
 
   const handleReloadFromFile = async () => {
     await cancelPendingAutoSave()
+    invalidateBotConfigCache()
     const loaded = await loadConfig()
     if (!loaded) {
       return
@@ -579,7 +589,40 @@ function BotConfigPageContent() {
   void handleSaveAndRestart
 
   const savePersonality = async (value: ConfigSectionData) => {
-    const { group_chat_prompt, private_chat_prompts, ...personality } = value
+    const {
+      group_chat_prompt,
+      private_chat_prompts,
+      nickname,
+      alias_names,
+      ...personalityRest
+    } = value
+    const selectedName = typeof personalityRest.selected_profile === 'string' ? personalityRest.selected_profile : ''
+    const existingProfiles = Array.isArray(personalityRest.profiles) ? (personalityRest.profiles as ConfigSectionData[]) : []
+    const syncedProfiles = selectedName
+      ? existingProfiles.map((prof) => (
+          prof.name === selectedName
+            ? {
+                ...prof,
+                personality: personalityRest.personality ?? prof.personality,
+                behavior_style: personalityRest.behavior_style ?? prof.behavior_style,
+                reply_style: personalityRest.reply_style ?? prof.reply_style,
+                multiple_reply_style: personalityRest.multiple_reply_style ?? prof.multiple_reply_style,
+                multiple_probability: personalityRest.multiple_probability ?? prof.multiple_probability,
+                owner_private_prompt: personalityRest.owner_private_prompt ?? prof.owner_private_prompt,
+                persona_v2_card_id: personalityRest.persona_v2_card_id ?? prof.persona_v2_card_id,
+                mvu_enabled: personalityRest.mvu_enabled ?? prof.mvu_enabled,
+                group_chat_prompt: group_chat_prompt ?? prof.group_chat_prompt,
+                private_chat_prompts: private_chat_prompts ?? prof.private_chat_prompts,
+                ...(typeof nickname === 'string' && nickname.trim() ? { nickname } : {}),
+                ...(Array.isArray(alias_names) && typeof nickname === 'string' && nickname.trim() ? { alias_names } : {}),
+              }
+            : prof
+        ))
+      : existingProfiles
+    const personality: ConfigSectionData = {
+      ...personalityRest,
+      profiles: syncedProfiles,
+    }
     const chat = {
       ...sectionValues.chat,
       reply_style: {
@@ -588,11 +631,32 @@ function BotConfigPageContent() {
         private_chat_prompts,
       },
     }
-    const configToSave = { ...buildFullConfig(), personality, chat }
-    setSectionValues((current) => ({ ...current, personality, chat }))
-    // 标记两部分的待保存修订，再通过现有写入屏障一次保存，避免分区自动保存竞争。
+    const hasNicknameSync = typeof nickname === 'string' && nickname.trim() !== ''
+    const bot = hasNicknameSync
+      ? {
+          ...sectionValues.bot,
+          nickname,
+          ...(Array.isArray(alias_names) ? { alias_names } : {}),
+        }
+      : sectionValues.bot
+    const configToSave = {
+      ...buildFullConfig(),
+      personality,
+      chat,
+      ...(bot ? { bot } : {}),
+    }
+    setSectionValues((current) => ({
+      ...current,
+      personality,
+      chat,
+      ...(bot ? { bot } : {}),
+    }))
+    // 标记多部分的待保存修订，再通过现有写入屏障一次保存，避免分区自动保存竞争。
     triggerAutoSave('personality', personality)
     triggerAutoSave('chat', chat)
+    if (hasNicknameSync && bot) {
+      triggerAutoSave('bot', bot)
+    }
     try {
       await runWithAutoSaveBarrier(() => updateBotConfig(configToSave))
     } catch (error) {
@@ -914,6 +978,7 @@ function BotConfigPageContent() {
             sectionValues={sectionValues}
             setSectionValue={setSectionValue}
             onPersonalityChange={savePersonality}
+            onReloadConfig={() => loadConfig({ silent: true })}
             setHasUnsavedChanges={setHasUnsavedChanges}
             searchFieldPath={searchFieldPath}
           />
@@ -969,6 +1034,7 @@ function updateNestedValue(
 
 interface DynamicConfigTabsProps {
   onPersonalityChange: (value: ConfigSectionData) => Promise<void>
+  onReloadConfig?: () => Promise<boolean>
   activeTab: string
   setActiveTab: (tab: string) => void
   advancedVisible: boolean
@@ -1012,6 +1078,7 @@ function DynamicConfigTabs(props: DynamicConfigTabsProps) {
     setHasUnsavedChanges,
     setSectionValue,
     onPersonalityChange,
+    onReloadConfig,
     tabGroups,
   } = props
   const initialActiveTab = tabGroups[0]?.id ?? ''
@@ -1104,14 +1171,58 @@ function DynamicConfigTabs(props: DynamicConfigTabsProps) {
     setExperimentalNoticeOpen(false)
   }
 
+  const syncFieldToActiveProfile = (personalitySection: ConfigSectionData, fieldName: string, value: unknown): ConfigSectionData | null => {
+    const selectedName = typeof personalitySection.selected_profile === 'string' ? personalitySection.selected_profile : ''
+    const existingProfiles = Array.isArray(personalitySection.profiles)
+      ? (personalitySection.profiles as ConfigSectionData[])
+      : []
+    if (!selectedName || !existingProfiles.some((prof) => prof.name === selectedName)) {
+      return null
+    }
+    return {
+      ...personalitySection,
+      profiles: existingProfiles.map((prof) => (
+        prof.name === selectedName ? { ...prof, [fieldName]: value } : prof
+      )),
+    }
+  }
+
   const updateSectionValueByPath = (sectionName: string, restPath: string[], value: unknown) => {
     const currentSectionValue = sectionValues[sectionName] ?? {}
-    const nextSectionValue =
+    let nextSectionValue =
       restPath.length === 0
         ? (value as ConfigSectionData)
         : updateNestedValue(currentSectionValue, restPath, value)
 
+    const profileSyncedPersonalityFields = new Set([
+      'personality',
+      'behavior_style',
+      'reply_style',
+      'multiple_reply_style',
+      'multiple_probability',
+      'owner_private_prompt',
+      'st_preset_file',
+      'persona_v2_card_id',
+      'mvu_enabled',
+    ])
+    if (sectionName === 'personality' && restPath.length === 1 && profileSyncedPersonalityFields.has(restPath[0])) {
+      nextSectionValue = syncFieldToActiveProfile(nextSectionValue, restPath[0], value) ?? nextSectionValue
+    }
+
     setSectionValue(sectionName, nextSectionValue)
+
+    if (
+      (sectionName === 'bot' && restPath.length === 1 && (restPath[0] === 'nickname' || restPath[0] === 'alias_names'))
+      || (sectionName === 'chat' && restPath.length === 2 && restPath[0] === 'reply_style' && (restPath[1] === 'group_chat_prompt' || restPath[1] === 'private_chat_prompts'))
+    ) {
+      const mirroredField = restPath[restPath.length - 1]
+      const currentPersonality = sectionValues.personality ?? {}
+      const mirroredPersonality = syncFieldToActiveProfile(currentPersonality, mirroredField, value)
+      if (mirroredPersonality) {
+        setSectionValue('personality', mirroredPersonality)
+      }
+    }
+
     setHasUnsavedChanges(true)
   }
 
@@ -1174,6 +1285,13 @@ function DynamicConfigTabs(props: DynamicConfigTabsProps) {
       .map((field) => ({ ...field, advanced: false })),
     nested: {},
   } : null
+  const ownerPrivatePromptSchema: ConfigSchema | null = personalitySchema ? {
+    ...personalitySchema,
+    fields: personalitySchema.fields
+      .filter((field) => field.name === 'owner_private_prompt')
+      .map((field) => ({ ...field, advanced: false })),
+    nested: {},
+  } : null
   // 基础页提供常用记忆开关，仍通过记忆配置的原始路径读写。
   const basicMemoryFields = [
     { section: 'plugin', name: 'enabled', label: '启用记忆系统' },
@@ -1193,14 +1311,20 @@ function DynamicConfigTabs(props: DynamicConfigTabsProps) {
   })
   const sectionLeadingContent = {
     personality: (
-      <div className="space-y-3">
+      <div className="space-y-4">
         <PersonalityProfiles
           values={{
             ...sectionValues.personality,
+            nickname: sectionValues.bot?.nickname,
+            alias_names: sectionValues.bot?.alias_names,
             group_chat_prompt: (sectionValues.chat?.reply_style as ConfigSectionData)?.group_chat_prompt,
             private_chat_prompts: (sectionValues.chat?.reply_style as ConfigSectionData)?.private_chat_prompts,
           }}
           onChange={(value) => { void onPersonalityChange(value) }}
+        />
+        <PersonaV2Workbench
+          personalityValues={sectionValues.personality ?? {}}
+          onReloadConfig={onReloadConfig}
         />
         {identitySchema && (
           <DynamicConfigForm
@@ -1260,6 +1384,26 @@ function DynamicConfigTabs(props: DynamicConfigTabsProps) {
             advancedVisible={advancedVisible}
           />
         )}
+        {ownerPrivatePromptSchema && ownerPrivatePromptSchema.fields.length > 0 && (
+          <div className="space-y-2 rounded-lg border border-amber-500/30 bg-amber-500/5 p-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <span className="text-xs font-medium text-amber-800 dark:text-amber-200">
+                Owner 专属私密提示词
+              </span>
+              <span className="text-[11px] text-amber-700/90 dark:text-amber-300/90">
+                仅限高信任度 OWNER 一对一私聊追加挂载，群聊绝不泄露
+              </span>
+            </div>
+            <DynamicConfigForm
+              schema={ownerPrivatePromptSchema}
+              values={sectionValues.personality ?? {}}
+              onChange={(field, value) => updateSectionValueByPath('personality', [field], value)}
+              basePath="personality"
+              hooks={fieldHooks}
+              advancedVisible={advancedVisible}
+            />
+          </div>
+        )}
       </div>
     ),
   }
@@ -1273,8 +1417,28 @@ function DynamicConfigTabs(props: DynamicConfigTabsProps) {
       return {
         ...schema,
         uiLabel: '身份与人格',
-        fields: schema.fields.filter((field) => ![...alternateStyleFieldNames, 'profiles', 'selected_profile'].includes(field.name)),
+        fields: schema.fields.filter((field) => ![
+          ...alternateStyleFieldNames,
+          'profiles',
+          'selected_profile',
+          'twin_mode_enabled',
+          'younger_slot_profile',
+          'elder_slot_profile',
+          'owner_private_prompt',
+          'persona_v2_card_id',
+          'mvu_enabled',
+        ].includes(field.name)),
         nested: Object.fromEntries(Object.entries(schema.nested ?? {}).filter(([name]) => name !== 'profiles')),
+      }
+    }
+    if (sectionName === 'twin_economy') {
+      return {
+        ...schema,
+        fields: schema.fields.filter((field) => ![
+          'away_direction_prompt',
+          'evolve_direction_prompt',
+          'return_direction_prompt',
+        ].includes(field.name)),
       }
     }
     if (sectionName === 'chat' && replyStyleSchema) {

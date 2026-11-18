@@ -254,6 +254,9 @@ def _serialize_tool_results(tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]
             prompt_html_uri = str(detail.get("prompt_html_uri") or "").strip()
         if prompt_html_uri:
             serialized_tool["prompt_html_uri"] = prompt_html_uri
+        st_telemetry = tool.get("st_telemetry")
+        if isinstance(st_telemetry, dict) and st_telemetry:
+            serialized_tool["st_telemetry"] = _normalize_payload_value(st_telemetry)
         if detail is not None:
             serialized_tool["detail"] = _normalize_payload_value(detail)
         if serialized_tool["tool_name"] == "tool_search" and serialized_tool["success"]:

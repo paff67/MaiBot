@@ -12,8 +12,19 @@ from .config_base import AttributeData
 from .official_configs import ChatReplyStyleConfig, PersonalityConfig, PersonalityProfile
 
 _switch_lock = asyncio.Lock()
-_FIELDS = {"personality", "behavior_style", "reply_style", "multiple_reply_style", "multiple_probability"}
+# 注意：background_story 为全局统一项目背景，故意不纳入 _FIELDS，切换备选人设时保持原值不变。
+_FIELDS = {
+    "personality",
+    "behavior_style",
+    "reply_style",
+    "multiple_reply_style",
+    "multiple_probability",
+    "owner_private_prompt",
+    "persona_v2_card_id",
+    "mvu_enabled",
+}
 _CHAT_FIELDS = {"group_chat_prompt", "private_chat_prompts"}
+_PROFILE_ONLY_FIELDS = {"nickname", "alias_names", "st_preset_file", "persona_v2_card_id", "mvu_enabled"}
 
 
 def current_profile(config: PersonalityConfig, reply_style: ChatReplyStyleConfig) -> Dict[str, Any]:
@@ -26,7 +37,7 @@ def current_profile(config: PersonalityConfig, reply_style: ChatReplyStyleConfig
 
 
 def profile_data(profile: PersonalityProfile) -> Dict[str, Any]:
-    return profile.model_dump(include=_FIELDS | _CHAT_FIELDS | {"name"})
+    return profile.model_dump(include=_FIELDS | _CHAT_FIELDS | _PROFILE_ONLY_FIELDS | {"name"})
 
 
 def persist_switch(path: Path, name: str) -> bool:
@@ -36,6 +47,7 @@ def persist_switch(path: Path, name: str) -> bool:
     config = PersonalityConfig.from_dict(AttributeData(), section.unwrap())
     chat_section = document["chat"]["reply_style"]
     reply_style = ChatReplyStyleConfig.from_dict(AttributeData(), chat_section.unwrap())
+    bot_section = document.get("bot") if isinstance(document, dict) else None
     target = next((profile for profile in config.profiles if profile.name == name), None)
     if target is None:
         raise ValueError(f"人设不存在: {name}")
@@ -47,6 +59,10 @@ def persist_switch(path: Path, name: str) -> bool:
     previous = next((profile for profile in profiles if profile["name"] == config.selected_profile), None)
     if previous is not None:
         previous.update(current_profile(config, reply_style))
+        if previous.get("nickname") and isinstance(bot_section, dict) and bot_section.get("nickname"):
+            previous["nickname"] = str(bot_section.get("nickname") or "")
+        if previous.get("alias_names") and isinstance(bot_section, dict) and isinstance(bot_section.get("alias_names"), list):
+            previous["alias_names"] = [str(item) for item in bot_section.get("alias_names", [])]
     else:
         backup_name = "切换前人设"
         suffix = 2
@@ -60,6 +76,11 @@ def persist_switch(path: Path, name: str) -> bool:
     # 与人格字段在同一次原子写入中更新，避免新旧人设提示词混用。
     for key, value in target.model_dump(include=_CHAT_FIELDS).items():
         chat_section[key] = value
+    if isinstance(bot_section, dict):
+        if str(target.nickname or "").strip():
+            bot_section["nickname"] = str(target.nickname).strip()
+        if target.alias_names:
+            bot_section["alias_names"] = [str(item) for item in target.alias_names]
     section["profiles"] = profiles
     section["selected_profile"] = name
     temporary_path = None

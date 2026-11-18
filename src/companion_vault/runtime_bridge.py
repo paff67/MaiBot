@@ -24,16 +24,51 @@ def _resolve_trust_role(db: CompanionTruthDB, person_id: str, user_id: str, plat
         row = db.conn.execute("SELECT trust_role FROM person_info WHERE person_id = ?", (person_id,)).fetchone()
         if row is not None:
             return row["trust_role"]
-        return "GROUP_MEMBER"
+    clean_uid = str(user_id or "").strip()
+    clean_plat = str(platform or "").strip()
     # platform_ids 为平台到账号 ID 的映射；若 person_id 直接存为平台账号 ID 也做匹配。
     for row in db.conn.execute("SELECT person_id, platform_ids, trust_role FROM person_info"):
         try:
             pids = json.loads(row["platform_ids"] or "{}")
         except (ValueError, TypeError):
             pids = {}
-        if pids.get(platform) == user_id or (user_id and row["person_id"] == user_id):
+        if pids.get(clean_plat) == clean_uid or (clean_uid and row["person_id"] == clean_uid):
             return row["trust_role"]
+    # 本地 WebUI Owner 聊天室（platform in ('internal', 'webui') 且 user_id == 'owner'）映射至 OWNER
+    if clean_plat.lower() in ("internal", "webui") and clean_uid.lower() == "owner":
+        owner_row = db.conn.execute("SELECT trust_role FROM person_info WHERE trust_role = 'OWNER' LIMIT 1").fetchone()
+        if owner_row is not None:
+            return owner_row["trust_role"]
     return "GROUP_MEMBER"
+
+
+def _resolve_owner_primary_scope(db: CompanionTruthDB) -> Dict[str, str] | None:
+    """解析 OWNER 的主微信归属域，供本地 WebUI 私聊复用作用域记忆检索。"""
+    row = db.conn.execute("SELECT person_id, platform_ids FROM person_info WHERE trust_role = 'OWNER' LIMIT 1").fetchone()
+    if row is None:
+        return None
+    owner_chat_id = str(row["person_id"] or "").strip()
+    try:
+        pids = json.loads(row["platform_ids"] or "{}")
+        if isinstance(pids, dict) and str(pids.get("wechat") or "").strip():
+            owner_chat_id = str(pids["wechat"]).strip()
+    except (ValueError, TypeError):
+        pass
+    if not owner_chat_id:
+        return None
+    prov = db.conn.execute(
+        "SELECT source, account FROM memory_provenance WHERE chat_id = ? LIMIT 1",
+        (owner_chat_id,),
+    ).fetchone()
+    if prov is None:
+        prov = db.conn.execute("SELECT source, account FROM memory_provenance LIMIT 1").fetchone()
+    if prov is None:
+        return None
+    source = str(prov["source"] or "").strip()
+    account = str(prov["account"] or "").strip()
+    if not source or not account:
+        return None
+    return {"source": source, "account": account, "chat_id": owner_chat_id}
 
 
 def _resolve_trust_role_sync(db_path: str, person_id: str, user_id: str, platform: str) -> str:
@@ -63,27 +98,33 @@ def build_owner_persona_overlay(
     clean_uid = str(user_id or "").strip()
     clean_plat = str(platform or "").strip()
     owner_notes = ""
+    owner_intro = ""
     try:
+        row = None
         if clean_uid and clean_plat:
             row = db.conn.execute(
-                "SELECT owner_private_notes, impression FROM person_info "
+                "SELECT owner_private_notes, impression, one_line_intro FROM person_info "
                 "WHERE trust_role = 'OWNER' AND (person_id = ? OR json_extract(platform_ids, ?) = ?) LIMIT 1",
                 (clean_uid, f"$.{clean_plat}", clean_uid),
             ).fetchone()
-        else:
+        if row is None:
             row = db.conn.execute(
-                "SELECT owner_private_notes, impression FROM person_info WHERE trust_role = 'OWNER' LIMIT 1"
+                "SELECT owner_private_notes, impression, one_line_intro FROM person_info WHERE trust_role = 'OWNER' LIMIT 1"
             ).fetchone()
         if row is not None:
             owner_notes = str(row["owner_private_notes"] or row["impression"] or "").strip()
+            owner_intro = str(row["one_line_intro"] or "").strip()
     except Exception:
         owner_notes = ""
+        owner_intro = ""
 
     configured_overlay = (overlay_text or os.environ.get("MAIBOT_OWNER_PERSONA_OVERLAY", "")).strip()
-    if not owner_notes and not configured_overlay:
+    if not owner_notes and not owner_intro and not configured_overlay:
         return ""
 
     parts: list[str] = ["<Owner专属关系与私密记忆层>"]
+    if owner_intro:
+        parts.append(f"- 对方核心身份：{owner_intro}")
     if owner_notes:
         parts.append(f"- 专属关系印象：{owner_notes}")
     if configured_overlay:
@@ -132,6 +173,38 @@ def get_twin_routing_state(db_path: str = DEFAULT_TRUTH_DB_PATH) -> Dict[str, An
         db.close()
 
 
+def _resolve_active_memory_scope(
+    db: CompanionTruthDB,
+    *,
+    platform: str,
+    sender_role: str,
+    is_group_chat: bool,
+    anchor_message_id: str,
+    account: str,
+    chat_id: str,
+    ledger_path: str,
+) -> Dict[str, str]:
+    """按聊天来源解析当前轮次应访问的作用域归属键 `(source, account, chat_id)`。"""
+    if platform == "wechat" and anchor_message_id:
+        from .wechat_recall import memory_scope
+
+        return memory_scope(
+            message_id=anchor_message_id,
+            platform=platform,
+            account=account,
+            chat_id=chat_id,
+            ledger_path=ledger_path,
+        )
+    if (
+        not is_group_chat
+        and str(sender_role or "").upper() == "OWNER"
+        and str(platform or "").strip().lower() in ("internal", "webui")
+        and Path(ledger_path).is_file()
+    ):
+        return _resolve_owner_primary_scope(db) or {}
+    return {}
+
+
 async def build_planner_truth_catalog_async(
     *,
     session_id: str,
@@ -165,57 +238,63 @@ async def build_planner_truth_catalog_async(
             )
             if overlay_block:
                 catalog = f"{catalog}\n\n{overlay_block}"
-            if platform == "wechat" and anchor_message_id:
-                from .wechat_recall import memory_scope
+            scope = _resolve_active_memory_scope(
+                db,
+                platform=platform,
+                sender_role=sender_role,
+                is_group_chat=is_group_chat,
+                anchor_message_id=anchor_message_id,
+                account=account,
+                chat_id=chat_id,
+                ledger_path=ledger_path,
+            )
+            if scope:
                 from .consolidator import read_scoped_memories
+                from .access_policy import authorized_file_rows
 
-                scope = memory_scope(
-                    message_id=anchor_message_id,
-                    platform=platform,
-                    account=account,
-                    chat_id=chat_id,
-                    ledger_path=ledger_path,
+                rows = read_scoped_memories(db_path, ledger_path, **scope)
+                scope_account = scope.get("account") or account
+                scope_chat_id = scope.get("chat_id") or chat_id
+                with sqlite3.connect(Path(ledger_path).resolve().as_uri() + "?mode=ro", uri=True) as ledger:
+                    file_rows = authorized_file_rows(
+                        db.conn,
+                        ledger,
+                        source=scope["source"],
+                        account=scope_account,
+                        destination_chat_id=scope_chat_id,
+                    )
+                ledger.close()
+                has_links = (
+                    db.conn.execute("SELECT 1 FROM sqlite_master WHERE name='message_asset_links'").fetchone()
+                    is not None
                 )
-                if scope:
-                    rows = read_scoped_memories(db_path, ledger_path, **scope)
-                    from .access_policy import authorized_file_rows
-
-                    with sqlite3.connect(Path(ledger_path).resolve().as_uri() + "?mode=ro", uri=True) as ledger:
-                        file_rows = authorized_file_rows(
-                            db.conn, ledger, source=scope["source"], account=account, destination_chat_id=chat_id
-                        )
-                    ledger.close()
-                    has_links = (
-                        db.conn.execute("SELECT 1 FROM sqlite_master WHERE name='message_asset_links'").fetchone()
-                        is not None
+                enriched_files = []
+                for r in file_rows:
+                    entry = {k: r[k] for k in ("file_code", "semantic_name", "mime_type")}
+                    if has_links:
+                        link_row = db.conn.execute(
+                            "SELECT msg_id FROM message_asset_links WHERE file_code=? AND account=? AND active=1 "
+                            "ORDER BY CAST(msg_id AS INTEGER) DESC LIMIT 1",
+                            (r["file_code"], scope_account),
+                        ).fetchone()
+                        if link_row is not None and link_row[0]:
+                            entry["msg_id"] = str(link_row[0])
+                    enriched_files.append(entry)
+                enriched_files.sort(
+                    key=lambda x: (
+                        int(x["msg_id"]) if str(x.get("msg_id") or "").isdigit() else 0,
+                        int(x["file_code"][2:]) if str(x.get("file_code") or "")[2:].isdigit() else 0,
                     )
-                    enriched_files = []
-                    for r in file_rows:
-                        entry = {k: r[k] for k in ("file_code", "semantic_name", "mime_type")}
-                        if has_links:
-                            link_row = db.conn.execute(
-                                "SELECT msg_id FROM message_asset_links WHERE file_code=? AND account=? AND active=1 "
-                                "ORDER BY CAST(msg_id AS INTEGER) DESC LIMIT 1",
-                                (r["file_code"], account),
-                            ).fetchone()
-                            if link_row is not None and link_row[0]:
-                                entry["msg_id"] = str(link_row[0])
-                        enriched_files.append(entry)
-                    enriched_files.sort(
-                        key=lambda x: (
-                            int(x["msg_id"]) if str(x.get("msg_id") or "").isdigit() else 0,
-                            int(x["file_code"][2:]) if str(x.get("file_code") or "")[2:].isdigit() else 0,
-                        )
-                    )
-                    catalog += "\n" + json.dumps(
-                        {
-                            "authorized_files": enriched_files[-20:],
-                            "scoped_memories": [
-                                {k: r[k] for k in ("code_index", "summary", "trigger_when")} for r in rows
-                            ],
-                        },
-                        ensure_ascii=False,
-                    )
+                )
+                catalog += "\n" + json.dumps(
+                    {
+                        "authorized_files": enriched_files[-20:],
+                        "scoped_memories": [
+                            {k: r[k] for k in ("code_index", "summary", "trigger_when")} for r in rows
+                        ],
+                    },
+                    ensure_ascii=False,
+                )
             return catalog
         finally:
             db.close()
@@ -270,34 +349,36 @@ async def load_reply_greenlights_async(
                 is_group_chat=is_group_chat,
                 include_unscoped_media_and_events=(platform != "wechat"),
             )
-            if platform == "wechat" and anchor_message_id:
-                from .wechat_recall import memory_scope
+            scope = _resolve_active_memory_scope(
+                db,
+                platform=platform,
+                sender_role=trust_role,
+                is_group_chat=is_group_chat,
+                anchor_message_id=anchor_message_id,
+                account=account,
+                chat_id=chat_id,
+                ledger_path=ledger_path,
+            )
+            if scope:
                 from .consolidator import read_scoped_memories
+                from .access_policy import authorized_file_rows
 
-                scope = memory_scope(
-                    message_id=anchor_message_id,
-                    platform=platform,
-                    account=account,
-                    chat_id=chat_id,
-                    ledger_path=ledger_path,
-                )
-                if scope:
-                    rows = read_scoped_memories(db_path, ledger_path, codes=memory_codes, **scope)
-                    memory_block += "\n" + json.dumps({"scoped_memories": rows}, ensure_ascii=False)
-                    from .access_policy import authorized_file_rows
-
-                    with sqlite3.connect(Path(ledger_path).resolve().as_uri() + "?mode=ro", uri=True) as ledger:
-                        wechat_files = authorized_file_rows(
-                            db.conn,
-                            ledger,
-                            source=scope["source"],
-                            account=account,
-                            destination_chat_id=chat_id,
-                            codes=file_codes,
-                        )
-                    ledger.close()
-                    known_files = {row["file_code"] for row in file_rows}
-                    file_rows.extend(row for row in wechat_files if row["file_code"] not in known_files)
+                rows = read_scoped_memories(db_path, ledger_path, codes=memory_codes, **scope)
+                memory_block += "\n" + json.dumps({"scoped_memories": rows}, ensure_ascii=False)
+                scope_account = scope.get("account") or account
+                scope_chat_id = scope.get("chat_id") or chat_id
+                with sqlite3.connect(Path(ledger_path).resolve().as_uri() + "?mode=ro", uri=True) as ledger:
+                    scoped_files = authorized_file_rows(
+                        db.conn,
+                        ledger,
+                        source=scope["source"],
+                        account=scope_account,
+                        destination_chat_id=scope_chat_id,
+                        codes=file_codes,
+                    )
+                ledger.close()
+                known_files = {row["file_code"] for row in file_rows}
+                file_rows.extend(row for row in scoped_files if row["file_code"] not in known_files)
             assets = AssetPipeline(
                 db,
                 os.environ.get("MAIBOT_ASSET_SPOOL", "data/companion_assets"),

@@ -266,6 +266,22 @@ class LLMServiceClient:
             prompt_text=effective_prompt_text,
         )
 
+    @staticmethod
+    def _record_compute_usage(result: LLMResponseResult) -> None:
+        """非阻塞向算力账本写入本次 LLM 调用 Token 消耗。"""
+        if not (getattr(result, "prompt_tokens", 0) or getattr(result, "completion_tokens", 0)):
+            return
+        try:
+            from src.companion_vault.compute_ledger import get_shared_compute_ledger
+
+            get_shared_compute_ledger().record_token_usage(
+                model_name=str(getattr(result, "model_name", "") or ""),
+                prompt_tokens=int(getattr(result, "prompt_tokens", 0) or 0),
+                completion_tokens=int(getattr(result, "completion_tokens", 0) or 0),
+            )
+        except Exception:
+            pass
+
     async def generate_response(
         self,
         prompt: str,
@@ -298,15 +314,18 @@ class LLMServiceClient:
             raise_when_empty=active_options.raise_when_empty,
             interrupt_flag=active_options.interrupt_flag,
             force_stream_mode=active_options.force_stream_mode,
+            extra_params=active_options.extra_params,
             session_id=self._resolve_effective_session_id(session_id),
         )
         self._record_cache_stats(result, prompt_text=prompt_text, session_id=session_id)
+        self._record_compute_usage(result)
         return result
 
     async def generate_response_from_snapshot(self, snapshot: ResponseRequest) -> LLMResponseResult:
         """复用已发送的模型、参数和工具定义，不重新选择任务默认模型。"""
         result = await self._orchestrator.generate_response_from_snapshot_async(snapshot)
         self._record_cache_stats(result, prompt_text=None, session_id=self.session_id)
+        self._record_compute_usage(result)
         return result
 
     async def generate_response_with_context(
@@ -354,9 +373,11 @@ class LLMServiceClient:
             raise_when_empty=active_options.raise_when_empty,
             interrupt_flag=active_options.interrupt_flag,
             force_stream_mode=active_options.force_stream_mode,
+            extra_params=active_options.extra_params,
             session_id=self._resolve_effective_session_id(session_id),
         )
         self._record_cache_stats(result, prompt_text=prompt_text_holder.get("prompt_text"), session_id=session_id)
+        self._record_compute_usage(result)
         return result
 
     async def generate_response_for_image(
@@ -425,6 +446,7 @@ class LLMServiceClient:
             session_id=self._resolve_effective_session_id(session_id),
         )
         self._record_cache_stats(result, prompt_text=prompt_text, session_id=session_id)
+        self._record_compute_usage(result)
         return result
 
     async def transcribe_audio(self, voice_base64: str, *, session_id: str = "") -> LLMAudioTranscriptionResult:
@@ -796,6 +818,7 @@ async def generate(request: LLMServiceRequest) -> LLMServiceResult:
                 tool_options=request.tool_options,
                 response_format=request.response_format,
                 interrupt_flag=request.interrupt_flag,
+                extra_params=dict(request.extra_params),
             ),
         )
         return LLMServiceResult.from_response_result(generation_result)

@@ -1,6 +1,7 @@
 """结构化真值库；同步接口应由异步调用方放入工作线程。"""
 
 from typing import Any, Dict, List, Sequence, Tuple
+from datetime import datetime, timezone
 import json
 import os
 import re
@@ -70,6 +71,16 @@ CREATE TABLE IF NOT EXISTS person_info (
     wechat_remark TEXT, trust_role TEXT DEFAULT 'GROUP_MEMBER', one_line_intro TEXT,
     public_impression TEXT DEFAULT '', owner_private_notes TEXT DEFAULT '',
     impression TEXT DEFAULT '', intimacy_score REAL DEFAULT 0, shared_episodes TEXT DEFAULT '[]'
+);
+CREATE TABLE IF NOT EXISTS mvu_variables (
+    card_id TEXT NOT NULL,
+    scope_key TEXT NOT NULL DEFAULT 'OWNER_PRIVATE',
+    var_key TEXT NOT NULL,
+    var_type TEXT NOT NULL DEFAULT 'string',
+    var_value TEXT NOT NULL DEFAULT '',
+    visibility TEXT NOT NULL DEFAULT 'PRIVATE' CHECK(visibility IN ('PUBLIC', 'PRIVATE')),
+    updated_at TEXT DEFAULT '',
+    PRIMARY KEY (card_id, scope_key, var_key)
 );
 """
 
@@ -183,14 +194,23 @@ class CompanionTruthDB:
         if not statements:
             raise ValueError("table_sql 不能为空")
         changes_before = self.conn.total_changes
-        allowed_tables = {"global_state", "user_status", "quests_events", "chronicle_events",
-                          "media_vault", "phone_surfing_log", "app_sop_skills", "person_info"}
+        allowed_tables = {
+            "global_state",
+            "user_status",
+            "quests_events",
+            "chronicle_events",
+            "media_vault",
+            "phone_surfing_log",
+            "app_sop_skills",
+            "person_info",
+            "mvu_variables",
+        }
         current_target_table: List[str] = [""]
 
         def authorize(action: int, arg1: str, arg2: str, database: str, source: str) -> int:
             if source is not None or database not in {None, "main"}:
                 return sqlite3.SQLITE_DENY
-            if forbid_owner_state_tables and arg1 in {"global_state", "user_status"} and action in (
+            if forbid_owner_state_tables and arg1 in {"global_state", "user_status", "mvu_variables"} and action in (
                 sqlite3.SQLITE_INSERT,
                 sqlite3.SQLITE_UPDATE,
                 sqlite3.SQLITE_DELETE,
@@ -457,6 +477,7 @@ class CompanionTruthDB:
         return (
             "<工作区运行状态>\n"
             f"- 算力工况档位：{tier_label} ({tier_code}) | 当前模型槽位：{active_slot}\n"
+            f"{away_arc_line}"
             f"{group_job_line}"
             "</工作区运行状态>"
         )
@@ -599,3 +620,171 @@ class CompanionTruthDB:
                     if row is not None:
                         files.append(dict(row))
         return "<记忆回溯>\n" + "\n".join(memories) + "\n</记忆回溯>", files
+
+    # ==================== MVU 状态变量真值读写助手 ====================
+
+    @staticmethod
+    def _serialize_mvu_value(var_type: str, raw_value: Any) -> str:
+        t = str(var_type or "string").strip().lower()
+        if t == "boolean":
+            if isinstance(raw_value, str):
+                b_val = raw_value.strip().lower() in {"true", "1", "yes", "on"}
+            else:
+                b_val = bool(raw_value)
+            return "true" if b_val else "false"
+        if t == "number":
+            try:
+                num = float(raw_value)
+                if num.is_integer():
+                    return str(int(num))
+                return str(round(num, 4))
+            except Exception:
+                return "0"
+        return str(raw_value if raw_value is not None else "")
+
+    @staticmethod
+    def _deserialize_mvu_value(var_type: str, stored_value: str) -> Any:
+        t = str(var_type or "string").strip().lower()
+        s = str(stored_value if stored_value is not None else "")
+        if t == "boolean":
+            return s.strip().lower() in {"true", "1", "yes", "on"}
+        if t == "number":
+            try:
+                num = float(s)
+                return int(num) if num.is_integer() else num
+            except Exception:
+                return 0
+        return s
+
+    def ensure_mvu_defaults(
+        self,
+        card_id: str,
+        variable_defs: Sequence[Dict[str, Any]],
+    ) -> None:
+        """幂等初始化指定人设卡的 MVU 变量默认值（已存在的变量保持原值不变）。"""
+        cid = str(card_id or "").strip()
+        if not cid or not variable_defs:
+            return
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with self.conn:
+            for vdef in variable_defs:
+                vkey = str(vdef.get("key") or "").strip()
+                if not vkey:
+                    continue
+                vtype = str(vdef.get("type") or "string").strip().lower()
+                vis = str(vdef.get("visibility") or "PUBLIC").strip().upper()
+                if vis not in {"PUBLIC", "PRIVATE"}:
+                    vis = "PUBLIC"
+                scope_key = "OWNER_PRIVATE" if vis == "PRIVATE" else "GLOBAL_PUBLIC"
+                serialized = self._serialize_mvu_value(vtype, vdef.get("default_value", ""))
+                self.conn.execute(
+                    """
+                    INSERT OR IGNORE INTO mvu_variables
+                        (card_id, scope_key, var_key, var_type, var_value, visibility, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (cid, scope_key, vkey, vtype, serialized, vis, now_iso),
+                )
+
+    def get_mvu_variable_rows(
+        self,
+        card_id: str,
+        *,
+        is_owner_private: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """
+        Fail-Closed 读取指定人设卡的 MVU 变量原始行：
+        - is_owner_private=False 时：物理 SQL 仅查询 visibility='PUBLIC' AND scope_key='GLOBAL_PUBLIC'；
+        - is_owner_private=True 时：查询 PUBLIC + PRIVATE。
+        """
+        cid = str(card_id or "").strip()
+        if not cid:
+            return []
+        if is_owner_private:
+            cur = self.conn.execute(
+                """
+                SELECT card_id, scope_key, var_key, var_type, var_value, visibility, updated_at
+                FROM mvu_variables
+                WHERE card_id = ?
+                ORDER BY var_key
+                """,
+                (cid,),
+            )
+        else:
+            cur = self.conn.execute(
+                """
+                SELECT card_id, scope_key, var_key, var_type, var_value, visibility, updated_at
+                FROM mvu_variables
+                WHERE card_id = ? AND visibility = 'PUBLIC' AND scope_key = 'GLOBAL_PUBLIC'
+                ORDER BY var_key
+                """,
+                (cid,),
+            )
+        rows: List[Dict[str, Any]] = []
+        for r in cur.fetchall():
+            d = dict(r)
+            d["typed_value"] = self._deserialize_mvu_value(d.get("var_type", "string"), d.get("var_value", ""))
+            rows.append(d)
+        return rows
+
+    def get_mvu_variables(
+        self,
+        card_id: str,
+        *,
+        is_owner_private: bool = False,
+    ) -> Dict[str, Any]:
+        """返回反序列化后的 `{var_key: typed_value}` 字典（严格遵循 Fail-Closed 物理隔离）。"""
+        rows = self.get_mvu_variable_rows(card_id, is_owner_private=is_owner_private)
+        return {str(r["var_key"]): r["typed_value"] for r in rows}
+
+    def upsert_mvu_variable(
+        self,
+        card_id: str,
+        *,
+        scope_key: str,
+        var_key: str,
+        var_type: str,
+        var_value: Any,
+        visibility: str,
+        updated_at: str = "",
+    ) -> None:
+        cid = str(card_id or "").strip()
+        vkey = str(var_key or "").strip()
+        if not cid or not vkey:
+            return
+        vis = str(visibility or "PUBLIC").strip().upper()
+        if vis not in {"PUBLIC", "PRIVATE"}:
+            vis = "PUBLIC"
+        eff_scope = str(scope_key or ("OWNER_PRIVATE" if vis == "PRIVATE" else "GLOBAL_PUBLIC")).strip()
+        ts = str(updated_at or "").strip() or datetime.now(timezone.utc).isoformat()
+        serialized = self._serialize_mvu_value(var_type, var_value)
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO mvu_variables
+                    (card_id, scope_key, var_key, var_type, var_value, visibility, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(card_id, scope_key, var_key) DO UPDATE SET
+                    var_type = excluded.var_type,
+                    var_value = excluded.var_value,
+                    visibility = excluded.visibility,
+                    updated_at = excluded.updated_at
+                """,
+                (cid, eff_scope, vkey, str(var_type or "string"), serialized, vis, ts),
+            )
+
+    def reset_mvu_variables(
+        self,
+        card_id: str,
+        *,
+        variable_defs: Sequence[Dict[str, Any]] = (),
+    ) -> Dict[str, Any]:
+        """将指定人设卡的所有 MVU 变量重置回 Schema 默认值。"""
+        cid = str(card_id or "").strip()
+        if not cid:
+            return {}
+        with self.conn:
+            self.conn.execute("DELETE FROM mvu_variables WHERE card_id = ?", (cid,))
+        if variable_defs:
+            self.ensure_mvu_defaults(cid, variable_defs)
+        return self.get_mvu_variables(cid, is_owner_private=True)

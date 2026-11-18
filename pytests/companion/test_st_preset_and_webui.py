@@ -1,4 +1,4 @@
-"""STPresetEngine（含 Meowssiah-2.0.11 模板编译、解包）、WebUI 在线编辑页面与双子 LLM 动态叙事路由全套单元测试。"""
+"""STPresetEngine（含 Meowssiah-2.1.7 模板编译、解包）、WebUI 在线编辑页面与双子 LLM 动态叙事路由全套单元测试。"""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from src.companion_vault.st_preset_engine import (
+    SPreset_SYSTEM_EFFORT_ZERO,
     STCompileContext,
     STHistoryTurn,
     STPresetEngine,
@@ -16,16 +17,24 @@ from src.companion_vault.st_preset_engine import (
 from src.companion_vault.twin_narrative_router import TwinNarrativeDirector
 from src.llm_models.model_client.gemini_client import _convert_messages
 from src.llm_models.payload_content.context_item import FunctionCallOutputItem, SystemMessageItem
-from src.llm_models.payload_content.tool_option import ToolCall
+from src.llm_models.payload_content.tool_option import (
+    ToolCall,
+    ToolOption,
+    ToolParam,
+    ToolParamType,
+    normalize_tool_options,
+)
 from src.plugin_runtime.runner.manifest_validator import PluginManifest
 from src.plugin_runtime.webui_schema import CustomPage, DeclarativePage, load_webui_extension
 
-MEOWSSIAH_PATH = Path(r"E:\Downloads\Meowssiah-2.0.11.json")
+MEOWSSIAH_PATH = Path(r"E:\Downloads\Meowssiah-2.1.7.json")
+TEMPLATE_217_PATH = Path(__file__).resolve().parents[2] / "plugins" / "st_preset_engine" / "templates" / "Meowssiah-2.1.7.json"
 
 
 def _sample_meowssiah_or_fallback() -> dict:
-    if MEOWSSIAH_PATH.is_file():
-        return json.loads(MEOWSSIAH_PATH.read_text(encoding="utf-8"))
+    for candidate in (MEOWSSIAH_PATH, TEMPLATE_217_PATH):
+        if candidate.is_file():
+            return json.loads(candidate.read_text(encoding="utf-8"))
     return {
         "temperature": 1.09,
         "prompts": [
@@ -76,7 +85,7 @@ def _sample_meowssiah_or_fallback() -> dict:
     }
 
 def test_meowssiah_spreset_tool_envelope_compilation_and_gemini_projection():
-    """验证 Meowssiah-2.0.11 编译为零 System Prompt 工具信封，且可无损转换为 Gemini Content 序列。"""
+    """验证 Meowssiah-2.1.7 编译为 EFFORT LEVEL 0 + 工具信封，且可无损转换为 Gemini Content 序列。"""
     engine = STPresetEngine(_sample_meowssiah_or_fallback())
     assert engine.is_spreset_tool_envelope() is True
 
@@ -94,7 +103,9 @@ def test_meowssiah_spreset_tool_envelope_compilation_and_gemini_projection():
     )
     compiled = engine.compile_to_context_items(ctx)
     assert compiled.protocol == "spreset_tool_envelope"
-    assert not any(isinstance(it, SystemMessageItem) for it in compiled.context_items)
+    assert isinstance(compiled.context_items[0], SystemMessageItem)
+    assert compiled.extra_params.get("thinking_level") == "LOW"
+    assert compiled.extra_params.get("include_thoughts") is False
 
     tool_outputs = [it for it in compiled.context_items if isinstance(it, FunctionCallOutputItem)]
     assert len(tool_outputs) >= 3
@@ -103,7 +114,7 @@ def test_meowssiah_spreset_tool_envelope_compilation_and_gemini_projection():
     assert "过来靠近一点，我帮你揉揉手腕" in tool_outputs[-1].output
 
     contents, sys_inst = _convert_messages(compiled.context_items)
-    assert sys_inst is None
+    assert sys_inst == SPreset_SYSTEM_EFFORT_ZERO
     assert len(contents) >= 5
 
     unwrapped_clean = STPresetEngine.unwrap_response(
@@ -238,3 +249,229 @@ async def test_twin_narrative_director_llm_dynamic_generation(tmp_path: Path):
 
     bridge = await director.generate_elder_return_bridge(evolved_arc=arc2, balance_usd=15.0, recent_chat_excerpt="刚充好电费")
     assert "深烘黑咖啡" in bridge
+
+
+def test_spreset_external_tools_observations_convergence_and_optional_slots():
+    """验证 SPreset 外部原生工具归一化、tool_observations 收敛、soliumbra_reply 可选字段及预设条目约束。"""
+    repo_root = Path(__file__).resolve().parents[2]
+    tpl_path = repo_root / "plugins" / "st_preset_engine" / "templates" / "Meowssiah-WeChat-IM.json"
+    data_path = repo_root / "data" / "presets" / "Meowssiah-WeChat-IM.json"
+    assert tpl_path.is_file() and data_path.is_file()
+    assert tpl_path.read_text(encoding="utf-8") == data_path.read_text(encoding="utf-8")
+
+    preset_data = json.loads(tpl_path.read_text(encoding="utf-8"))
+    order_100001 = next(g for g in preset_data["prompt_order"] if g.get("character_id") == 100001)["order"]
+    idx_map = {item["identifier"]: idx for idx, item in enumerate(order_100001)}
+    assert idx_map["catgod-native-tool-dispatch"] + 1 == idx_map["3df19ba7-b44d-4d46-b17a-de514d86e5d5"]
+    for twin_id in ("twin_away_direction", "twin_evolve_direction", "twin_return_direction"):
+        assert idx_map[twin_id] > 50
+
+    engine = STPresetEngine(preset_data)
+    framing = engine.extract_director_framing_blocks(STCompileContext(char_name="许妍", user_name="paff"))
+    assert "available_external_tools" not in framing
+    assert "soliumbra_reply" not in framing.lower()
+
+    # Pass 1: 注入多种形状的 external_tools（OpenAI function / 扁平 dict / ToolOption），并过滤内部保留工具
+    ext_tools = [
+        {"name": "reply", "description": "应被跳过", "parameters_schema": {"type": "object", "properties": {}}},
+        {"name": "soliumbra_reply", "description": "应被跳过", "parameters_schema": {"type": "object", "properties": {}}},
+        {"name": "context", "description": "应被跳过", "parameters_schema": {"type": "object", "properties": {}}},
+        {
+            "type": "function",
+            "function": {
+                "name": "query_memory",
+                "description": "检索长期记忆\n涉及回忆时使用。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string", "description": "关键词"}},
+                    "required": ["query"],
+                },
+            },
+        },
+        {
+            "name": "query_person_profile",
+            "description": "查询人物档案信息。",
+            "parameters": {
+                "type": "object",
+                "properties": {"person_name": {"type": "string"}},
+                "required": ["person_name"],
+            },
+        },
+        ToolOption(
+            name="wait",
+            description="群聊等待一段时间后再看。",
+            params=[ToolParam("seconds", ToolParamType.INTEGER, "等待秒数", True)],
+        ),
+        {
+            "name": "stop",
+            "description": "结束本轮思考并等待新消息。",
+            "parameters_schema": {"type": "object", "properties": {}, "required": []},
+        },
+    ]
+
+    compiled_p1 = engine.compile_to_context_items(
+        STCompileContext(
+            char_name="许妍",
+            user_name="paff",
+            last_user_message="还记得我们上周去根津买咖啡豆那次吗？",
+            external_tools=ext_tools,
+            protocol_mode="spreset_tool_envelope",
+        )
+    )
+    tool_names = [t["name"] for t in compiled_p1.tool_definitions]
+    assert tool_names == [
+        "soliumbra_reply",
+        "context",
+        "query_memory",
+        "query_person_profile",
+        "wait",
+        "stop",
+    ]
+    # 校验生成的 tool_definitions 完全兼容 LLMGenerationOptions.tool_options 归一化管线
+    normalized_opts = normalize_tool_options(compiled_p1.tool_definitions)
+    assert normalized_opts is not None
+    assert [opt.name for opt in normalized_opts] == tool_names
+
+    sol_schema = compiled_p1.tool_definitions[0]["parameters_schema"]
+    assert "propertyOrdering" not in sol_schema
+    prop_keys = list(sol_schema["properties"].keys())
+    assert "persona_slot" in prop_keys
+    assert "quote_msg_id" in prop_keys
+    assert prop_keys.index("think_nya") < prop_keys.index("game_content")
+    assert "persona_slot" not in sol_schema["required"]
+    assert "quote_msg_id" not in sol_schema["required"]
+
+    sync_p1 = json.loads(compiled_p1.context_items[-1].output)
+    assert [item["name"] for item in sync_p1["available_external_tools"]] == [
+        "query_memory",
+        "query_person_profile",
+        "wait",
+        "stop",
+    ]
+    assert "\n" not in sync_p1["available_external_tools"][0]["description"]
+    assert "tool_observations" not in sync_p1
+    assert compiled_p1.extra_params["tool_config"]["function_calling_config"]["allowed_function_names"] == [
+        "soliumbra_reply",
+        "query_memory",
+        "query_person_profile",
+        "wait",
+        "stop",
+    ]
+
+    # Pass 2: 回灌 tool_observations，必须收敛到 ["soliumbra_reply"]
+    observations = [
+        {
+            "tool": "query_memory",
+            "args": {"query": "根津 咖啡豆"},
+            "result": "上周五傍晚许妍和姐姐在根津老巷买了埃塞水洗手冲豆。",
+        }
+    ]
+    compiled_p2 = engine.compile_to_context_items(
+        STCompileContext(
+            char_name="许妍",
+            user_name="paff",
+            last_user_message="还记得我们上周去根津买咖啡豆那次吗？",
+            external_tools=ext_tools,
+            tool_observations=observations,
+            protocol_mode="spreset_tool_envelope",
+        )
+    )
+    sync_p2 = json.loads(compiled_p2.context_items[-1].output)
+    assert "available_external_tools" not in sync_p2
+    assert sync_p2["tool_observations"] == observations
+    assert "soliumbra_reply" in sync_p2["status"]
+    assert compiled_p2.extra_params["tool_config"]["function_calling_config"]["allowed_function_names"] == [
+        "soliumbra_reply"
+    ]
+
+    # 验证 persona_slot 与 quote_msg_id 解包提取（含缺省回退空串）
+    unwrapped_slots = STPresetEngine.unwrap_response(
+        tool_calls=[
+            ToolCall(
+                call_id="c_slot",
+                func_name="soliumbra_reply",
+                args={
+                    "think_nya": "切到姐姐回应喵~",
+                    "game_content": "<game>那包豆子我收在吧台柜子里了</game>",
+                    "persona_slot": "sister_elder",
+                    "quote_msg_id": "m42",
+                },
+            )
+        ],
+        output_mode="im_clean",
+    )
+    assert unwrapped_slots.persona_slot == "sister_elder"
+    assert unwrapped_slots.quote_msg_id == "m42"
+    assert unwrapped_slots.visible_text == "那包豆子我收在吧台柜子里了"
+
+    unwrapped_default = STPresetEngine.unwrap_response(
+        tool_calls=[
+            {
+                "function": {
+                    "name": "soliumbra_reply",
+                    "arguments": json.dumps(
+                        {
+                            "think_nya": "普通回复喵",
+                            "game_content": "<game>嗯嗯记得</game>",
+                        },
+                        ensure_ascii=False,
+                    ),
+                }
+            }
+        ],
+        output_mode="im_clean",
+    )
+    assert unwrapped_default.persona_slot == ""
+    assert unwrapped_default.quote_msg_id == ""
+
+
+def test_gemini_client_tool_role_and_reasoning_only_empty_exception():
+    """验证 Gemini _convert_messages 将 FunctionCallOutputItem 映射为 user，且仅有 reasoning 无工具调用时抛出 EmptyResponseException 触发重试。"""
+    import io
+    from types import SimpleNamespace
+    import pytest
+
+    from src.llm_models.exceptions import EmptyResponseException
+    from src.llm_models.model_client.gemini_client import (
+        _build_stream_api_response,
+        _default_normal_response_parser,
+    )
+    from src.llm_models.payload_content.context_item import (
+        ContextItemMeta,
+        ContextToolCall,
+        FunctionCallItem,
+    )
+
+    meta = ContextItemMeta.create(logical_turn_id="turn_gemini_role")
+    fc_item = FunctionCallItem(
+        meta=meta,
+        tool_call=ContextToolCall.create(call_id="c_ctx", func_name="context", args={"query": "sync"}),
+    )
+    fr_item = FunctionCallOutputItem(
+        meta=meta,
+        call_id="c_ctx",
+        tool_name="context",
+        output='{"ok": true}',
+    )
+    contents, _ = _convert_messages([fc_item, fr_item])
+    assert [c.role for c in contents] == ["model", "user"]
+    assert all(c.role in {"user", "model"} for c in contents)
+
+    fake_resp = SimpleNamespace(
+        candidates=[
+            SimpleNamespace(
+                content=SimpleNamespace(parts=[SimpleNamespace(text="thinking...", thought=True)]),
+                finish_reason="UNKNOWN_19",
+            )
+        ],
+        text=None,
+        function_calls=None,
+        usage_metadata=None,
+    )
+    with pytest.raises(EmptyResponseException):
+        _default_normal_response_parser(fake_resp, logical_turn_id="turn_malformed")
+
+    c_buf = io.StringIO("")
+    r_buf = io.StringIO("only thought content")
+    with pytest.raises(EmptyResponseException):
+        _build_stream_api_response(c_buf, r_buf, [], fake_resp, "turn_malformed_stream")

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import asyncio
 import base64
 import binascii
+import json
 import time
 import uuid
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple, cast
@@ -57,6 +58,62 @@ class ChatHistoryMessage(BaseModel):
     sender_name: str
     sender_id: Optional[str] = None
     is_bot: bool = False
+    persona_slot: Optional[str] = None
+
+
+def resolve_bot_persona_identity(msg: SessionMessage) -> Tuple[Optional[str], str]:
+    """解析出站或历史机器人消息的值班槽位与展示名（sister_younger / sister_elder）。"""
+    raw_cfg = getattr(getattr(msg, "message_info", None), "additional_config", None) or {}
+    if isinstance(raw_cfg, str):
+        try:
+            parsed_cfg = json.loads(raw_cfg)
+            additional_config = parsed_cfg if isinstance(parsed_cfg, dict) else {}
+        except Exception:
+            additional_config = {}
+    elif isinstance(raw_cfg, dict):
+        additional_config = raw_cfg
+    else:
+        additional_config = {}
+
+    raw_slot = str(additional_config.get("persona_slot") or "").strip()
+    raw_name = str(additional_config.get("persona_name") or "").strip()
+    user_info = getattr(getattr(msg, "message_info", None), "user_info", None)
+    user_nick = str(getattr(user_info, "user_nickname", "") or "").strip()
+    persona_slot: Optional[str] = raw_slot if raw_slot in {"sister_younger", "sister_elder"} else None
+    slot_nick = ""
+
+    if bool(getattr(global_config.personality, "twin_mode_enabled", False)):
+        try:
+            elder_prof = global_config.personality.resolve_slot_profile(
+                "sister_elder", global_config.bot, global_config.chat.reply_style
+            )
+            younger_prof = global_config.personality.resolve_slot_profile(
+                "sister_younger", global_config.bot, global_config.chat.reply_style
+            )
+            elder_nick = str(getattr(elder_prof, "nickname", "") or "").strip()
+            younger_nick = str(getattr(younger_prof, "nickname", "") or "").strip()
+            if persona_slot == "sister_elder":
+                slot_nick = elder_nick
+            elif persona_slot == "sister_younger":
+                slot_nick = younger_nick
+            else:
+                check_name = raw_name or user_nick
+                if elder_nick and check_name == elder_nick:
+                    persona_slot = "sister_elder"
+                    slot_nick = elder_nick
+                elif younger_nick and check_name == younger_nick:
+                    persona_slot = "sister_younger"
+                    slot_nick = younger_nick
+        except Exception:
+            pass
+
+    persona_name = (
+        raw_name
+        or slot_nick
+        or user_nick
+        or str(getattr(global_config.bot, "nickname", "") or "麦麦").strip()
+    )
+    return persona_slot, persona_name
 
 
 @dataclass
@@ -115,14 +172,23 @@ class ChatHistoryManager:
             len(segments) == 1 and segments[0].get("type") == "text"
         )
 
+        persona_slot: Optional[str] = None
+        if is_bot:
+            persona_slot, sender_name = resolve_bot_persona_identity(msg)
+            sender_id = f"bot:{persona_slot}" if persona_slot else "bot"
+        else:
+            sender_name = user_info.user_nickname or "未知用户"
+            sender_id = user_id
+
         return {
             "id": msg.message_id,
             "type": "bot" if is_bot else "user",
             "content": msg.processed_plain_text or "",
             "timestamp": msg.timestamp.timestamp(),
-            "sender_name": user_info.user_nickname or (global_config.bot.nickname if is_bot else "未知用户"),
-            "sender_id": "bot" if is_bot else user_id,
+            "sender_name": sender_name,
+            "sender_id": sender_id,
             "is_bot": is_bot,
+            "persona_slot": persona_slot if is_bot else None,
             "message_type": "rich" if is_rich else "text",
             "segments": segments if is_rich else None,
         }

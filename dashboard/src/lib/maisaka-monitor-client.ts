@@ -272,6 +272,15 @@ export interface MaisakaTimingGateBlock {
   }
 }
 
+export interface MaisakaStTelemetry {
+  persona_slot?: string
+  persona_name?: string
+  thinking?: string
+  summary?: string
+  comment?: string
+  mvu_watch?: unknown
+}
+
 export interface MaisakaFinalizedToolResult {
   session_id?: string
   session_name?: string
@@ -291,6 +300,7 @@ export interface MaisakaFinalizedToolResult {
   summary: string
   prompt_html_uri?: string
   detail?: unknown
+  st_telemetry?: MaisakaStTelemetry
   matched_tool_names?: string[]
   newly_discovered_tool_names?: string[]
 }

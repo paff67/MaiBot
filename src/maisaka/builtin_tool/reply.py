@@ -34,7 +34,14 @@ if TYPE_CHECKING:
 
 logger = get_logger("maisaka_builtin_reply")
 _REPLY_TOOL_INTERNAL_ARGUMENTS = {
-    "msg_id", "_reply_id", "_plugin_reply_prompt", "_recalled_memory_block", "_recalled_file_parts",
+    "msg_id",
+    "_reply_id",
+    "_plugin_reply_prompt",
+    "_recalled_memory_block",
+    "_recalled_file_parts",
+    "_precomputed_st_response",
+    "_external_tools",
+    "_tool_observations",
 }
 _DUPLICATE_TARGET_REPLY_REMINDER_ARG = "_duplicate_target_reply_reminder"
 _DUPLICATE_TARGET_REPLY_REMINDER_TEMPLATE = (
@@ -294,6 +301,9 @@ def _build_monitor_metadata(reply_result: ReplyGenerationResult, reply_id: str =
             *monitor_detail.get("extra_sections", []),
             {"title": "回复补充编排", "content": json.dumps(supplement_detail, ensure_ascii=False, indent=2)},
         ]
+    st_telemetry = reply_result.metrics.extra.get("st_telemetry")
+    if isinstance(st_telemetry, dict) and st_telemetry:
+        metadata["st_telemetry"] = deepcopy(st_telemetry)
     if isinstance(monitor_detail, dict):
         metadata["monitor_detail"] = monitor_detail
     return metadata
@@ -426,6 +436,8 @@ async def handle_tool(
             f"{tool_ctx.runtime.log_prefix} 检测到 reply 工具参数被重复包裹，已自动解包: "
             f"调用编号={invocation.call_id}"
         )
+    for internal_key in _REPLY_TOOL_INTERNAL_ARGUMENTS - {"msg_id"}:
+        invocation_arguments.pop(internal_key, None)
     return await execute_reply(tool_ctx, invocation_arguments, call_id=invocation.call_id)
 
 
@@ -436,6 +448,7 @@ async def execute_reply(
     call_id: str,
     target_message: Optional[SessionMessage] = None,
     supplement_runner: Optional[Callable[[], Awaitable["ReplySupplement"]]] = None,
+    precomputed: Optional[Any] = None,
 ) -> ToolExecutionResult:
     """共用回复执行入口，保留附件、插件扩展、Hook 和发送统计。
 
@@ -444,7 +457,15 @@ async def execute_reply(
     supplement_runner 在正文生成时并行运行；两者完成并校验后才开始发送。
     """
 
-    invocation_arguments = deepcopy(arguments)
+    precomputed_st_response = precomputed if precomputed is not None else arguments.get("_precomputed_st_response")
+    raw_external_tools = arguments.get("_external_tools")
+    raw_tool_observations = arguments.get("_tool_observations")
+    raw_recalled_memory_block = str(arguments.get("_recalled_memory_block") or "")
+    raw_recalled_file_parts = list(arguments.get("_recalled_file_parts") or [])
+    copy_safe_arguments = {
+        key: value for key, value in arguments.items() if key != "_precomputed_st_response"
+    }
+    invocation_arguments = deepcopy(copy_safe_arguments)
     if type(invocation_arguments.get("attach_emoji")) is int and invocation_arguments["attach_emoji"] == 0:
         invocation_arguments.pop("attach_emoji")
     reply_reference = invocation_arguments.get("reply_reference")
@@ -466,8 +487,39 @@ async def execute_reply(
         for key, value in invocation_arguments.items()
         if key not in _REPLY_TOOL_INTERNAL_ARGUMENTS
     }
+    if raw_recalled_memory_block:
+        reply_tool_args["_recalled_memory_block"] = raw_recalled_memory_block
+    if raw_recalled_file_parts:
+        reply_tool_args["_recalled_file_parts"] = raw_recalled_file_parts
+    if raw_external_tools is not None:
+        reply_tool_args["_external_tools"] = list(raw_external_tools)
+    if raw_tool_observations is not None:
+        reply_tool_args["_tool_observations"] = list(raw_tool_observations)
+    if precomputed_st_response is not None:
+        reply_tool_args["_precomputed_st_response"] = precomputed_st_response
     if not _use_expression_intent():
         reply_tool_args.pop("expression_intent", None)
+
+    if not target_message_id:
+        if target_message is not None and getattr(target_message, "message_id", ""):
+            target_message_id = str(target_message.message_id).strip()
+        else:
+            latest_user_msg = next(
+                (
+                    msg
+                    for msg in reversed(getattr(tool_ctx.runtime, "_chat_history", []))
+                    if isinstance(msg, SessionBackedMessage)
+                    and msg.source_kind == "user"
+                    and getattr(msg, "message_id", "")
+                ),
+                None,
+            )
+            if latest_user_msg is not None:
+                target_message_id = str(latest_user_msg.message_id).strip()
+                logger.warning(
+                    f"{tool_ctx.runtime.log_prefix} Planner 调用 reply 时未传 msg_id，"
+                    f"已自动回退锚定到最近一条用户消息 msg_id={to_display_message_id(target_message_id)}"
+                )
 
     if not target_message_id:
         return tool_ctx.build_failure_result(
@@ -508,14 +560,20 @@ async def execute_reply(
             account=target_message.account_id or '',
             chat_id=target_message.message_info.group_info.group_id if target_message.message_info.group_info else target_message.message_info.user_info.user_id,
         )
-        reply_tool_args["_recalled_memory_block"] = memory_block
-        reply_tool_args["_recalled_file_parts"] = file_parts
+        if memory_block:
+            prev_mem = reply_tool_args.get("_recalled_memory_block", "")
+            reply_tool_args["_recalled_memory_block"] = f"{prev_mem}\n{memory_block}".strip() if prev_mem else memory_block
+        if file_parts:
+            reply_tool_args["_recalled_file_parts"] = [*reply_tool_args.get("_recalled_file_parts", []), *file_parts]
 
     if quote_kwargs:
         from src.companion_vault.wechat_recall import build_quote_context_async
         quote_block, quote_parts = await build_quote_context_async([target_message])
-        reply_tool_args['_recalled_memory_block'] = reply_tool_args.get('_recalled_memory_block','') + '\n' + quote_block
-        reply_tool_args['_recalled_file_parts'] = [*reply_tool_args.get('_recalled_file_parts',[]),*quote_parts]
+        if quote_block and quote_block not in reply_tool_args.get("_recalled_memory_block", ""):
+            prev_mem = reply_tool_args.get("_recalled_memory_block", "")
+            reply_tool_args["_recalled_memory_block"] = f"{prev_mem}\n{quote_block}".strip() if prev_mem else quote_block
+        if quote_parts:
+            reply_tool_args["_recalled_file_parts"] = [*reply_tool_args.get("_recalled_file_parts", []), *quote_parts]
 
     extension_execution = ReplyExtensionExecution(
         context=ToolAvailabilityContext(
@@ -575,9 +633,38 @@ async def execute_reply(
     )
     if previous_target_reply:
         reply_tool_args = _with_duplicate_target_reply_reminder(reply_tool_args, previous_target_reply)
+
+    reasoning_engine = getattr(tool_ctx.runtime, "_reasoning_engine", None)
+    turn_decision = getattr(reasoning_engine, "_current_turn_decision", None)
+    if turn_decision is not None:
+        if getattr(turn_decision, "forced_slot", None):
+            reply_tool_args["persona_slot"] = turn_decision.forced_slot
+            away_arc = str(getattr(turn_decision, "elder_away_arc", "") or "").strip()
+            if away_arc:
+                prev_ref = str(reply_tool_args.get("reply_reference") or "").strip()
+                away_note = f"[姐姐离场锁定状态：本轮仅妹妹值班；姐姐当前情况：{away_arc}，回复时须与该状态保持一致，不可替姐姐直接说话。]"
+                reply_tool_args["reply_reference"] = f"{prev_ref}\n\n{away_note}" if prev_ref else away_note
+        elif not str(reply_tool_args.get("persona_slot") or "").strip():
+            rec_slot = str(getattr(turn_decision, "recommended_slot", "") or "").strip()
+            if rec_slot in {"sister_younger", "sister_elder"}:
+                reply_tool_args["persona_slot"] = rec_slot
+        transient_note = str(getattr(turn_decision, "transient_narrative_note", "") or "").strip()
+        if transient_note:
+            prev_ref = str(reply_tool_args.get("reply_reference") or "").strip()
+            note_block = f"[本轮剧情衔接：{transient_note}]"
+            if transient_note not in prev_ref:
+                reply_tool_args["reply_reference"] = f"{prev_ref}\n\n{note_block}" if prev_ref else note_block
+        reply_tool_args["_sender_trust_role"] = str(getattr(turn_decision, "sender_trust_role", "") or "")
+        reply_tool_args["_is_owner_private"] = bool(getattr(turn_decision, "is_owner_private", False))
+
     supplement: Optional["ReplySupplement"] = None
     try:
-        tool_ctx.runtime._update_stage_status("Replyer", "生成可见回复及富文本编排" if supplement_runner else "生成可见回复")
+        stage_desc = (
+            "解析预计算 ST 回复"
+            if precomputed_st_response is not None
+            else ("生成可见回复及富文本编排" if supplement_runner else "生成可见回复")
+        )
+        tool_ctx.runtime._update_stage_status("Replyer", stage_desc)
         generation = replyer.generate_reply_with_context(
             reply_reason="",
             stream_id=tool_ctx.runtime.session_id,
@@ -645,12 +732,17 @@ async def execute_reply(
         reply_tool_args["reply_supplement"] = supplement.plan.model_dump()
         invocation_arguments["reply_supplement"] = supplement.plan.model_dump()
 
+    hook_reply_tool_args = {
+        key: value
+        for key, value in reply_tool_args.items()
+        if key not in {"_precomputed_st_response", "_recalled_file_parts"}
+    }
     try:
         reply_text, post_process_options = await _invoke_before_post_process_hook(
             tool_ctx,
             reply_text,
             target_message_id,
-            reply_tool_args,
+            hook_reply_tool_args,
         )
     except Exception as exc:
         logger.warning(f"{tool_ctx.runtime.log_prefix} 回复文本后处理前 Hook 调用失败，将使用默认策略: {exc}")
@@ -723,6 +815,36 @@ async def execute_reply(
     reply_result.text_fragments = reply_segments
     reply_result.monitor_detail = build_reply_monitor_detail(reply_result)
     reply_metadata = _build_monitor_metadata(reply_result, extension_execution.reply_id)
+    st_telemetry = (
+        reply_result.metrics.extra.get("st_telemetry")
+        if isinstance(getattr(getattr(reply_result, "metrics", None), "extra", None), dict)
+        else None
+    )
+    raw_persona_slot = str(
+        (st_telemetry.get("persona_slot") if isinstance(st_telemetry, dict) else None)
+        or reply_tool_args.get("persona_slot")
+        or "sister_younger"
+    ).strip()
+    persona_slot = "sister_elder" if raw_persona_slot == "sister_elder" else "sister_younger"
+    slot_profile = (
+        replyer._resolve_slot_profile({"persona_slot": persona_slot})
+        if hasattr(replyer, "_resolve_slot_profile")
+        else None
+    )
+    persona_name = str(
+        (st_telemetry.get("persona_name") if isinstance(st_telemetry, dict) else None)
+        or (
+            replyer._resolve_slot_display_name(persona_slot, slot_profile)
+            if hasattr(replyer, "_resolve_slot_display_name")
+            else ""
+        )
+        or config_module.global_config.bot.nickname
+        or "许妍"
+    ).strip()
+    outbound_extra_config: dict[str, Any] = {
+        "persona_slot": persona_slot,
+        "persona_name": persona_name,
+    }
     if extension_execution.targets:
         reply_metadata["reply_extensions"] = list(extension_execution.parameters)
     # 旧链路按首段正文与当前聊天情境抽样一次；补充器明确选定的引用挂在首段正文上。
@@ -814,6 +936,7 @@ async def execute_reply(
                     typing=index > 0,
                     sync_to_maisaka_history=True,
                     maisaka_source_kind="guided_reply",
+                    extra_config=outbound_extra_config,
                 )
                 sent = sent_message is not None
                 if not sent:
@@ -862,7 +985,7 @@ async def execute_reply(
         )
 
     target_user_info = target_message.message_info.user_info
-    bot_name = config_module.global_config.bot.nickname.strip() or "MaiSaka"
+    bot_name = persona_name or config_module.global_config.bot.nickname.strip() or "MaiSaka"
     if is_bot_self(tool_ctx.runtime.chat_stream.platform, target_user_info.user_id):
         # 自身消息只是回复的引用锚点，不能把其作者当作实际收件人。
         target_user_name = ""
@@ -885,6 +1008,8 @@ async def execute_reply(
             "reply_segments": reply_segments,
             "send_results": send_results,
             "target_user_name": target_user_name,
+            "persona_slot": persona_slot,
+            "persona_name": persona_name,
         },
         metadata=reply_metadata,
     )

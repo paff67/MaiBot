@@ -244,6 +244,8 @@ def _is_truth_owner(conn: sqlite3.Connection, platform: str, user_id: str) -> bo
             "SELECT trust_role FROM person_info WHERE person_id = ? OR json_extract(platform_ids, ?) = ? LIMIT 1",
             (clean_uid, f"$.{clean_plat}", clean_uid),
         ).fetchone()
+        if row is None and clean_plat.lower() in ("internal", "webui") and clean_uid.lower() == "owner":
+            row = conn.execute("SELECT trust_role FROM person_info WHERE trust_role = 'OWNER' LIMIT 1").fetchone()
     else:
         row = conn.execute("SELECT trust_role FROM person_info WHERE person_id = ? LIMIT 1", (clean_uid,)).fetchone()
     return bool(row and _clean_text(row["trust_role"]).upper() == "OWNER")
@@ -314,6 +316,14 @@ def _query_companion_truth_profile(
                 matched_row = conn.execute(
                     f"SELECT {projection} FROM person_info WHERE person_id = ? OR platform_ids LIKE ? LIMIT 1",
                     (clean_user_id, f'%"{clean_user_id}"%'),
+                ).fetchone()
+            if (
+                matched_row is None
+                and clean_platform.lower() in ("internal", "webui")
+                and clean_user_id.lower() == "owner"
+            ):
+                matched_row = conn.execute(
+                    f"SELECT {projection} FROM person_info WHERE trust_role = 'OWNER' LIMIT 1"
                 ).fetchone()
 
         if matched_row is None and clean_person_name:

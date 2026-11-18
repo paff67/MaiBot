@@ -621,8 +621,17 @@ def process_llm_response_segments(
 
     if len(segments) > max_sentence_num:
         if global_config.response_splitter.enable_overflow_return_all:
-            logger.warning(f"分割后消息数量过多 ({len(segments)} 条)，直接返回原文")
-            segments = [ProcessedResponseSegment(cleaned_text)]
+            if "\n" in cleaned_text:
+                logger.warning(f"分割后消息数量过多 ({len(segments)} 条)，改按自然段合并切分")
+                line_segments = [
+                    ProcessedResponseSegment(line.strip(), separator="\n")
+                    for line in cleaned_text.splitlines()
+                    if line.strip()
+                ]
+                segments = line_segments or [ProcessedResponseSegment(cleaned_text)]
+            else:
+                logger.warning(f"分割后消息数量过多 ({len(segments)} 条)，直接返回原文")
+                segments = [ProcessedResponseSegment(cleaned_text)]
         else:
             logger.warning(f"分割后消息数量过多 ({len(segments)} 条)，返回默认回复")
             return [ProcessedResponseSegment(_get_random_default_reply())]

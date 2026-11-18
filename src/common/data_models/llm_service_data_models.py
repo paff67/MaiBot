@@ -51,6 +51,7 @@ class LLMServiceRequest(BaseDataModel):
     max_tokens: int | None = None
     response_format: RespFormat | None = None
     interrupt_flag: asyncio.Event | None = None
+    extra_params: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         """校验请求对象的必要字段。
@@ -257,6 +258,7 @@ class LLMGenerationOptions(BaseDataModel):
     interrupt_flag: asyncio.Event | None = None
     raise_when_empty: bool = True
     force_stream_mode: bool = False
+    extra_params: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)

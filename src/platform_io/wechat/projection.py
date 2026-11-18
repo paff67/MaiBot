@@ -36,10 +36,11 @@ def get_self_wxid(explicit_wxid: str = "") -> str:
 
 
 def get_dynamic_bot_aliases() -> set[str]:
-    """从 global_config.bot 动态读取当前人设名称与别名，彻底解除硬编码（保持模块轻量延迟加载）"""
+    """从 global_config.bot 与双子槽位人格库动态读取当前人设名称与别名，彻底解除硬编码（保持模块轻量延迟加载）"""
     aliases: set[str] = set()
     try:
         from src.config.config import global_config
+
         bot_cfg = getattr(global_config, "bot", None)
         if bot_cfg:
             nick = str(getattr(bot_cfg, "nickname", "") or "").strip()
@@ -49,6 +50,24 @@ def get_dynamic_bot_aliases() -> set[str]:
                 clean_a = str(a or "").strip()
                 if clean_a:
                     aliases.add(clean_a)
+
+        pers_cfg = getattr(global_config, "personality", None)
+        if pers_cfg and bool(getattr(pers_cfg, "twin_mode_enabled", False)):
+            slot_targets = {
+                str(getattr(pers_cfg, "younger_slot_profile", "") or "").strip(),
+                str(getattr(pers_cfg, "elder_slot_profile", "") or "").strip(),
+            }
+            for profile in getattr(pers_cfg, "profiles", []) or []:
+                prof_name = str(getattr(profile, "name", "") or "").strip()
+                if slot_targets and any(slot_targets) and prof_name not in slot_targets:
+                    continue
+                prof_nick = str(getattr(profile, "nickname", "") or "").strip()
+                if prof_nick:
+                    aliases.add(prof_nick)
+                for a in getattr(profile, "alias_names", []) or []:
+                    clean_a = str(a or "").strip()
+                    if clean_a:
+                        aliases.add(clean_a)
     except Exception:
         pass
     return aliases or {"麦麦"}

@@ -50,4 +50,63 @@ describe('personality import card', () => {
     expect(screen.getByRole('alert')).toHaveTextContent('仅支持')
     expect(screen.getByRole('button', { name: '继续编辑' })).toBeDisabled()
   })
+
+  it('toggles twin_mode_enabled and switches full twin slot fields on one-click sister switch', () => {
+    const onChange = vi.fn()
+    const youngerProfile = {
+      name: '妹妹',
+      personality: '妹妹性格',
+      behavior_style: '妹妹行为',
+      reply_style: '妹妹说话风格',
+      group_chat_prompt: '妹妹群聊',
+      private_chat_prompts: '妹妹私聊',
+      multiple_reply_style: [],
+      multiple_probability: 0.1,
+      nickname: '许妍',
+      alias_names: ['妍妍'],
+      owner_private_prompt: '妹妹对Owner撒娇',
+      st_preset_file: 'Meowssiah-WeChat-IM.json',
+    }
+    const elderProfile = {
+      name: '姐姐',
+      personality: '姐姐性格',
+      behavior_style: '姐姐行为',
+      reply_style: '姐姐说话风格',
+      group_chat_prompt: '姐姐群聊',
+      private_chat_prompts: '姐姐私聊',
+      multiple_reply_style: [],
+      multiple_probability: 0.0,
+      nickname: '姐姐大人',
+      alias_names: ['大妍'],
+      owner_private_prompt: '姐姐对Owner毒舌又温柔',
+      st_preset_file: 'Elder-Preset.json',
+    }
+    render(
+      <PersonalityProfiles
+        values={{
+          ...youngerProfile,
+          selected_profile: '妹妹',
+          profiles: [youngerProfile, elderProfile],
+          twin_mode_enabled: false,
+          younger_slot_profile: '妹妹',
+          elder_slot_profile: '姐姐',
+        }}
+        onChange={onChange}
+      />,
+    )
+
+    fireEvent.click(screen.getByRole('switch', { name: /启用双子人格切换/ }))
+    expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ twin_mode_enabled: true }))
+
+    onChange.mockClear()
+    fireEvent.click(screen.getByRole('button', { name: '切到姐姐编辑' }))
+    expect(onChange).toHaveBeenCalledWith(expect.objectContaining({
+      selected_profile: '姐姐',
+      nickname: '姐姐大人',
+      alias_names: ['大妍'],
+      owner_private_prompt: '姐姐对Owner毒舌又温柔',
+      st_preset_file: 'Elder-Preset.json',
+      personality: '姐姐性格',
+    }))
+  })
 })

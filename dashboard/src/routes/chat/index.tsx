@@ -575,7 +575,12 @@ export function ChatPage() {
                 ? [...buildMessageSegments(data.raw_content || '', data.images || [], data.emojis || []), ...(data.files || []).map(file => ({ type: 'file' as const, data: file }))]
                 : undefined,
             timestamp: data.timestamp || Date.now() / 1000,
-            sender: data.sender,
+            sender: data.sender
+              ? {
+                  ...data.sender,
+                  persona_slot: data.sender.persona_slot ?? undefined,
+                }
+              : undefined,
           })
           break
         }
@@ -603,6 +608,12 @@ export function ChatPage() {
           setTabs((prev) =>
             prev.map((tab) => {
               if (tab.id !== tabId) return tab
+              const botPersonaSlot =
+                (typeof data.sender?.persona_slot === 'string' && data.sender.persona_slot) ||
+                (typeof data.persona_slot === 'string' && data.persona_slot) ||
+                undefined
+              const botSenderName =
+                data.sender?.name || tab.sessionInfo.bot_name || t('chat.botNameFallback')
               const newMessage: ChatMessage = {
                 id: generateMessageId('bot'),
                 type: 'bot',
@@ -610,7 +621,14 @@ export function ChatPage() {
                 message_type: (data.message_type === 'rich' ? 'rich' : 'text') as 'text' | 'rich',
                 segments: data.segments,
                 timestamp: data.timestamp || Date.now() / 1000,
-                sender: data.sender,
+                sender: {
+                  name: botSenderName,
+                  user_id:
+                    data.sender?.user_id ||
+                    (botPersonaSlot ? `bot:${botPersonaSlot}` : 'bot'),
+                  is_bot: true,
+                  persona_slot: botPersonaSlot,
+                },
               }
               return {
                 ...tab,
@@ -673,6 +691,10 @@ export function ChatPage() {
             processedSet.add(contentHash)
             const isRich =
               msg.message_type === 'rich' && Array.isArray(msg.segments) && msg.segments.length > 0
+            const botPersonaSlot =
+              isBot && typeof msg.persona_slot === 'string' && msg.persona_slot
+                ? msg.persona_slot
+                : undefined
             return {
               id: msgId,
               type: isBot ? 'bot' : ('user' as const),
@@ -683,8 +705,10 @@ export function ChatPage() {
               sender: {
                 name:
                   msg.sender_name || (isBot ? t('chat.botNameFallback') : t('chat.userFallback')),
-                user_id: msg.sender_id,
+                user_id:
+                  msg.sender_id || (isBot && botPersonaSlot ? `bot:${botPersonaSlot}` : undefined),
                 is_bot: isBot,
+                persona_slot: botPersonaSlot,
               },
             }
           })
@@ -695,7 +719,24 @@ export function ChatPage() {
             processedSet.delete(firstKey)
           }
           processedMessagesMapRef.current.set(tabId, processedSet)
-          updateTab(tabId, { messages: formattedMessages })
+          const latestHistoryTimestamp = formattedMessages.reduce(
+            (maxTs, item) => Math.max(maxTs, item.timestamp || 0),
+            0
+          )
+          setTabs((prev) =>
+            prev.map((tab) => {
+              if (tab.id !== tabId) return tab
+              const staleError =
+                tab.runtimeStatus?.kind === 'error' &&
+                latestHistoryTimestamp > 0 &&
+                tab.runtimeStatus.updatedAt < latestHistoryTimestamp
+              return {
+                ...tab,
+                messages: formattedMessages,
+                runtimeStatus: staleError ? null : tab.runtimeStatus,
+              }
+            })
+          )
           setIsLoadingHistory(false)
           break
         }
@@ -897,6 +938,18 @@ export function ChatPage() {
               if (!matchesMonitorTarget(tab, event.data)) {
                 return tab
               }
+              const errorTimestamp = event.data.timestamp || 0
+              const latestMessageTimestamp = tab.messages.reduce(
+                (maxTs, message) => Math.max(maxTs, message.timestamp || 0),
+                0
+              )
+              if (
+                errorTimestamp > 0 &&
+                latestMessageTimestamp > 0 &&
+                errorTimestamp < latestMessageTimestamp
+              ) {
+                return tab
+              }
               const currentStatus = tab.runtimeStatus
               return {
                 ...tab,
@@ -906,7 +959,7 @@ export function ChatPage() {
                   stage: currentStatus?.stage,
                   detail: event.data.message,
                   retry: currentStatus?.retry,
-                  updatedAt: event.data.timestamp || Date.now() / 1000,
+                  updatedAt: errorTimestamp || Date.now() / 1000,
                 },
               }
             })

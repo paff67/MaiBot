@@ -1076,3 +1076,51 @@ SELECT COUNT(*) FROM wechat_driver_quarantine;
    - 补齐 `pytests/maisaka/test_reasoning_engine.py` 旧单测对防线一 Fail-Closed 默认群聊脱敏契约的双态断言；
    - 实跑全量关联套件（`pytests/companion` + `pytests/platform_io` + `pytests/maisaka/test_reasoning_engine.py`）共计 **142 passed, 0 failed**，`ruff check` 零错误通过；
    - 同步更新 `deploy/embodied/OPERATIONS_MANUAL.md` 与 `media.env.example` 的去硬编码生产部署核对清单。
+
+---
+
+## 十三、Phase 6：原生双子并发槽位、`Meowssiah-WeChat-IM` 解包与 WebUI 全链路闭环
+
+在保持第五章（`CLEANROOM_REFACTOR_SPEC.md`）四道物理级记忆防线零退化的前提下，在分支 `feat/phase6-twins-native-runtime` 完成 Phase 6 全四步工程落地（权威执行基准见 `docs/PHASE6_TWINS_EXECUTION_GUIDE.md`）：
+
+1. **`Meowssiah-WeChat-IM` 微信特调预设与兼容解包引擎（Step 1）**：
+   - 模板固化于 `plugins/st_preset_engine/templates/Meowssiah-WeChat-IM.json` 并支持自举同步至 `data/presets/Meowssiah-WeChat-IM.json`：完整保留 `[43]` 历史回顾、`[20~26]` 风格控制以及 `[47] <summary>` / `[48] <comment>` 开关，仅关闭 `[35]` 千字输出限制与 `[46] <options>`，并将 `[30]` 替换为微信真人短句回信规范。
+   - 升级 `src/companion_vault/st_preset_engine.py`：兼容提取 `<thinking>` / `<think>` / `<think_nya>` 与原生 `reasoning` 字段；微信出站 `visible_text` 严格只放行 `<game>` 纯净对话气泡，并将思维链、场记小总结与猫猫留言保留在遥测结构供 WebUI 查看；`extract_director_framing_blocks` 自动将外挂工具标识 `soliumbra_reply` 清洗为原生 `reply`。
+
+2. **原生双子槽位、算力经济路由与导演叙事演进（Step 2）**：
+   - 原生配置与模型槽位扩展：`src/config/official_configs.py`、`src/config/config.py`、`src/config/model_configs.py`、`src/services/service_task_resolver.py`、`src/config/personality_service.py` 与 `src/webui/routers/config.py` 落地 `PersonalityProfile` 扩展字段、`twin_mode_enabled` / `younger_slot_profile` / `elder_slot_profile`、`TwinEconomyConfig` 动态阈值，以及 `planner_flash` / `replyer_elder` 任务槽位（未配置时自动回退默认槽位）。
+   - 算力账本与动态双子路由：`src/services/llm_service.py`（`LLMServiceClient._record_compute_usage`）全局接入 `src/companion_vault/compute_ledger.py`；`src/companion_vault/twin_runtime_router.py`（`TwinRuntimeRouter`）联动 `src/companion_vault/twin_narrative_router.py`（`TwinNarrativeDirector`）按算力水位实现非 Owner 休眠、低余额动态生成与演进 `elder_away_arc` 并切换 Flash 妹妹值守、回血回归衔接及高余额智能路由。
+   - Planner / Replyer 主链路打通与 Fail-Closed 隐私铁律：`src/maisaka/chat_loop_service.py`、`src/maisaka/builtin_tool/reply.py`、`src/chat/replyer/maisaka_generator_base.py`、`src/chat/replyer/retro_prompt.py` 与 `src/maisaka/reasoning_engine.py` 支持三段式导演帧注入、按 `persona_slot` 切换真实姐妹 Profile 与模型，以及私聊 `one_pass_st` 模式；`MaisakaGeneratorBase._resolve_is_owner_private` 通过 `runtime_bridge._resolve_trust_role_sync` 与 `MAIBOT_TRUTH_DB_PATH` 严格校验 `(not is_group_chat) and (sender_trust_role == "OWNER")`，绝不仅凭私聊状态放行 `owner_private_prompt`。
+
+3. **原生 WebUI `/config/bot` 与 `/chat` 遥测闭环（Step 3）**：
+   - `/config/bot` 双子控制台：`dashboard/src/routes/config/bot/PersonalityProfiles.tsx` 与 `dashboard/src/routes/config/bot.tsx`、`dashboard/src/lib/personality-import.ts` 直接在「身份与人格」页顶部集成双子槽位绑定、妹妹/姐姐一键切换、`owner_private_prompt` 编辑器与 `TwinEconomyConfig` 配置面板，并与底层配置双向同步。
+   - `/chat` 思维链与场记卡遥测：`src/maisaka/monitor/events.py` 将 `st_telemetry` 挂载在 `tool` 顶层以绕过 `src/maisaka/monitor/planner_delta.py` 的 `detail` 裁剪，`dashboard/src/lib/maisaka-monitor-client.ts` 与 `dashboard/src/routes/monitor/maisaka-monitor.tsx`（`PlannerToolResultCard`）渲染值班姐妹徽章、模型标识、可折叠 `<thinking>` 思维链、`📏 小总结` 与 `🐱 猫猫留言`。
+   - 本地生产打包入口：`src/webui/app.py` 增加 `_is_local_dashboard_enabled()` 支持通过环境变量 `MAIBOT_USE_LOCAL_DASHBOARD=1`（见 `deploy/embodied/media.env.example`）托管 `dashboard/dist` 构建产物。
+
+4. **全链路回归与前后端构建验证（Step 4）**：
+   - `ruff check src/companion_vault/ src/maisaka/ src/chat/replyer/ src/config/ src/services/ src/webui/ src/platform_io/wechat/ pytests/companion/`：`All checks passed!`；
+   - 后端定向 + 回归测试：`pytests/companion/ pytests/maisaka/ pytests/platform_io/ pytests/webui/test_app.py tests/test_personality_service.py` 共计 **435 passed, 0 failed**（含 `pytests/companion/test_phase6_twins_and_wechat_preset.py` **5 passed**）；
+   - 前端（`dashboard/`）：`npm run typecheck` 通过，`npx vitest run src/lib/__tests__/personality-import.test.ts src/routes/config/bot/PersonalityProfiles.test.tsx src/lib/__tests__/maisaka-monitor-client.test.ts` 共 **3 个测试文件 / 30 tests passed**，`npm run build` 成功生成 `dashboard/dist`。
+   - 本地端点冒烟：`STPresetEngine.from_file("plugins/st_preset_engine/templates/Meowssiah-WeChat-IM.json")` 编译 24 条 `context_items` 并通过 `LLMServiceClient` 请求当前配置的 `DeepSeek` 端点；因工作区 `config/model_config.toml` 仅含占位密钥且未配置 Gemini 密钥，远端返回预期 `401 Authentication Fails`。
+5. **真实生产环境与真机全链路联调实测（`DMIT-US` + 小米 10 `1f56a0a3`）**：
+   - 热修复与生产配置同步：修复 `src/chat/replyer/maisaka_generator_base.py`（`L986-991`）对模型任务解析的调用错误并同步至 `DMIT-US:/opt/maibot-brain`；完成 `/etc/maibot-media.env`（`MAIBOT_USE_LOCAL_DASHBOARD=1`）、`data/presets/_engine_config.json`（`Meowssiah-WeChat-IM` + `spreset_tool_envelope` + `im_clean`）、`config/model_config.toml`（`planner_flash = ["gemini-3.8-flash"]`、`replyer_elder = ["gemini-4-argon"]`）与 `config/bot_config.toml`（`twin_mode_enabled = true`、`younger_slot_profile = "许妍"`、`elder_slot_profile = "许清"`）生产配置落地。
+   - 远端门禁与实时 Gemini + 双子路由实测：在 `DMIT-US` 执行 `python3 -m compileall -q src/ plugins/` 与 `pytest pytests/companion/test_phase6_twins_and_wechat_preset.py pytests/companion/test_st_preset_and_webui.py -v` 通过（**8 passed, 5.84s**）；真实调用 `api.0-0.pro/v1beta`（`gemini-3.8-flash` / `soliumbra_reply` 封套）零拒绝输出干净微信对话气泡；`TwinRuntimeRouter` 基于实时余额 `$0.72`（`THRIFTY` 省流态）自动扣费并调用 `TwinNarrativeDirector` 按 `Asia/Tokyo` 时钟动态生成持久化 `elder_away_arc`。
+   - 原生 WebUI 与生产服务验证：`maibot-main.service` 及 5 个伴随守护服务全部 `active`（核心插件与 `maibot-team.st-preset-engine` / `maibot-team.embodied-workspace` 零失败加载）；`http://127.0.0.1:8001/` 实测直接托管 `/opt/maibot-brain/dashboard/dist/index.html` 与 `bot-MtRFtpWz.js`、`maisaka-monitor-DHcR65YC.js` 懒加载产物（HTTP 200），`ConfigSchemaGenerator.generate_schema(Config)` 包含 `twin_economy` 配置段。
+   - 端到端链路与真机心跳验收（历史记录）：生成的微信正文不含内部标签；Owner 私聊、Owner 群内发言和普通成员私聊按不同权限处理。监控端收到了预期遥测，手机端心跳及云端事件轮询正常。公开记录不包含聊天账号、群号、设备序列号或内网地址。
+
+---
+
+## 十四、 Persona V2 立体人设、3 层共享 MVU 引擎与缺口审计闭环
+
+1. **《潜令V1.8》双生姊妹 Persona V2 立体人设与共享空间定型**：
+   - `data/personas/maibot_xuyue.json`（24 岁前 DeepMind 核心研究员 / 独立 AGI 架构师，`card_id="maibot_xuyue"`，`name="许玥"`）与 `data/personas/maibot_xuyan.json`（21 岁东大工学部具身智能修士 / 大提琴手，`card_id="maibot_xuyan"`，`name="许妍"`），连同 `plugins/st_preset_engine/templates/personas/` 同名模板与 `*_qianling_full.json` 变体，统一锁定真实地理坐标 **東京都台東区池之端1丁目4-33『ブリリアタワー上野池之端』15层转角大平层**。
+   - 双卡按 `maibot.persona.v2` schema（`PersonaV2Card`）完整收拢 `core_persona`、`relationship_stages`（`0~120` 分段）、`mvu_config`、`past_experiences`（各 14 条）与 `sample_corpora`（各 32 条），并通过 `shared_namespace="twin_xu"` 共用跨槽位 MVU 状态空间与客厅主机/共享手机/微信号设定。
+2. **核心链路缺口审计与补齐（A / B / C）**：
+   - **A（`src/services/llm_service.py` ComputeLedger 挂载）**：`LLMServiceClient._record_compute_usage(result)` 已接入 `generate_response`、`generate_response_from_snapshot` 与 `generate_response_with_context`；审计补齐遗漏分支 **`generate_response_for_image()`**，确保视觉/图像推理调用同样向 `get_shared_compute_ledger().record_token_usage(...)` 上报真实 Token 消耗。
+   - **B（`src/maisaka/chat_loop_service.py` / `reasoning_engine.py` / `builtin_tool/reply.py` 动态路由透传）**：`ReasoningEngine._run_planner_request` 已将 `TwinTurnDecision.planner_task_name` 经 `task_override` 传入 `_run_interruptible_planner` -> `chat_loop_step` -> `_get_llm_chat_client`。审计并修复 3 处子缺口：
+     1. `chat_loop_service.py` 无条件透传非空 `task_override` 至 `_get_llm_chat_client`；
+     2. `src/maisaka/builtin_tool/reply.py` 当 `forced_slot` 为空且工具未显式传 `persona_slot` 时，回落继承 `turn_decision.recommended_slot`；
+     3. `ReasoningEngine._reply_from_planner_content` 兜底路径同步从 `_current_turn_decision` 注入 `persona_slot`。
+   - **C（`src/maisaka/monitor/events.py` / `dashboard/src/routes/monitor/maisaka-monitor.tsx` 遥测闭环）**：`events.py` 已在 tool results 顶层挂载 `st_telemetry` 并穿透 `PlannerDeltaEncoder` 精简逻辑，监控台 `PlannerToolResultCard` 已渲染 `<thinking>` / `<summary>` / `<comment>` 与 `mvu_watch`。审计并修复 `maisaka-monitor.tsx` 姐姐值班徽章仅匹配 `'elder'` 而未匹配后端 `'sister_elder'` 的显示错位、`MessageList.tsx` 对 `许玥` 系列名称识别与 `'玥'` 字兜底头像、以及 `maisaka-monitor-client.ts` 中 `MaisakaStTelemetry.mvu_watch` 类型声明。
+3. **3 层共享 MVU 与 Persona V2 API/WebUI 联动**：
+   - 通过 `src/companion_vault/persona_v2_engine.py`、`src/companion_vault/mvu_engine.py`（`shared:twin_xu` 作用域）与 `src/webui/routers/persona_v2.py` 对接前端 `PersonaV2Workbench.tsx`，支持多卡切换、MVU 初始化与 `<UpdateVariable>` 实时状态演进展示。

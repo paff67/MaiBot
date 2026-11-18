@@ -50,6 +50,76 @@ interface BubbleAvatarProps {
   imageUrl?: string
 }
 
+type TwinPersonaSlot = 'sister_younger' | 'sister_elder'
+
+function resolveBotPersonaSlot(message: ChatMessage): TwinPersonaSlot | undefined {
+  if (message.type !== 'bot') {
+    return undefined
+  }
+  const rawSlot = message.sender?.persona_slot?.trim()
+  if (rawSlot === 'sister_elder' || rawSlot === 'sister_younger') {
+    return rawSlot
+  }
+  const userId = message.sender?.user_id?.trim()
+  if (userId === 'bot:sister_elder') return 'sister_elder'
+  if (userId === 'bot:sister_younger') return 'sister_younger'
+
+  const name = message.sender?.name?.trim() ?? ''
+  if (
+    name === '许玥' ||
+    name === '玥姐' ||
+    name === '阿玥' ||
+    name === '许玥（潜令全量版）' ||
+    name === '许清' ||
+    name === '清姐' ||
+    name === '姐姐' ||
+    name === '许汐'
+  ) {
+    return 'sister_elder'
+  }
+  if (
+    name === '许妍' ||
+    name === '妍妍' ||
+    name === '小妍' ||
+    name === '许妍（潜令全量版）' ||
+    name === '妹妹'
+  ) {
+    return 'sister_younger'
+  }
+  return undefined
+}
+
+const SISTER_AVATAR_CACHE = new Map<string, string>()
+
+function buildSisterAvatarDataUri(slot: TwinPersonaSlot, senderName: string): string {
+  const rawGlyph = Array.from(senderName.trim()).at(-1) ?? ''
+  const safeGlyph = rawGlyph.replace(/[<>&"']/g, '') || (slot === 'sister_elder' ? '玥' : '妍')
+  const cacheKey = `${slot}:${safeGlyph}`
+  const cached = SISTER_AVATAR_CACHE.get(cacheKey)
+  if (cached) {
+    return cached
+  }
+  const isElder = slot === 'sister_elder'
+  const c1 = isElder ? '#38bdf8' : '#fb7185'
+  const c2 = isElder ? '#4f46e5' : '#f59e0b'
+  const accent = isElder ? '#e0f2fe' : '#fff1f2'
+  const mark = isElder
+    ? '<path d="M50 11a14 14 0 0 0 11 11 14 14 0 0 0-11-11Z" fill="#e0f2fe" opacity="0.9"/>'
+    : '<circle cx="48" cy="16" r="4" fill="#fff1f2" opacity="0.9"/><circle cx="53" cy="21" r="2.2" fill="#fef3c7"/>'
+  const svg = [
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">',
+    `<defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="${c1}"/><stop offset="100%" stop-color="${c2}"/></linearGradient></defs>`,
+    '<rect width="64" height="64" rx="14" fill="url(#g)"/>',
+    `<rect x="3" y="3" width="58" height="58" rx="11" fill="none" stroke="${accent}" stroke-opacity="0.35" stroke-width="1.5"/>`,
+    mark,
+    `<text x="32" y="42" text-anchor="middle" font-family="system-ui,-apple-system,sans-serif" font-size="27" font-weight="700" fill="#ffffff">${safeGlyph}</text>`,
+    '</svg>',
+  ].join('')
+  const dataUri = `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`
+  SISTER_AVATAR_CACHE.set(cacheKey, dataUri)
+  return dataUri
+}
+
 function BubbleAvatar({ type, visible, imageUrl }: BubbleAvatarProps) {
   return (
     <div className="h-8 w-8 shrink-0 sm:h-9 sm:w-9">
@@ -444,11 +514,15 @@ export function MessageList({
                 }
 
                 const previous = messages[index - 1]
+                const prevPersonaSlot = previous ? resolveBotPersonaSlot(previous) : undefined
+                const currPersonaSlot = resolveBotPersonaSlot(message)
                 const sameGroup = Boolean(
                   previous &&
                   previous.type === message.type &&
+                  prevPersonaSlot === currPersonaSlot &&
                   (previous.sender?.user_id ?? previous.sender?.name) ===
-                    (message.sender?.user_id ?? message.sender?.name)
+                    (message.sender?.user_id ?? message.sender?.name) &&
+                  (previous.sender?.name ?? '') === (message.sender?.name ?? '')
                 )
                 let rowContent: ReactNode
                 let spacingClass = 'py-2'
@@ -471,10 +545,23 @@ export function MessageList({
                   const isUser = message.type === 'user'
                   const bubbleType: 'user' | 'bot' = isUser ? 'user' : 'bot'
                   const senderName = message.sender?.name || (isUser ? userName : botDisplayName)
+                  const roleTag =
+                    currPersonaSlot === 'sister_elder'
+                      ? '姐姐'
+                      : currPersonaSlot === 'sister_younger'
+                        ? '妹妹'
+                        : ''
+                  const metaName = roleTag ? `${senderName} · ${roleTag}` : senderName
+                  const resolvedAvatarSrc =
+                    bubbleType === 'bot'
+                      ? currPersonaSlot
+                        ? buildSisterAvatarDataUri(currPersonaSlot, senderName)
+                        : botAvatarUrl
+                      : userAvatarUrl
                   spacingClass = index === 0 ? 'pb-0.5' : sameGroup ? 'py-0.5' : 'pt-3 pb-0.5'
                   rowContent = (
-                    <MessageBubble name={senderName} time={formatTime(message.timestamp)} outgoing={isUser} showMeta={!sameGroup}
-                      avatar={!sameGroup && <ConversationAvatar name={senderName} bot={!isUser} src={bubbleType === 'bot' ? botAvatarUrl : userAvatarUrl} />}>
+                    <MessageBubble name={metaName} time={formatTime(message.timestamp)} outgoing={isUser} showMeta={!sameGroup}
+                      avatar={!sameGroup && <ConversationAvatar name={senderName} bot={!isUser} src={resolvedAvatarSrc} />}>
                       <RenderMessageContent message={message} />
                     </MessageBubble>
                   )

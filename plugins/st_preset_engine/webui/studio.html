@@ -89,14 +89,14 @@
     </div>
 
     <div class="card">
-      <h3>3. 双子离场 / 演进 / 回归 LLM 动态方向约束 Prompt</h3>
-      <label>跌破阈值（&lt; 3 USD）姐姐动态离场约束</label>
+      <h3>3. 双子离场 / 演进 / 回归 LLM 动态方向约束 Prompt <span class="tag">已绑定预设条目 🌙双子叙事丨...</span></h3>
+      <label>跌破阈值（&lt; 3 USD）姐姐动态离场约束（绑定条目：<code>🌙双子叙事丨省流姐姐动态离场约束</code>）</label>
       <textarea id="tw-away"></textarea>
-      <label>妹妹值班期间场外状态演进约束</label>
+      <label>妹妹值班期间场外状态演进约束（绑定条目：<code>🌙双子叙事丨持续省流场外状态演进约束</code>）</label>
       <textarea id="tw-evolve"></textarea>
-      <label>经费恢复后姐姐自然回归衔接约束</label>
+      <label>经费恢复后姐姐自然回归衔接约束（绑定条目：<code>🌙双子叙事丨经费恢复姐姐自然回归衔接约束</code>）</label>
       <textarea id="tw-return"></textarea>
-      <div style="margin-top:8px"><button id="btn-save-twin">保存双子动态叙事约束</button></div>
+      <div style="margin-top:8px"><button id="btn-save-twin">保存双子动态叙事约束（同步写回预设条目）</button></div>
     </div>
 
     <div class="card">
@@ -158,8 +158,8 @@
       const chk = document.createElement("input"); chk.type = "checkbox"; chk.checked = !!e.enabled;
       chk.onclick = async (ev) => {
         ev.stopPropagation();
-        const res = await window.maibot.action("update_entry", { preset_name: curPreset, identifier: e.identifier, enabled: chk.checked });
-        curEntries = res.preset.entries; renderEntries();
+        await window.maibot.action("update_entry", { preset_name: curPreset, identifier: e.identifier, enabled: chk.checked });
+        await refreshAll();
       };
       const title = document.createElement("span"); title.textContent = `${idx + 1}. ${e.name}`;
       left.appendChild(chk); left.appendChild(title);
@@ -210,7 +210,7 @@
   $("btn-save-entry").onclick = async () => {
     if (curIdx < 0 || !curPreset) return;
     const e = curEntries[curIdx];
-    const res = await window.maibot.action("update_entry", {
+    await window.maibot.action("update_entry", {
       preset_name: curPreset,
       identifier: e.identifier,
       name: $("ed-name").value,
@@ -220,8 +220,7 @@
       scope_guard: $("ed-guard").value,
       content: $("ed-content").value,
     });
-    curEntries = res.preset.entries;
-    renderEntries();
+    await refreshAll();
     setTag("条目已保存");
   };
 
@@ -248,6 +247,7 @@
       evolve_direction_prompt: $("tw-evolve").value,
       return_direction_prompt: $("tw-return").value,
     });
+    await refreshAll();
     setTag("双子动态约束已保存");
   };
 

@@ -165,10 +165,13 @@ vi.mock('@/components/dynamic-form', () => ({
 }))
 
 vi.mock('@/lib/config-api', () => ({
+  BOT_CONFIG_UPDATED_EVENT: 'maibot:bot-config-updated',
   getBotConfig: vi.fn(),
   getBotConfigCached: vi.fn(),
   getBotConfigRaw: vi.fn(),
   getBotConfigSchema: vi.fn(),
+  getModelConfig: vi.fn(),
+  invalidateBotConfigCache: vi.fn(),
   updateBotConfig: vi.fn(),
   updateBotConfigRaw: vi.fn(),
   updateBotConfigSection: vi.fn(),
@@ -228,6 +231,16 @@ function createDeferred<T>() {
 
 /** 页面挂载时应注册的字段 hook 路径与类型（replace 为缺省） */
 const EXPECTED_FIELD_HOOKS: Array<[string, 'replace' | 'wrapper' | 'hidden']> = [
+  ['desktop_pet.skin_id', 'replace'],
+  ['agent.connection', 'wrapper'],
+  ['agent.desktop_manifest', 'wrapper'],
+  ['agent.acp_args', 'wrapper'],
+  ['agent.acp_command', 'wrapper'],
+  ['agent.acp_cwd', 'wrapper'],
+  ['agent.acp_env', 'wrapper'],
+  ['agent.acp_model', 'wrapper'],
+  ['agent.acp_timeout', 'wrapper'],
+  ['chat.reply_timing.private_reply_pause_rules', 'replace'],
   ['bot.platform', 'hidden'],
   ['bot.alias_names', 'replace'],
   ['bot.qq_account', 'hidden'],
@@ -239,6 +252,8 @@ const EXPECTED_FIELD_HOOKS: Array<[string, 'replace' | 'wrapper' | 'hidden']> = 
   ['experimental.focus_groups', 'replace'],
   ['expression.expression_groups', 'replace'],
   ['expression.learning_list', 'replace'],
+  ['expression.learning_blacklist', 'replace'],
+  ['jargon.learning_blacklist', 'replace'],
   ['jargon.jargon_groups', 'replace'],
   ['jargon.learning_list', 'replace'],
   ['a_memorix.global_memory_sharing_enabled', 'hidden'],
@@ -357,6 +372,9 @@ beforeEach(() => {
   vi.mocked(configApi.getBotConfigCached).mockResolvedValue(baseConfig())
   vi.mocked(configApi.getBotConfig).mockResolvedValue(baseConfig())
   vi.mocked(configApi.getBotConfigSchema).mockResolvedValue(baseSchema() as never)
+  vi.mocked(configApi.getModelConfig).mockResolvedValue({
+    model_task_config: { embedding: { model_list: [] } }, models: [], api_providers: [],
+  } as never)
   // 实际接口返回 { content } 对象，页面从 .content 取原始 TOML
   vi.mocked(configApi.getBotConfigRaw).mockResolvedValue({
     content: 'title = "hello\\nworld"',

@@ -63,6 +63,7 @@ import { useResolvedAvatarUrl, type AvatarTargetType } from '@/lib/avatar-url'
 import { useVirtualizerUnmountGuard } from '@/lib/use-virtualizer-unmount-guard'
 import { useToast } from '@/hooks/use-toast'
 import { backendApi } from '@/lib/http'
+import type { MaisakaMvuWatch } from '@/lib/persona-v2-api'
 import { cn } from '@/lib/utils'
 
 import type {
@@ -1719,6 +1720,174 @@ function PlannerToolResultCard({
         {tool.tool_name === 'reply' && (
           <ReplyToolArguments tool={tool} messages={messages} onJumpToMessage={onJumpToMessage} />
         )}
+        {(() => {
+          const stTelemetry = tool.st_telemetry as
+            | (NonNullable<typeof tool.st_telemetry> & { mvu_watch?: MaisakaMvuWatch })
+            | undefined
+          const mvuWatch = stTelemetry?.mvu_watch
+          const activeStageLabel =
+            typeof mvuWatch?.active_stage === 'string'
+              ? mvuWatch.active_stage
+              : mvuWatch?.active_stage && typeof mvuWatch.active_stage === 'object'
+                ? mvuWatch.active_stage.stage_name || mvuWatch.active_stage.stage_id || ''
+                : ''
+          const hasMvuWatch = Boolean(
+            mvuWatch &&
+              (activeStageLabel ||
+                mvuWatch.analysis?.trim() ||
+                (Array.isArray(mvuWatch.changes) && mvuWatch.changes.length > 0))
+          )
+
+          if (
+            !stTelemetry ||
+            !(
+              stTelemetry.persona_slot ||
+              stTelemetry.persona_name ||
+              stTelemetry.thinking ||
+              stTelemetry.summary ||
+              stTelemetry.comment ||
+              hasMvuWatch
+            )
+          ) {
+            return null
+          }
+
+          return (
+            <div className="mt-2 space-y-2 rounded-md border border-border/60 bg-muted/20 p-2.5 text-xs">
+              <div className="flex flex-wrap items-center gap-1.5">
+                {(stTelemetry.persona_slot || stTelemetry.persona_name) && (
+                  <Badge
+                    variant={
+                      stTelemetry.persona_slot === 'sister_elder' || stTelemetry.persona_slot === 'elder'
+                        ? 'default'
+                        : 'secondary'
+                    }
+                    className="text-[11px]"
+                  >
+                    {stTelemetry.persona_slot === 'sister_elder' || stTelemetry.persona_slot === 'elder'
+                      ? '🌙 姐姐值班'
+                      : '🌸 妹妹值班'}
+                    {stTelemetry.persona_name ? ` · ${stTelemetry.persona_name}` : ''}
+                  </Badge>
+                )}
+                {hasMvuWatch && (
+                  <Badge
+                    variant="outline"
+                    className="border-emerald-500/40 bg-emerald-500/10 text-[11px] text-emerald-700 dark:text-emerald-300"
+                  >
+                    📊 MVU 状态演进
+                    {activeStageLabel ? ` · ${activeStageLabel}` : ''}
+                  </Badge>
+                )}
+                {tool.model_name && (
+                  <Badge variant="outline" className="font-mono text-[10px]">
+                    {tool.model_name}
+                  </Badge>
+                )}
+              </div>
+              {stTelemetry.thinking?.trim() && (
+                <div className="border-muted-foreground/30 bg-muted/40 space-y-1 rounded-r-md border-l-2 px-3 py-2">
+                  <div className="text-muted-foreground flex items-center gap-1 text-[11px] font-medium">
+                    <Brain className="h-3 w-3" />
+                    Replyer CoT 思维链 (&lt;thinking&gt;)
+                  </div>
+                  <CollapsibleText
+                    text={stTelemetry.thinking}
+                    maxLines={6}
+                    className="text-muted-foreground text-xs"
+                  />
+                </div>
+              )}
+              {stTelemetry.summary?.trim() && (
+                <div className="space-y-1 rounded-md border border-blue-500/20 bg-blue-500/5 px-2.5 py-2">
+                  <div className="text-[11px] font-medium text-blue-700 dark:text-blue-300">
+                    📏 小总结 (&lt;summary&gt;)
+                  </div>
+                  <p className="text-foreground/90 whitespace-pre-wrap break-words leading-relaxed">
+                    {stTelemetry.summary}
+                  </p>
+                </div>
+              )}
+              {stTelemetry.comment?.trim() && (
+                <div className="space-y-1 rounded-md border border-amber-500/20 bg-amber-500/5 px-2.5 py-2">
+                  <div className="text-[11px] font-medium text-amber-700 dark:text-amber-300">
+                    🐱 猫猫留言 (&lt;comment&gt;)
+                  </div>
+                  <p className="text-foreground/90 whitespace-pre-wrap break-words leading-relaxed">
+                    {stTelemetry.comment}
+                  </p>
+                </div>
+              )}
+              {hasMvuWatch && mvuWatch && (
+                <div className="space-y-2 rounded-md border border-emerald-500/25 bg-emerald-500/5 px-2.5 py-2">
+                  <div className="flex flex-wrap items-center justify-between gap-1.5">
+                    <div className="text-[11px] font-medium text-emerald-700 dark:text-emerald-300">
+                      📊 MVU 状态演进 (&lt;UpdateVariable&gt;)
+                    </div>
+                    <div className="flex flex-wrap items-center gap-1">
+                      {mvuWatch.card_id && (
+                        <Badge variant="outline" className="font-mono text-[10px]">
+                          {mvuWatch.card_id}
+                        </Badge>
+                      )}
+                      {activeStageLabel && (
+                        <Badge
+                          variant="secondary"
+                          className="border-emerald-500/30 bg-emerald-500/15 text-[10px] text-emerald-800 dark:text-emerald-200"
+                        >
+                          阶段: {activeStageLabel}
+                        </Badge>
+                      )}
+                    </div>
+                  </div>
+                  {mvuWatch.analysis?.trim() && (
+                    <div className="rounded bg-background/70 px-2 py-1.5 text-[11px] text-muted-foreground">
+                      <span className="font-semibold text-foreground/80">
+                        &lt;Analysis&gt; 归因：
+                      </span>
+                      <span className="whitespace-pre-wrap break-words">
+                        {mvuWatch.analysis}
+                      </span>
+                    </div>
+                  )}
+                  {Array.isArray(mvuWatch.changes) && mvuWatch.changes.length > 0 && (
+                    <div className="flex flex-wrap gap-1.5">
+                      {mvuWatch.changes.map((change, idx) => {
+                        const rawDelta =
+                          change.delta !== undefined && change.delta !== null
+                            ? Number(change.delta)
+                            : typeof change.old === 'number' && typeof change.new === 'number'
+                              ? change.new - change.old
+                              : null
+                        const hasNumericDelta =
+                          rawDelta !== null && Number.isFinite(rawDelta) && rawDelta !== 0
+                        const deltaText = hasNumericDelta
+                          ? ` (${rawDelta > 0 ? `+${rawDelta}` : `${rawDelta}`})`
+                          : ''
+                        return (
+                          <span
+                            key={`${change.key}-${idx}`}
+                            className="inline-flex items-center gap-1 rounded border border-emerald-500/30 bg-background/90 px-2 py-0.5 font-mono text-[11px] text-foreground"
+                          >
+                            <span className="font-sans font-medium text-muted-foreground">
+                              {change.label || change.key}:
+                            </span>
+                            <span>{String(change.old ?? '—')}</span>
+                            <span className="text-muted-foreground">→</span>
+                            <span className="font-semibold text-emerald-700 dark:text-emerald-300">
+                              {String(change.new ?? '—')}
+                              {deltaText}
+                            </span>
+                          </span>
+                        )
+                      })}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          )
+        })()}
         {isToolSearch && !tool.status && tool.success && <ToolDiscoveryBlock tools={[tool]} />}
         {((!isToolSearch && tool.tool_name !== 'reply' && argumentEntries.length > 0) || (!tool.status && !tool.success && tool.error_message)) && (
           <div className="flex flex-wrap items-center gap-1.5">

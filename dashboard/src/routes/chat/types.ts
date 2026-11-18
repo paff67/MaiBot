@@ -125,6 +125,7 @@ export interface ChatMessage {
     name: string
     user_id?: string
     is_bot?: boolean
+    persona_slot?: string
   }
 }
 
@@ -162,10 +163,12 @@ export interface WsMessage {
   virtual_mode?: boolean
   // user_message 的发送端：网页聊天室为其逻辑会话 ID，插件界面为 plugin:<插件ID>
   origin?: string
+  persona_slot?: string | null
   sender?: {
     name: string
     user_id?: string
     is_bot?: boolean
+    persona_slot?: string | null
   }
   images?: ChatIncomingImage[]
   emojis?: ChatIncomingImage[]
@@ -178,6 +181,7 @@ export interface WsMessage {
     sender_name?: string
     sender_id?: string
     is_bot?: boolean
+    persona_slot?: string | null
     message_type?: string
     segments?: MessageSegment[] | null
   }>

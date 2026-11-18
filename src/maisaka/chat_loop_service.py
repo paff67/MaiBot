@@ -702,17 +702,20 @@ class MaisakaChatLoopService:
             return "planner"
         return PROMPT_PREVIEW_CATEGORY_BY_REQUEST_KIND.get(normalized_request_kind, normalized_request_kind)
 
-    def _resolve_model_task_name(self, request_kind: str) -> str:
+    def _resolve_model_task_name(self, request_kind: str, task_override: Optional[str] = None) -> str:
         """根据请求类型解析模型任务配置名。"""
 
         normalized_request_kind = str(request_kind or "").strip().lower()
+        clean_override = str(task_override or "").strip()
+        if normalized_request_kind == "planner" and clean_override:
+            return clean_override
         return MODEL_TASK_NAME_BY_REQUEST_KIND.get(normalized_request_kind, self._model_task_name)
 
-    def _get_llm_chat_client(self, request_kind: str) -> LLMServiceClient:
+    def _get_llm_chat_client(self, request_kind: str, task_override: Optional[str] = None) -> LLMServiceClient:
         """获取当前请求类型对应的 LLM 客户端。"""
 
         request_type = self._resolve_llm_request_type(request_kind)
-        model_task_name = self._resolve_model_task_name(request_kind)
+        model_task_name = self._resolve_model_task_name(request_kind, task_override=task_override)
         client_key = f"{model_task_name}:{request_type}"
         llm_client = self._llm_chat_clients.get(client_key)
         if llm_client is None:
@@ -782,6 +785,246 @@ class MaisakaChatLoopService:
         async with self._prompt_load_lock:
             self._build_chat_system_prompt(tools_section)
 
+    def _build_st_director_stage1_block(self) -> str:
+        """构建 Stage 1 静态 ST 导演定调帧与双子槽位对比卡（不含任何私密/动态状态，保持 KV Cache 稳定）。"""
+
+        twin_mode = bool(getattr(global_config.personality, "twin_mode_enabled", False))
+        bg_story = str(getattr(global_config.personality, "background_story", "") or "").strip()
+        try:
+            from pathlib import Path
+            from src.companion_vault.st_preset_engine import (
+                STCompileContext,
+                STPresetEngine,
+                get_st_preset_manager,
+            )
+
+            st_mgr = get_st_preset_manager()
+            director_engine, cfg = st_mgr.get_active_engine()
+            younger = global_config.personality.resolve_slot_profile(
+                "sister_younger", global_config.bot, global_config.chat.reply_style
+            )
+            elder = global_config.personality.resolve_slot_profile(
+                "sister_elder", global_config.bot, global_config.chat.reply_style
+            )
+            has_v2_binding = bool(
+                str(getattr(younger, "persona_v2_card_id", "") or "").strip()
+                or str(getattr(elder, "persona_v2_card_id", "") or "").strip()
+                or str(getattr(global_config.personality, "persona_v2_card_id", "") or "").strip()
+            )
+            if not twin_mode and director_engine is None and not has_v2_binding:
+                return f"【项目背景设定】\n{bg_story}" if bg_story else ""
+
+            if director_engine is None and (twin_mode or cfg.get("enabled")):
+                active_name = str(cfg.get("active_preset") or "").strip()
+                if active_name and callable(getattr(st_mgr, "get_engine", None)):
+                    try:
+                        director_engine = st_mgr.get_engine(active_name)
+                    except Exception:
+                        director_engine = None
+            if director_engine is None and twin_mode:
+                fallback_path = (
+                    Path(__file__).resolve().parents[2]
+                    / "plugins"
+                    / "st_preset_engine"
+                    / "templates"
+                    / "Meowssiah-WeChat-IM.json"
+                )
+                if fallback_path.exists():
+                    director_engine = STPresetEngine.from_file(fallback_path)
+
+            younger_name = younger.nickname or global_config.bot.nickname or "许妍"
+            elder_name = elder.nickname or "姐姐"
+
+            sections: List[str] = []
+            if bg_story:
+                sections.append(f"【项目背景设定】\n{bg_story}")
+            if director_engine is not None:
+                framing = director_engine.extract_director_framing_blocks(
+                    STCompileContext(char_name=younger_name, user_name="对方", scenario=bg_story)
+                )
+                if framing:
+                    sections.append(
+                        f"【ST 导演叙事基调（Stage 1 静态定调）】\n{framing}\n"
+                        "[执行边界：以上叙事与表达权限仅供你作为总导演进行情境判断，并调用原生 reply / 其他真实工具执行；严禁编造或输出虚构工具调用格式。]"
+                    )
+
+            v2_cards_by_slot: dict[str, Any] = {}
+            try:
+                from src.companion_vault.persona_v2_engine import get_persona_v2_manager
+
+                v2_mgr = get_persona_v2_manager()
+                v2_stage1_lines: List[str] = []
+                for slot_label, prof in (("sister_younger", younger), ("sister_elder", elder)):
+                    card = v2_mgr.resolve_card_for_profile(prof)
+                    v2_cards_by_slot[slot_label] = card
+                    if card is None:
+                        continue
+                    summary_txt = (
+                        card.planner_summary.strip()
+                        or card.core_persona.soul_pitch.strip()
+                        or card.core_persona.public_interaction_baseline.strip()
+                    )
+                    if summary_txt:
+                        v2_stage1_lines.append(
+                            f"- `{slot_label}` 绑定人设卡《{card.name}》({card.card_id})：{summary_txt}"
+                        )
+                    if not twin_mode:
+                        break
+                if v2_stage1_lines:
+                    sections.append("【Persona V2 角色导演基调（通用公开层）】\n" + "\n".join(v2_stage1_lines))
+            except Exception:
+                pass
+
+            if twin_mode:
+                def _format_twin_slot_card(slot_key: str, role_title: str, display_name: str, prof: Any) -> str:
+                    card = v2_cards_by_slot.get(slot_key)
+                    if card is not None:
+                        persona_txt = f"参见上方 Persona V2《{card.name}》({card.card_id}) 导演基调"
+                        raw_style = prof.reply_style.strip()
+                        style_txt = (raw_style[:180] + "…") if len(raw_style) > 180 else (raw_style or "（沿用默认风格）")
+                    else:
+                        persona_txt = prof.personality.strip() or "（沿用默认设定）"
+                        style_txt = prof.reply_style.strip() or "（沿用默认风格）"
+                    return (
+                        f"- `{slot_key}`（{role_title}）：\n"
+                        f"  - 昵称/称呼：{display_name}（Profile={prof.name}）\n"
+                        f"  - 人格设定：{persona_txt}\n"
+                        f"  - 说话风格：{style_txt}"
+                    )
+
+                twin_card = "\n".join(
+                    [
+                        "【双子值班声带对照卡（Twin Profiles）】",
+                        "当前已开启双子值班模式，调用 `reply` 时可通过 `persona_slot` 指定由谁出面回复：",
+                        _format_twin_slot_card("sister_younger", "妹妹，默认槽位", younger_name, younger),
+                        _format_twin_slot_card("sister_elder", "姐姐槽位", elder_name, elder),
+                        "【双子调度准则】结合对话对象、话题深度与上下文氛围，在满足末尾动态 `@D0` 约束的前提下，"
+                        "自然选择由 `sister_younger` 或 `sister_elder` 出声（或在需要时交接接力）。禁止替不存在的槽位杜撰事实。",
+                    ]
+                )
+                sections.append(twin_card)
+
+            return "\n\n".join(s for s in sections if s.strip())
+        except Exception as exc:
+            logger.debug(f"构建 ST Stage 1 导演定调块失败（已忽略）: {exc}")
+            return ""
+
+    @staticmethod
+    def build_planner_d0_director_guidance(decision: Any, recent_text: str = "") -> str:
+        """构建 Stage 3 `@D0` 尾部动态导演指令（仅作用于当前轮次末尾，不污染前缀缓存）。"""
+
+        if decision is None:
+            return ""
+
+        lines: List[str] = [
+            "【@D0 动态导演调度指令（仅对本轮生效）】",
+            f"- 算力档位：{decision.compute_tier}（有效余额约 ${float(decision.balance_usd):.2f} USD）；发送方信任角色：{decision.sender_trust_role}",
+        ]
+        if getattr(decision, "forced_slot", None):
+            slot_label = "妹妹 (sister_younger)" if decision.forced_slot == "sister_younger" else decision.forced_slot
+            lines.append(
+                f"- 强制值班锁定：本轮必须由 `{decision.forced_slot}`（{slot_label}）值班回复，"
+                f"调用 `reply` 时必须使用 `persona_slot=\"{decision.forced_slot}\"`，禁止切换其他槽位。"
+            )
+            away_arc = str(getattr(decision, "elder_away_arc", "") or "").strip()
+            if away_arc:
+                lines.append(f"- 姐姐当前离场剧情线（若对方询问姐姐需严格保持连贯，勿穿帮）：{away_arc}")
+        else:
+            allowed = ", ".join(getattr(decision, "allowed_slots", ("sister_younger", "sister_elder")))
+            lines.append(
+                f"- 允许值班槽位：{allowed}；推荐槽位：`{getattr(decision, 'recommended_slot', 'sister_younger')}`。"
+                "请保持自然真人对话节奏，避免说教或僵硬机械拒绝。"
+            )
+
+        transient_note = str(getattr(decision, "transient_narrative_note", "") or "").strip()
+        if transient_note:
+            lines.append(f"- 本轮瞬时剧情衔接提示：{transient_note}")
+
+        is_owner_private = (
+            bool(getattr(decision, "is_owner_private", False))
+            and str(getattr(decision, "sender_trust_role", "")) == "OWNER"
+        )
+        younger_prof = getattr(decision, "younger_profile", None) or global_config.personality.resolve_slot_profile(
+            "sister_younger", global_config.bot, global_config.chat.reply_style
+        )
+        elder_prof = getattr(decision, "elder_profile", None) or global_config.personality.resolve_slot_profile(
+            "sister_elder", global_config.bot, global_config.chat.reply_style
+        )
+
+        younger_v2 = None
+        elder_v2 = None
+        try:
+            from src.companion_vault.persona_v2_engine import get_persona_v2_manager
+
+            v2_mgr = get_persona_v2_manager()
+            younger_v2 = v2_mgr.resolve_card_for_profile(younger_prof)
+            elder_v2 = v2_mgr.resolve_card_for_profile(elder_prof)
+        except Exception:
+            younger_v2 = None
+            elder_v2 = None
+
+        # 安全铁律：仅在非群聊且经真值数据库强校验为 OWNER 时，挂载 Owner 专属私聊提示词。
+        if is_owner_private:
+            priv_lines: List[str] = []
+            for role_label, prof, card, include in (
+                ("妹妹", younger_prof, younger_v2, True),
+                ("姐姐", elder_prof, elder_v2, not getattr(decision, "forced_slot", None)),
+            ):
+                if not include:
+                    continue
+                if card is not None:
+                    bond_txt = str(getattr(card.core_persona, "owner_relationship_bond", "") or "").strip()
+                    if bond_txt:
+                        priv_lines.append(f"[{role_label}对 Owner 专属核心张力] {bond_txt}")
+                else:
+                    raw_priv = str(getattr(prof, "owner_private_prompt", "") or "").strip()
+                    if raw_priv:
+                        priv_lines.append(f"[{role_label}对 Owner 专属设定] {raw_priv}")
+            if priv_lines:
+                lines.append("- 【Owner 私聊专属指令（仅当前私聊 Owner 可见）】：\n  " + "\n  ".join(priv_lines))
+
+        # 挂载当前推荐/强制槽位的 Persona V2 关系阶段导演指引与 MVU 实时状态（严格遵循 Fail-Closed）
+        try:
+            import os
+            from src.companion_vault import runtime_bridge
+            from src.companion_vault.mvu_engine import MVURuntimeEngine
+
+            target_slot = (
+                str(getattr(decision, "forced_slot", "") or "").strip()
+                or str(getattr(decision, "recommended_slot", "") or "").strip()
+                or "sister_younger"
+            )
+            active_prof = elder_prof if target_slot == "sister_elder" else younger_prof
+            v2_card = elder_v2 if target_slot == "sister_elder" else younger_v2
+            if v2_card is not None:
+                mvu_enabled = bool(getattr(active_prof, "mvu_enabled", True)) and bool(
+                    getattr(global_config.personality, "mvu_enabled", True)
+                )
+                truth_db_path = (
+                    os.environ.get("MAIBOT_TRUTH_DB_PATH", "").strip()
+                    or runtime_bridge.DEFAULT_TRUTH_DB_PATH
+                )
+                db = None
+                try:
+                    if os.path.isfile(truth_db_path):
+                        db = runtime_bridge._open_truth_db(truth_db_path)
+                    v2_turn = MVURuntimeEngine.compile_turn_persona_and_mvu(
+                        v2_card,
+                        db=db,
+                        is_owner_private=is_owner_private,
+                        recent_text=recent_text,
+                        mvu_enabled_override=mvu_enabled,
+                    )
+                    if v2_turn.planner_d0_guidance_block.strip():
+                        lines.append(v2_turn.planner_d0_guidance_block.strip())
+                finally:
+                    if db is not None:
+                        db.close()
+        except Exception as exc:
+            logger.debug(f"构建 Planner @D0 Persona V2 / MVU 引导块失败（已忽略）: {exc}")
+
+        return "\n".join(lines)
+
     def _build_chat_system_prompt(self, tools_section: str = "", bot_nickname_notice: str = "") -> str:
         """基于当前配置实时构造主聊天系统提示词。
 
@@ -797,6 +1040,8 @@ class MaisakaChatLoopService:
         # 每轮读取实验开关，普通与专注模式共用同一份本地化风格指令。
         if attention_drift := build_attention_drift_prompt_block(self._is_group_chat):
             system_prompt += f"\n\n{attention_drift}"
+        if st_stage1_block := self._build_st_director_stage1_block():
+            system_prompt += f"\n\n{st_stage1_block}"
         return system_prompt
 
     def _build_planner_final_user_reminder(self) -> str:
@@ -1190,6 +1435,7 @@ class MaisakaChatLoopService:
         system_prompt: Optional[str] = None,
         tail_user_messages: Sequence[str] | None = None,
         logical_turn_id: str | None = None,
+        task_override: Optional[str] = None,
     ) -> ChatResponse:
         """执行一轮 Maisaka 规划器请求。
 
@@ -1348,7 +1594,13 @@ class MaisakaChatLoopService:
                 history_item_ids=external_snapshot.history_item_ids,
             )
         else:
-            llm_chat = self._get_llm_chat_client(request_kind)
+            if task_override:
+                try:
+                    llm_chat = self._get_llm_chat_client(request_kind, task_override=task_override)
+                except TypeError:
+                    llm_chat = self._get_llm_chat_client(request_kind)
+            else:
+                llm_chat = self._get_llm_chat_client(request_kind)
             generation_options = LLMGenerationOptions(
                 tool_options=all_tools if all_tools else None,
                 response_format=response_format,

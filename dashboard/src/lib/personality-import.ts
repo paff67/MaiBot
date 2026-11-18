@@ -7,6 +7,10 @@ export interface PersonalityProfile {
   private_chat_prompts: string
   multiple_reply_style: string[]
   multiple_probability: number
+  nickname?: string
+  alias_names?: string[]
+  owner_private_prompt?: string
+  st_preset_file?: string
 }
 
 export const PERSONALITY_IMPORT_LIMIT = 65536
@@ -46,7 +50,11 @@ export function parsePersonalityImport(text: string): PersonalityProfile {
   }
   const profile = data.profile
   if (!object(profile)) throw new Error('profile 必须是人设对象')
-  const fields = ['name', 'personality', 'behavior_style', 'reply_style', 'group_chat_prompt', 'private_chat_prompts', 'multiple_reply_style', 'multiple_probability']
+  const fields = [
+    'name', 'personality', 'behavior_style', 'reply_style',
+    'group_chat_prompt', 'private_chat_prompts', 'multiple_reply_style', 'multiple_probability',
+    'nickname', 'alias_names', 'owner_private_prompt', 'st_preset_file',
+  ]
   if (Object.keys(profile).some((key) => !fields.includes(key))) throw new Error('profile 中包含不支持的字段')
   for (const key of ['name', 'personality', 'behavior_style', 'reply_style']) {
     if (typeof profile[key] !== 'string') throw new Error(`${key} 必须是字符串`)
@@ -64,6 +72,17 @@ export function parsePersonalityImport(text: string): PersonalityProfile {
   if (typeof probability !== 'number' || !Number.isFinite(probability) || probability < 0 || probability > 1) {
     throw new Error('multiple_probability 必须是 0 到 1 之间的数字')
   }
+  for (const key of ['nickname', 'owner_private_prompt', 'st_preset_file'] as const) {
+    if (profile[key] !== undefined && typeof profile[key] !== 'string') {
+      throw new Error(`${key} 必须是字符串`)
+    }
+  }
+  if (
+    profile.alias_names !== undefined
+    && (!Array.isArray(profile.alias_names) || !profile.alias_names.every((alias) => typeof alias === 'string'))
+  ) {
+    throw new Error('alias_names 必须是字符串数组')
+  }
   return {
     name,
     personality: profile.personality as string,
@@ -73,6 +92,10 @@ export function parsePersonalityImport(text: string): PersonalityProfile {
     private_chat_prompts: profile.private_chat_prompts as string,
     multiple_reply_style: styles,
     multiple_probability: probability,
+    ...(typeof profile.nickname === 'string' ? { nickname: profile.nickname } : {}),
+    ...(Array.isArray(profile.alias_names) ? { alias_names: profile.alias_names as string[] } : {}),
+    ...(typeof profile.owner_private_prompt === 'string' ? { owner_private_prompt: profile.owner_private_prompt } : {}),
+    ...(typeof profile.st_preset_file === 'string' ? { st_preset_file: profile.st_preset_file } : {}),
   }
 }
 

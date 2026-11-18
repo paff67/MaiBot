@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Literal,
 
 import asyncio
 import difflib
+import os
 import time
 import uuid
 
@@ -164,6 +165,7 @@ class MaisakaReasoningEngine:
         self._active_logical_turn_id: str | None = None
         self._turn_passive_replyer: Optional[bool] = None
         self._compaction_failure_count: int = 0
+        self._current_turn_decision: Any = None
 
     @property
     def passive_replyer_enabled(self) -> bool:
@@ -200,6 +202,7 @@ class MaisakaReasoningEngine:
         injected_user_messages: Optional[list[str | UserMessageItem]] = None,
         tail_user_messages: Optional[list[str]] = None,
         tool_definitions: Optional[list[dict[str, Any]]] = None,
+        task_override: Optional[str] = None,
     ) -> Any:
         """运行一轮可被新消息打断的主 planner 请求。"""
 
@@ -218,6 +221,7 @@ class MaisakaReasoningEngine:
                     tool_definitions=tool_definitions,
                     max_context_size=self._runtime._max_context_size,
                     logical_turn_id=self._active_logical_turn_id,
+                    task_override=task_override,
                 )
             )
             # 在完整请求期间监听中断，流暂时没有数据时也能取消，不采用迟到的输出。
@@ -479,9 +483,19 @@ class MaisakaReasoningEngine:
         started_at = time.time()
         execution_id = uuid.uuid4().hex
         target = state.reply_target_message
+        decision = getattr(self, "_current_turn_decision", None)
+        default_slot = (
+            str(
+                getattr(decision, "forced_slot", None)
+                or getattr(decision, "recommended_slot", None)
+                or "sister_younger"
+            ).strip()
+            or "sister_younger"
+        )
         arguments = {
             "msg_id": target.message_id if target is not None else "",
             "reply_reference": content,
+            "persona_slot": default_slot,
         }
         self._runtime._update_stage_status("Replyer", "根据 Planner 正文生成可见回复")
         tool_ctx = BuiltinToolRuntimeContext(self, self._runtime)
@@ -528,6 +542,9 @@ class MaisakaReasoningEngine:
                 "detail": normalize_tool_record_value(result.metadata.get("monitor_detail")),
             }
         ]
+        st_telemetry = result.metadata.get("st_telemetry")
+        if isinstance(st_telemetry, dict) and st_telemetry:
+            state.tool_monitor_results[0]["st_telemetry"] = normalize_tool_record_value(st_telemetry)
         if result.success:
             state.cycle_end = CycleEnd("planner_reply_end", "回复完成，已结束本轮思考。")
         else:
@@ -652,10 +669,32 @@ class MaisakaReasoningEngine:
                 ),
                 None,
             )
+            decision = getattr(self, "_current_turn_decision", None)
+            tail_user_messages = list(build_consecutive_wait_reminders(self._runtime._consecutive_wait_count) or [])
+            if (
+                decision is not None
+                and callable(getattr(self._runtime._chat_loop_service, "build_planner_d0_director_guidance", None))
+            ):
+                recent_snippets: list[str] = []
+                for hist_msg in self._runtime._chat_history[-6:]:
+                    txt = str(getattr(hist_msg, "processed_plain_text", "") or getattr(hist_msg, "content", "") or "").strip()
+                    if txt:
+                        recent_snippets.append(txt)
+                recent_text = "\n".join(recent_snippets)
+                try:
+                    d0_guidance = self._runtime._chat_loop_service.build_planner_d0_director_guidance(
+                        decision, recent_text=recent_text
+                    )
+                except TypeError:
+                    d0_guidance = self._runtime._chat_loop_service.build_planner_d0_director_guidance(decision)
+                if d0_guidance:
+                    tail_user_messages.append(d0_guidance)
+            planner_task_override = str(getattr(decision, "planner_task_name", "") or "").strip() or None
             response = await self._run_interruptible_planner(
                 injected_user_messages=injected_user_messages or None,
-                tail_user_messages=build_consecutive_wait_reminders(self._runtime._consecutive_wait_count),
+                tail_user_messages=tail_user_messages or None,
                 tool_definitions=action_tool_definitions,
+                task_override=planner_task_override,
             )
         finally:
             state.planner_ended_at = time.time()
@@ -951,6 +990,481 @@ class MaisakaReasoningEngine:
         self._runtime._idle_backoff.record_cycle_result(cycle_end.reason)
         return cycle_end
 
+    async def _resolve_current_turn_decision(
+        self,
+        *,
+        trigger_message: SessionMessage,
+        source_messages: list[SessionMessage],
+    ) -> Any:
+        """调用 TwinRuntimeRouter 计算当前轮次的双子路由与模型策略。"""
+
+        try:
+            from src.companion_vault.twin_runtime_router import resolve_turn_route
+
+            is_group_chat = bool(self._runtime.chat_stream.is_group_session)
+            platform = str(
+                getattr(trigger_message, "platform", "")
+                or getattr(self._runtime.chat_stream, "platform", "wechat")
+                or "wechat"
+            ).strip()
+            msg_info = getattr(trigger_message, "message_info", None)
+            user_info = getattr(msg_info, "user_info", None) if msg_info is not None else None
+            sender_id = str(
+                getattr(user_info, "user_id", "")
+                or getattr(self._runtime.chat_stream, "user_id", "")
+                or ""
+            ).strip()
+            person_id = str(getattr(user_info, "person_id", "") or "").strip()
+            latest_user_text = str(getattr(trigger_message, "processed_plain_text", "") or "").strip()
+            batch_sender_ids: list[str] = []
+            for msg in source_messages:
+                m_uinfo = getattr(getattr(msg, "message_info", None), "user_info", None)
+                uid = str(getattr(m_uinfo, "user_id", "") or "").strip()
+                if uid:
+                    batch_sender_ids.append(uid)
+
+            recent_lines: list[str] = []
+            for item in self._runtime._chat_history[-6:]:
+                if isinstance(item, SessionBackedMessage):
+                    txt = str(getattr(item, "processed_plain_text", "") or "").strip()
+                    if txt:
+                        recent_lines.append(txt[:200])
+            recent_context = "\n".join(recent_lines)
+            mentions_bot = bool(getattr(trigger_message, "is_mentioned", False))
+
+            return await resolve_turn_route(
+                session_id=str(self._runtime.session_id or ""),
+                platform=platform,
+                sender_id=sender_id,
+                person_id=person_id,
+                is_group_chat=is_group_chat,
+                latest_user_text=latest_user_text,
+                recent_context=recent_context,
+                batch_sender_ids=batch_sender_ids or None,
+                mentions_bot=mentions_bot,
+            )
+        except Exception as exc:
+            logger.warning(f"{self._runtime.log_prefix} TwinRuntimeRouter 仲裁异常，将沿用默认策略: {exc}")
+            return None
+
+    async def _build_one_pass_external_tools(self) -> list[dict[str, Any]]:
+        """收集统一 ST-Agent 模式可用的外部动作工具定义（排除 reply/context/soliumbra_reply）。"""
+        has_custom_builder = "_build_action_tool_definitions" in self.__dict__
+        if getattr(self._runtime, "_tool_registry", None) is None and not has_custom_builder:
+            return []
+        raw_defs: list[dict[str, Any]] = []
+        try:
+            if has_custom_builder or (
+                hasattr(self._runtime, "_chat_loop_service") and hasattr(self._runtime, "_max_context_size")
+            ):
+                action_defs, _ = await self._build_action_tool_definitions()
+                raw_defs = list(action_defs)
+            else:
+                availability_context = self._build_tool_availability_context()
+                tool_specs = await self._runtime._tool_registry.list_tools(availability_context)
+                raw_defs = [
+                    spec.to_llm_definition()
+                    for spec in tool_specs
+                    if getattr(spec, "enabled", True)
+                ]
+        except Exception as exc:
+            logger.debug(f"{self._runtime.log_prefix} 构建 ST-Agent 外部工具列表失败（已降级为空）: {exc}")
+            return []
+
+        excluded_names = {"reply", "soliumbra_reply", "context", "tool_search"}
+        is_group_session = bool(getattr(getattr(self._runtime, "chat_stream", None), "is_group_session", False))
+        if not is_group_session:
+            excluded_names.update({"wait", "stop"})
+
+        existing_names: set[str] = set()
+        filtered_defs: list[dict[str, Any]] = []
+        for tool_def in raw_defs:
+            if not isinstance(tool_def, dict):
+                continue
+            tname = str((tool_def.get("function") or {}).get("name") or tool_def.get("name") or "").strip()
+            if not tname or tname in excluded_names or tname in existing_names:
+                continue
+            existing_names.add(tname)
+            filtered_defs.append(tool_def)
+
+        deferred_map = getattr(self._runtime, "deferred_tool_specs_by_name", None)
+        if isinstance(deferred_map, dict):
+            promoted_names: list[str] = []
+            for direct_name in ("query_memory", "query_image_memory", "query_person_profile", "view_forward_message"):
+                spec = deferred_map.get(direct_name)
+                if spec is not None and getattr(spec, "enabled", True) and direct_name not in existing_names:
+                    existing_names.add(direct_name)
+                    filtered_defs.append(spec.to_llm_definition())
+                    promoted_names.append(direct_name)
+            if promoted_names and callable(getattr(self._runtime, "set_current_action_tool_names", None)):
+                current_names = list(getattr(self._runtime, "_current_action_tool_names", ()) or ())
+                self._runtime.set_current_action_tool_names([*current_names, *promoted_names])
+
+        return filtered_defs
+
+    async def _build_one_pass_recalled_memory_context(
+        self,
+        *,
+        trigger_message: SessionMessage,
+        source_messages: list[SessionMessage],
+    ) -> tuple[str, list[Any]]:
+        """为统一 ST-Agent 收集人物画像、真值目录与引用上下文（任意子步骤异常均优雅降级）。"""
+        from src.companion_vault.runtime_bridge import DEFAULT_TRUTH_DB_PATH
+
+        chat_stream = getattr(self._runtime, "chat_stream", None)
+        msg_info = getattr(trigger_message, "message_info", None)
+        is_group_chat = bool(getattr(chat_stream, "is_group_session", False)) or bool(
+            getattr(msg_info, "group_info", None)
+        )
+        truth_db_path = str(os.environ.get("MAIBOT_TRUTH_DB_PATH", "") or "").strip() or DEFAULT_TRUTH_DB_PATH
+        session_id = str(getattr(self._runtime, "session_id", "") or getattr(trigger_message, "session_id", "") or "")
+
+        blocks: list[str] = []
+        file_parts: list[Any] = []
+
+        try:
+            profile_messages = await build_person_profile_injection_messages(
+                anchor_message=trigger_message,
+                pending_messages=source_messages,
+                db_path=truth_db_path,
+                is_group_chat=is_group_chat,
+            )
+            for block in profile_messages:
+                clean_block = str(block or "").strip()
+                if clean_block:
+                    blocks.append(clean_block)
+        except Exception as exc:
+            logger.debug(f"{self._runtime.log_prefix} ST-Agent 人物画像注入失败，已跳过: {exc}")
+
+        if os.path.isfile(truth_db_path):
+            try:
+                user_info = getattr(msg_info, "user_info", None) if msg_info is not None else None
+                group_info = getattr(msg_info, "group_info", None) if msg_info is not None else None
+                uid = str(getattr(user_info, "user_id", "") or "")
+                chat_id = str(getattr(group_info, "group_id", "") or uid)
+                truth_catalog = await build_planner_truth_catalog_async(
+                    session_id=session_id,
+                    is_group_chat=is_group_chat,
+                    user_id=uid,
+                    platform=str(getattr(trigger_message, "platform", "") or ""),
+                    db_path=truth_db_path,
+                    anchor_message_id=str(getattr(trigger_message, "message_id", "") or ""),
+                    account=str(getattr(trigger_message, "account_id", "") or ""),
+                    chat_id=chat_id,
+                )
+                clean_catalog = str(truth_catalog or "").strip()
+                if clean_catalog:
+                    blocks.append(clean_catalog)
+            except Exception as exc:
+                logger.debug(f"{self._runtime.log_prefix} ST-Agent 真值目录组装失败，已跳过: {exc}")
+
+        try:
+            from src.companion_vault.wechat_recall import build_quote_context_async
+
+            hydrated_direct_ids = tuple(
+                msg.message_id
+                for msg in (getattr(self._runtime, "_chat_history", []) or [])
+                if isinstance(msg, SessionBackedMessage) and getattr(msg, "vault_descriptors", ())
+            )
+            quote_block, quote_parts = await build_quote_context_async(
+                source_messages or [trigger_message],
+                db_path=truth_db_path,
+                exclude_direct_attachment_ids=hydrated_direct_ids,
+            )
+            if quote_block and str(quote_block).strip():
+                blocks.append(str(quote_block).strip())
+            if quote_parts:
+                file_parts.extend(quote_parts)
+        except Exception as exc:
+            logger.debug(f"{self._runtime.log_prefix} ST-Agent 引用上下文组装失败，已跳过: {exc}")
+
+        return "\n\n".join(blocks).strip(), file_parts
+
+    @staticmethod
+    def _build_one_pass_monitor_item(
+        *,
+        execution_id: str,
+        arguments: dict[str, Any],
+        result: Any,
+        summary: str,
+        started_at: float,
+        ended_at: float,
+    ) -> dict[str, Any]:
+        safe_tool_args = {
+            k: v
+            for k, v in arguments.items()
+            if k not in {"_precomputed_st_response", "_recalled_file_parts"}
+        }
+        monitor_item: dict[str, Any] = {
+            "tool_call_id": execution_id,
+            "tool_name": "reply",
+            "tool_args": normalize_tool_record_value(safe_tool_args),
+            "tool_call_source": "one_pass_st",
+            "tool_call_source_label": "一Pass直答",
+            "success": result.success,
+            "summary": summary,
+            "started_at": started_at,
+            "ended_at": ended_at,
+            "duration_ms": (ended_at - started_at) * 1000,
+            "detail": normalize_tool_record_value(result.metadata.get("monitor_detail")),
+        }
+        st_telemetry = result.metadata.get("st_telemetry")
+        if isinstance(st_telemetry, dict) and st_telemetry:
+            monitor_item["st_telemetry"] = normalize_tool_record_value(st_telemetry)
+        return monitor_item
+
+    async def _execute_one_pass_st_turn(
+        self,
+        *,
+        trigger_message: SessionMessage,
+        decision: Any,
+        source_messages: Optional[list[SessionMessage]] = None,
+    ) -> None:
+        """统一 ST-Agent 一 Pass 直答与原生工具闭环：私聊/群聊通用。"""
+
+        cycle_detail, round_text = await self._start_cycle_round(0)
+        state = CycleRuntimeState()
+        state.reply_target_message = trigger_message
+        started_at = time.time()
+        execution_id = uuid.uuid4().hex
+        prev_logical_turn_id = getattr(self, "_active_logical_turn_id", None)
+        created_logical_turn_id = False
+        if not prev_logical_turn_id:
+            self._active_logical_turn_id = uuid.uuid4().hex
+            created_logical_turn_id = True
+        try:
+            await self._refresh_visual_placeholders_for_cycle(cycle_detail)
+            await self._post_process_chat_history_after_cycle(cycle_detail, consume_references=False)
+            eff_source_messages = list(source_messages) if source_messages else [trigger_message]
+            slot = str(
+                getattr(decision, "forced_slot", None)
+                or getattr(decision, "recommended_slot", None)
+                or "sister_younger"
+            ).strip()
+            is_group_chat = bool(getattr(getattr(self._runtime, "chat_stream", None), "is_group_session", False))
+            mode_label = "群聊统一 ST-Agent 模式" if is_group_chat else "私聊一Pass直答模式"
+            ref_parts = [f"{mode_label}：直接根据当前对话历史、记忆与角色人设自然回应，必要时可先调用外部工具或静默等待。"]
+            transient_note = str(getattr(decision, "transient_narrative_note", "") or "").strip()
+            if transient_note:
+                ref_parts.append(transient_note)
+            arguments: dict[str, Any] = {
+                "msg_id": trigger_message.message_id,
+                "reply_reference": "\n".join(ref_parts),
+                "persona_slot": slot,
+            }
+
+            external_tools = await self._build_one_pass_external_tools()
+            recalled_memory_block, recalled_file_parts = await self._build_one_pass_recalled_memory_context(
+                trigger_message=trigger_message,
+                source_messages=eff_source_messages,
+            )
+            if recalled_memory_block:
+                arguments["_recalled_memory_block"] = recalled_memory_block
+            if recalled_file_parts:
+                arguments["_recalled_file_parts"] = recalled_file_parts
+
+            tool_ctx = BuiltinToolRuntimeContext(self, self._runtime)
+            chat_stream = getattr(self._runtime, "chat_stream", None)
+            replyer = None
+            if chat_stream is not None:
+                try:
+                    from src.chat.replyer.replyer_manager import replyer_manager
+
+                    replyer = replyer_manager.get_replyer(
+                        chat_stream=chat_stream,
+                        request_type="maisaka.replyer",
+                        replyer_type="maisaka",
+                    )
+                except Exception as exc:
+                    logger.debug(f"{self._runtime.log_prefix} 获取 replyer 失败，将回退 execute_reply: {exc}")
+                    replyer = None
+
+            if (
+                replyer is None
+                or getattr(replyer, "express_model", None) is None
+                or not callable(getattr(replyer, "run_st_single_turn", None))
+            ):
+                self._runtime._update_stage_status("Replyer", "一Pass直答生成中", round_text=round_text)
+                result = await execute_reply(
+                    tool_ctx,
+                    arguments,
+                    call_id=execution_id,
+                    target_message=trigger_message,
+                )
+                ended_at = time.time()
+                cycle_detail.time_records["replyer"] = ended_at - started_at
+                summary = result.get_history_content()
+                state.tool_result_summaries = [summary]
+                state.tool_monitor_results = [
+                    self._build_one_pass_monitor_item(
+                        execution_id=execution_id,
+                        arguments=arguments,
+                        result=result,
+                        summary=summary,
+                        started_at=started_at,
+                        ended_at=ended_at,
+                    )
+                ]
+                state.cycle_end = (
+                    CycleEnd("one_pass_st_end", f"{mode_label}完成，已结束本轮。")
+                    if result.success
+                    else CycleEnd("one_pass_st_failed", f"{mode_label}失败：{summary}")
+                )
+                return
+
+            self._runtime._update_stage_status("ST-Agent", "一Pass生成/工具决策中", round_text=round_text)
+            round0_args = dict(arguments)
+            if external_tools:
+                round0_args["_external_tools"] = external_tools
+            round0_started_at = time.time()
+            llm_res, _compiled_req = await replyer.run_st_single_turn(
+                stream_id=str(getattr(self._runtime, "session_id", "") or ""),
+                reply_message=trigger_message,
+                chat_history=list(getattr(self._runtime, "_chat_history", [])),
+                reply_reason="",
+                reply_tool_args=round0_args,
+                image_recognition_refresher=lambda history: self._refresh_chat_history_visual_placeholders(
+                    chat_history=history,
+                    wait_for_text_model=True,
+                ),
+            )
+            round0_ended_at = time.time()
+            cycle_detail.time_records["st_round0"] = round0_ended_at - round0_started_at
+
+            raw_tool_calls = list(getattr(llm_res, "tool_calls", None) or [])
+            non_st_calls = [
+                tc
+                for tc in raw_tool_calls
+                if str(getattr(tc, "func_name", "") or "").strip() not in {"soliumbra_reply", "context"}
+            ]
+
+            if non_st_calls:
+                tool_started_at = time.time()
+                (
+                    should_pause,
+                    pause_tool_name,
+                    tool_result_summaries,
+                    tool_monitor_results,
+                ) = await self._handle_tool_calls(
+                    non_st_calls,
+                    "",
+                    cycle_detail,
+                    state,
+                )
+                cycle_detail.time_records["tool_calls"] = time.time() - tool_started_at
+                if should_pause:
+                    state.tool_result_summaries = tool_result_summaries
+                    state.tool_monitor_results = tool_monitor_results
+                    state.cycle_end = self._cycle_end_for_pause_tool(pause_tool_name)
+                    return
+
+                tool_observations = [
+                    {
+                        "tool": tc.func_name,
+                        "args": dict(tc.args or {}),
+                        "result": tool_result_summaries[idx] if idx < len(tool_result_summaries) else "",
+                    }
+                    for idx, tc in enumerate(non_st_calls)
+                ]
+                pass2_args = dict(arguments)
+                pass2_args["_tool_observations"] = tool_observations
+                pass2_args["_external_tools"] = []
+                self._runtime._update_stage_status("Replyer", "ST工具收敛生成回复中", round_text=round_text)
+                reply_started_at = time.time()
+                result = await execute_reply(
+                    tool_ctx,
+                    pass2_args,
+                    call_id=execution_id,
+                    target_message=trigger_message,
+                )
+                ended_at = time.time()
+                cycle_detail.time_records["replyer"] = ended_at - reply_started_at
+                summary = result.get_history_content()
+                reply_monitor = self._build_one_pass_monitor_item(
+                    execution_id=execution_id,
+                    arguments=pass2_args,
+                    result=result,
+                    summary=summary,
+                    started_at=reply_started_at,
+                    ended_at=ended_at,
+                )
+                state.tool_result_summaries = [*tool_result_summaries, summary]
+                state.tool_monitor_results = [*tool_monitor_results, reply_monitor]
+                state.cycle_end = (
+                    CycleEnd("one_pass_st_end", f"{mode_label}工具收敛直答完成，已结束本轮。")
+                    if result.success
+                    else CycleEnd("one_pass_st_failed", f"{mode_label}工具收敛直答失败：{summary}")
+                )
+                return
+
+            from src.companion_vault.st_preset_engine import STPresetEngine
+
+            unwrapped = STPresetEngine.unwrap_response(
+                response_text=str(getattr(llm_res, "response", "") or ""),
+                tool_calls=raw_tool_calls,
+                output_mode="im_clean",
+                native_reasoning=str(getattr(llm_res, "reasoning", "") or ""),
+            )
+            allowed_slots = tuple(getattr(decision, "allowed_slots", ("sister_younger", "sister_elder")) or ())
+            forced_slot = getattr(decision, "forced_slot", None)
+            extracted_slot = str(getattr(unwrapped, "persona_slot", "") or "").strip()
+            if not forced_slot and extracted_slot and extracted_slot in allowed_slots:
+                arguments["persona_slot"] = extracted_slot
+
+            target_msg = trigger_message
+            extracted_quote_id = str(getattr(unwrapped, "quote_msg_id", "") or "").strip()
+            if extracted_quote_id:
+                expand_fn = getattr(self._runtime, "expand_message_id_aliases", None)
+                if callable(expand_fn):
+                    expanded = expand_fn({"msg_id": extracted_quote_id})
+                    extracted_quote_id = str(expanded.get("msg_id") or extracted_quote_id).strip()
+                find_fn = getattr(self._runtime, "find_source_message_by_id", None)
+                if callable(find_fn):
+                    quoted_msg = find_fn(extracted_quote_id)
+                    if quoted_msg is not None:
+                        target_msg = quoted_msg
+                        arguments["msg_id"] = target_msg.message_id
+                        state.reply_target_message = target_msg
+
+            arguments["_precomputed_st_response"] = llm_res
+            self._runtime._update_stage_status("Replyer", "一Pass直答发送中", round_text=round_text)
+            result = await execute_reply(
+                tool_ctx,
+                arguments,
+                call_id=execution_id,
+                target_message=target_msg,
+                precomputed=llm_res,
+            )
+            ended_at = time.time()
+            cycle_detail.time_records["replyer"] = ended_at - started_at
+            summary = result.get_history_content()
+            state.tool_result_summaries = [summary]
+            state.tool_monitor_results = [
+                self._build_one_pass_monitor_item(
+                    execution_id=execution_id,
+                    arguments=arguments,
+                    result=result,
+                    summary=summary,
+                    started_at=started_at,
+                    ended_at=ended_at,
+                )
+            ]
+            state.cycle_end = (
+                CycleEnd("one_pass_st_end", f"{mode_label}完成，已结束本轮。")
+                if result.success
+                else CycleEnd("one_pass_st_failed", f"{mode_label}失败：{summary}")
+            )
+        except Exception as exc:
+            logger.exception(f"{self._runtime.log_prefix} 统一 ST-Agent 一Pass直答异常")
+            state.cycle_end = CycleEnd("cycle_error", f"统一 ST-Agent 一Pass直答异常：{exc}")
+            raise
+        finally:
+            try:
+                await self._finalize_cycle(cycle_detail=cycle_detail, round_index=0, state=state)
+            finally:
+                if created_logical_turn_id:
+                    self._active_logical_turn_id = prev_logical_turn_id
+
     async def run_loop(self) -> None:
         """独立消费消息批次，并执行对应的内部思考轮次。"""
         try:
@@ -977,6 +1491,28 @@ class MaisakaReasoningEngine:
                     self._active_logical_turn_id = turn_start_context.logical_turn_id or uuid.uuid4().hex
                     if force_continue_reason := self._runtime._consume_forced_turn_reason():
                         logger.info(f"{self._runtime.log_prefix} {force_continue_reason}")
+
+                    turn_decision = await self._resolve_current_turn_decision(
+                        trigger_message=trigger_message,
+                        source_messages=cached_messages or [trigger_message],
+                    )
+                    self._current_turn_decision = turn_decision
+                    if turn_decision is not None and turn_decision.abort_turn:
+                        logger.info(
+                            f"{self._runtime.log_prefix} 双子算力保护静默休眠（0 Token 跳过）: {turn_decision.abort_reason}"
+                        )
+                        self._runtime._update_stage_status("待命", f"低算力休眠（${turn_decision.balance_usd:.2f}）")
+                        continue
+                    if (
+                        turn_decision is not None
+                        and turn_decision.execution_mode == "one_pass_st"
+                    ):
+                        await self._execute_one_pass_st_turn(
+                            trigger_message=trigger_message,
+                            source_messages=cached_messages or [trigger_message],
+                            decision=turn_decision,
+                        )
+                        continue
                     round_index = 0
                     while round_index < self._runtime._max_internal_rounds:
                         # 工具执行或整理上下文期间收到的消息，在下一次模型请求前补齐。
@@ -1051,6 +1587,7 @@ class MaisakaReasoningEngine:
                 finally:
                     self._turn_passive_replyer = None
                     self._runtime._chat_loop_service.passive_replyer_override = None
+                    self._current_turn_decision = None
                     self._active_logical_turn_id = None
                     if self._runtime._agent_state == self._runtime._STATE_RUNNING:
                         self._runtime._enter_stop_state()
@@ -2093,6 +2630,9 @@ class MaisakaReasoningEngine:
             prompt_html_uri = str(normalized_detail.get("prompt_html_uri") or "").strip()
         if prompt_html_uri:
             tool_monitor_result["prompt_html_uri"] = prompt_html_uri
+        st_telemetry = result.metadata.get("st_telemetry")
+        if isinstance(st_telemetry, dict) and st_telemetry:
+            tool_monitor_result["st_telemetry"] = normalize_tool_record_value(st_telemetry)
         return tool_monitor_result
 
     @staticmethod

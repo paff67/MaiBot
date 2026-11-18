@@ -252,3 +252,31 @@ ruff check plugins/embodied_workspace src/companion_vault src/platform_io/wechat
   - `P1-SANDBOX-PLUGIN-05`：私聊只读分享防串号、本群公开昵称过滤、DOM `.textContent` 安全化、命名 cgroup 回收、`@Command` 命名捕获组与死代码（`fast_renderer.py` 等）清理全部完成。
 - **[已清零] P2 去实例硬编码与遗留目录归档**：
   - 源码已剥离特定微信号/群友昵称/`143000` 魔数阈值，补齐 `tzdata` 跨平台依赖，并物理移除 `src/mobile_agent/` 与 `src/integration_tools/` 废弃目录。
+
+---
+
+## Phase 6 原生双子架构与验证门禁（`feat/phase6-twins-native-runtime`）
+
+### 1. 核心模块清单
+- **ST 预设与兼容解包**：[`plugins/st_preset_engine/templates/Meowssiah-WeChat-IM.json`](../../plugins/st_preset_engine/templates/Meowssiah-WeChat-IM.json)（自举目标 `data/presets/Meowssiah-WeChat-IM.json`）与 [`src/companion_vault/st_preset_engine.py`](../../src/companion_vault/st_preset_engine.py)（支持 `<thinking>` / `<think>` / `<think_nya>` / 原生 `reasoning` 解析、`im_clean` `<game>` 纯净提取，以及 `extract_director_framing_blocks` 对 `soliumbra_reply` 的清洗）。
+- **原生配置与双子路由**：[`src/config/official_configs.py`](../../src/config/official_configs.py)（`PersonalityProfile` 扩展字段、`PersonalityConfig.resolve_slot_profile`、`TwinEconomyConfig`）、[`src/config/model_configs.py`](../../src/config/model_configs.py) + [`src/services/service_task_resolver.py`](../../src/services/service_task_resolver.py)（`planner_flash` / `replyer_elder` 与回退守卫）、[`src/services/llm_service.py`](../../src/services/llm_service.py)（`ComputeLedger` 自动计费）、[`src/companion_vault/twin_runtime_router.py`](../../src/companion_vault/twin_runtime_router.py)（`TwinRuntimeRouter`）与 [`src/companion_vault/twin_narrative_router.py`](../../src/companion_vault/twin_narrative_router.py)（`TwinNarrativeDirector`）。
+- **推理 / 回复链路与隐私红线**：[`src/maisaka/reasoning_engine.py`](../../src/maisaka/reasoning_engine.py)、[`src/maisaka/chat_loop_service.py`](../../src/maisaka/chat_loop_service.py)、[`src/maisaka/builtin_tool/reply.py`](../../src/maisaka/builtin_tool/reply.py)、[`src/chat/replyer/maisaka_generator_base.py`](../../src/chat/replyer/maisaka_generator_base.py) 与 [`src/chat/replyer/retro_prompt.py`](../../src/chat/replyer/retro_prompt.py)；`MaisakaGeneratorBase._resolve_is_owner_private` 通过 `runtime_bridge._resolve_trust_role_sync`（读取 `MAIBOT_TRUTH_DB_PATH`）强制要求 `(not is_group_chat) and (sender_trust_role == "OWNER")`。
+- **WebUI `/config/bot` 与 `/chat` 遥测**：[`src/maisaka/monitor/events.py`](../../src/maisaka/monitor/events.py)（在 `tool` 顶层挂载 `st_telemetry` 绕过 `planner_delta.py` 对 `detail` 裁剪）、[`src/webui/app.py`](../../src/webui/app.py)（`_is_local_dashboard_enabled()` 响应 `MAIBOT_USE_LOCAL_DASHBOARD=1`）、[`dashboard/src/routes/config/bot.tsx`](../../dashboard/src/routes/config/bot.tsx)、[`dashboard/src/routes/config/bot/PersonalityProfiles.tsx`](../../dashboard/src/routes/config/bot/PersonalityProfiles.tsx) 与 [`dashboard/src/routes/monitor/maisaka-monitor.tsx`](../../dashboard/src/routes/monitor/maisaka-monitor.tsx)。
+- **Persona V2 立体人设与 3 层共享 MVU 引擎（`shared:twin_xu`）**：
+  - [`src/companion_vault/persona_v2_engine.py`](../../src/companion_vault/persona_v2_engine.py) 与 [`src/companion_vault/mvu_engine.py`](../../src/companion_vault/mvu_engine.py)：实现《潜令V1.8》范式的六维人设卡片加载、`general` vs `owner_only` Fail-Closed 双域过滤、240 字符近距语料/经历召回、`balance_tier` / `phone_holder` 系统只读注入、`shared:twin_xu` 跨卡共享状态同步（`apartment_scene` 与 `love_locked`）及 `0~120` 浮点好感阶段演进；
+  - [`src/webui/routers/persona_v2.py`](../../src/webui/routers/persona_v2.py) 与 [`dashboard/src/routes/config/bot/PersonaV2Workbench.tsx`](../../dashboard/src/routes/config/bot/PersonaV2Workbench.tsx)：提供 `/api/webui/persona-v2` 全套卡片 CRUD、槽位绑定与 MVU 实时状态调参接口与前端 4-Tab 工作台，自动自举 `plugins/st_preset_engine/templates/personas/*.json` 至 `data/personas/`。
+
+### 2. 已验证门禁命令与结果
+```powershell
+# 1. 代码风格与静态检查
+uv run ruff check src/companion_vault/ src/maisaka/ src/chat/replyer/ src/config/ src/services/ src/webui/ src/platform_io/wechat/ pytests/companion/
+# -> All checks passed!
+
+# 2. Persona V2 / MVU / Phase 6 专项与关联回归
+uv run pytest tests/unit/companion_vault pytests/companion/test_phase6_twins_and_wechat_preset.py pytests/companion/test_st_preset_and_webui.py pytests/companion/ pytests/maisaka/ pytests/platform_io/ pytests/webui/test_app.py tests/test_personality_service.py -q
+
+# 3. 前端类型检查、Vitest 与生产打包（于 dashboard/ 目录执行）
+npm run typecheck
+npx vitest run src/lib/__tests__/personality-import.test.ts src/routes/config/bot/PersonalityProfiles.test.tsx src/lib/__tests__/maisaka-monitor-client.test.ts
+npm run build
+```

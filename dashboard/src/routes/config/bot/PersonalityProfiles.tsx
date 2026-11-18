@@ -1,11 +1,13 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Download, Plus, Wrench } from 'lucide-react'
 
+import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Dialog, DialogBody, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
+import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
 import { useToast } from '@/hooks/use-toast'
 import {
@@ -13,7 +15,14 @@ import {
   readPersonalityImport, type PersonalityProfile as Profile,
 } from '@/lib/personality-import'
 
-function snapshot(values: Record<string, unknown>, name: string): Profile {
+const SLOT_UNSET = '__unset__'
+
+type ExtendedProfile = Profile & {
+  persona_v2_card_id?: string
+  mvu_enabled?: boolean
+}
+
+function snapshot(values: Record<string, unknown>, name: string): ExtendedProfile {
   return {
     name,
     personality: values.personality as string,
@@ -23,6 +32,16 @@ function snapshot(values: Record<string, unknown>, name: string): Profile {
     private_chat_prompts: values.private_chat_prompts as string,
     multiple_reply_style: values.multiple_reply_style as string[],
     multiple_probability: values.multiple_probability as number,
+    ...(typeof values.nickname === 'string' ? { nickname: values.nickname } : {}),
+    ...(Array.isArray(values.alias_names) ? { alias_names: values.alias_names as string[] } : {}),
+    ...(typeof values.owner_private_prompt === 'string'
+      ? { owner_private_prompt: values.owner_private_prompt }
+      : {}),
+    ...(typeof values.st_preset_file === 'string' ? { st_preset_file: values.st_preset_file } : {}),
+    ...(typeof values.persona_v2_card_id === 'string'
+      ? { persona_v2_card_id: values.persona_v2_card_id }
+      : {}),
+    ...(typeof values.mvu_enabled === 'boolean' ? { mvu_enabled: values.mvu_enabled } : {}),
   }
 }
 
@@ -32,12 +51,17 @@ export function PersonalityProfiles({ values, onChange }: {
 }) {
   const [panel, setPanel] = useState<'create' | 'manage' | 'import' | null>(() => readPersonalityImport() !== null ? 'import' : null)
   const [importText, setImportText] = useState(() => readPersonalityImport() ?? '')
-  const [draft, setDraft] = useState<Profile | null>(null)
+  const [draft, setDraft] = useState<ExtendedProfile | null>(null)
   const [originalName, setOriginalName] = useState<string | null>(null)
   const [confirmDelete, setConfirmDelete] = useState(false)
   const { toast } = useToast()
-  const profiles = (values.profiles ?? []) as Profile[]
+  const profiles = (values.profiles ?? []) as ExtendedProfile[]
   const selected = profiles.find((profile) => profile.name === values.selected_profile)
+  const twinModeEnabled = Boolean(values.twin_mode_enabled)
+  const mvuEnabled = values.mvu_enabled === undefined ? true : Boolean(values.mvu_enabled)
+  const activeV2CardId = typeof values.persona_v2_card_id === 'string' ? values.persona_v2_card_id : (selected?.persona_v2_card_id ?? '')
+  const youngerSlotProfile = typeof values.younger_slot_profile === 'string' ? values.younger_slot_profile : ''
+  const elderSlotProfile = typeof values.elder_slot_profile === 'string' ? values.elder_slot_profile : ''
 
   const imported = useMemo(() => {
     if (!importText.trim()) return { profile: null, error: '' }
@@ -62,7 +86,7 @@ export function PersonalityProfiles({ values, onChange }: {
     setPanel(null)
   }
 
-  const editProfile = (profile: Profile) => {
+  const editProfile = (profile: ExtendedProfile) => {
     // 当前人设可能在主表单中有新编辑，管理卡片应展示这份最新内容。
     setDraft(profile.name === selected?.name ? snapshot(values, profile.name) : { ...profile })
     setOriginalName(profile.name)
@@ -80,7 +104,7 @@ export function PersonalityProfiles({ values, onChange }: {
     const target = profiles.find((profile) => profile.name === nextName)
     if (!target || nextName === selected?.name) return
     // 切换前把当前编辑写回原人设；未入库的内容自动留一份，避免第一次切换丢失。
-    let nextProfiles: Profile[]
+    let nextProfiles: ExtendedProfile[]
     if (selected) {
       nextProfiles = profiles.map((profile) => profile.name === selected.name ? snapshot(values, selected.name) : profile)
     } else {
@@ -90,7 +114,19 @@ export function PersonalityProfiles({ values, onChange }: {
       nextProfiles = [...profiles, snapshot(values, backupName)]
     }
     const { name: targetName, ...settings } = target
-    onChange({ ...values, ...settings, profiles: nextProfiles, selected_profile: targetName })
+    const nextValues: Record<string, unknown> = {
+      ...values,
+      ...settings,
+      owner_private_prompt: target.owner_private_prompt ?? '',
+      st_preset_file: target.st_preset_file ?? '',
+      persona_v2_card_id: target.persona_v2_card_id ?? '',
+      mvu_enabled: target.mvu_enabled ?? true,
+      profiles: nextProfiles,
+      selected_profile: targetName,
+    }
+    if (target.nickname !== undefined) nextValues.nickname = target.nickname
+    if (target.alias_names !== undefined) nextValues.alias_names = target.alias_names
+    onChange(nextValues)
   }
 
   const saveProfile = () => {
@@ -104,15 +140,40 @@ export function PersonalityProfiles({ values, onChange }: {
       toast({ title: '备用表达风格概率应在 0 到 1 之间', variant: 'destructive' })
       return
     }
-    const saved = { ...draft, name, multiple_reply_style: draft.multiple_reply_style.filter((style) => style.trim()) }
+    const cleanedAliases = Array.isArray(draft.alias_names)
+      ? draft.alias_names.map((alias) => alias.trim()).filter(Boolean)
+      : undefined
+    const saved: ExtendedProfile = {
+      ...draft,
+      name,
+      multiple_reply_style: draft.multiple_reply_style.filter((style) => style.trim()),
+      ...(cleanedAliases !== undefined ? { alias_names: cleanedAliases } : {}),
+    }
     const nextProfiles = originalName === null
       ? [...profiles, saved]
       : profiles.map((profile) => profile.name === originalName ? saved : profile)
     const { name: savedName, ...settings } = saved
+    const renameSlot = (slotValue: unknown) => (
+      originalName !== null && slotValue === originalName ? savedName : slotValue
+    )
+    const slotUpdates = {
+      younger_slot_profile: renameSlot(values.younger_slot_profile),
+      elder_slot_profile: renameSlot(values.elder_slot_profile),
+    }
     // 修改正在使用的人设时同步主表单；编辑其他备选人设不改变当前生效内容。
     onChange(originalName !== null && originalName === selected?.name
-      ? { ...values, ...settings, profiles: nextProfiles, selected_profile: savedName }
-      : { ...values, profiles: nextProfiles })
+      ? {
+          ...values,
+          ...settings,
+          ...slotUpdates,
+          owner_private_prompt: saved.owner_private_prompt ?? '',
+          st_preset_file: saved.st_preset_file ?? '',
+          persona_v2_card_id: saved.persona_v2_card_id ?? '',
+          mvu_enabled: saved.mvu_enabled ?? true,
+          profiles: nextProfiles,
+          selected_profile: savedName,
+        }
+      : { ...values, ...slotUpdates, profiles: nextProfiles })
     closePanel()
   }
 
@@ -121,6 +182,8 @@ export function PersonalityProfiles({ values, onChange }: {
       ...values,
       profiles: profiles.filter((profile) => profile.name !== originalName),
       selected_profile: originalName === selected?.name ? '' : values.selected_profile,
+      younger_slot_profile: originalName === values.younger_slot_profile ? '' : values.younger_slot_profile,
+      elder_slot_profile: originalName === values.elder_slot_profile ? '' : values.elder_slot_profile,
     })
     setDraft(null)
     setOriginalName(null)
@@ -150,6 +213,130 @@ export function PersonalityProfiles({ values, onChange }: {
           else { setDraft(null); setOriginalName(null); setConfirmDelete(false) }
           setPanel('manage')
         }}><Wrench className="h-4 w-4" /></Button>
+      </div>
+
+      <div className="space-y-3 rounded-lg border border-border/70 bg-muted/20 p-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-sm font-medium">双子人格控制台</span>
+            <Badge variant={twinModeEnabled ? 'default' : 'secondary'} className="text-[11px]">
+              {twinModeEnabled ? '已开启双子值班' : '单人格模式'}
+            </Badge>
+            {activeV2CardId && (
+              <Badge variant="outline" className="font-mono text-[10px]">
+                V2卡片: {activeV2CardId}
+              </Badge>
+            )}
+          </div>
+          <div className="flex flex-wrap items-center gap-3">
+            <div className="flex items-center gap-2">
+              <Label htmlFor="mvu-runtime-enabled" className="text-xs text-muted-foreground">
+                启用 MVU 动态变量演进 (mvu_enabled)
+              </Label>
+              <Switch
+                id="mvu-runtime-enabled"
+                checked={mvuEnabled}
+                onCheckedChange={(checked) => onChange({ ...values, mvu_enabled: checked })}
+              />
+            </div>
+            <div className="flex items-center gap-2">
+              <Label htmlFor="twin-mode-enabled" className="text-xs text-muted-foreground">
+                启用双子人格切换 (twin_mode_enabled)
+              </Label>
+              <Switch
+                id="twin-mode-enabled"
+                checked={twinModeEnabled}
+                onCheckedChange={(checked) => onChange({ ...values, twin_mode_enabled: checked })}
+              />
+            </div>
+          </div>
+        </div>
+
+        <div className="grid gap-2.5 sm:grid-cols-2">
+          <div className="space-y-1.5 rounded-md border border-border/60 bg-background/80 p-2.5">
+            <div className="flex items-center justify-between gap-2">
+              <Label htmlFor="twin-younger-slot" className="text-xs font-medium">
+                🌸 妹妹主值班槽位
+              </Label>
+              {youngerSlotProfile && selected?.name === youngerSlotProfile && (
+                <Badge variant="outline" className="text-[10px]">编辑中</Badge>
+              )}
+            </div>
+            <div className="flex items-center gap-1.5">
+              <Select
+                value={youngerSlotProfile || SLOT_UNSET}
+                onValueChange={(nextValue) => onChange({
+                  ...values,
+                  younger_slot_profile: nextValue === SLOT_UNSET ? '' : nextValue,
+                })}
+              >
+                <SelectTrigger id="twin-younger-slot" className="h-8 min-w-0 flex-1 text-xs">
+                  <SelectValue placeholder="跟随当前全局人设" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={SLOT_UNSET}>跟随当前全局人设</SelectItem>
+                  {profiles.map((profile) => (
+                    <SelectItem key={'younger-' + profile.name} value={profile.name}>
+                      {profile.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <Button
+                type="button"
+                size="sm"
+                variant={youngerSlotProfile && selected?.name === youngerSlotProfile ? 'default' : 'outline'}
+                className="h-8 shrink-0 px-2.5 text-xs"
+                disabled={!youngerSlotProfile || !profiles.some((p) => p.name === youngerSlotProfile) || selected?.name === youngerSlotProfile}
+                onClick={() => switchTo(youngerSlotProfile)}
+              >
+                切到妹妹编辑
+              </Button>
+            </div>
+          </div>
+
+          <div className="space-y-1.5 rounded-md border border-border/60 bg-background/80 p-2.5">
+            <div className="flex items-center justify-between gap-2">
+              <Label htmlFor="twin-elder-slot" className="text-xs font-medium">
+                🌙 姐姐协同槽位
+              </Label>
+              {elderSlotProfile && selected?.name === elderSlotProfile && (
+                <Badge variant="outline" className="text-[10px]">编辑中</Badge>
+              )}
+            </div>
+            <div className="flex items-center gap-1.5">
+              <Select
+                value={elderSlotProfile || SLOT_UNSET}
+                onValueChange={(nextValue) => onChange({
+                  ...values,
+                  elder_slot_profile: nextValue === SLOT_UNSET ? '' : nextValue,
+                })}
+              >
+                <SelectTrigger id="twin-elder-slot" className="h-8 min-w-0 flex-1 text-xs">
+                  <SelectValue placeholder="跟随当前全局人设" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={SLOT_UNSET}>跟随当前全局人设</SelectItem>
+                  {profiles.map((profile) => (
+                    <SelectItem key={'elder-' + profile.name} value={profile.name}>
+                      {profile.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <Button
+                type="button"
+                size="sm"
+                variant={elderSlotProfile && selected?.name === elderSlotProfile ? 'default' : 'outline'}
+                className="h-8 shrink-0 px-2.5 text-xs"
+                disabled={!elderSlotProfile || !profiles.some((p) => p.name === elderSlotProfile) || selected?.name === elderSlotProfile}
+                onClick={() => switchTo(elderSlotProfile)}
+              >
+                切到姐姐编辑
+              </Button>
+            </div>
+          </div>
+        </div>
       </div>
 
       <Dialog open={panel !== null} onOpenChange={(open) => { if (!open) closePanel() }}>
@@ -199,6 +386,24 @@ export function PersonalityProfiles({ values, onChange }: {
                 <div className="space-y-2">
                   <Label htmlFor="profile-probability">备用表达风格触发概率</Label>
                   <Input id="profile-probability" type="number" min={0} max={1} step={0.1} value={Number.isNaN(draft.multiple_probability) ? '' : draft.multiple_probability} onChange={(event) => setDraft({ ...draft, multiple_probability: event.target.valueAsNumber })} />
+                </div>
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <div className="space-y-2">
+                    <Label htmlFor="profile-nickname">昵称 (可选，切换时同步 bot 昵称)</Label>
+                    <Input id="profile-nickname" placeholder="如：许妍 / 姐姐" value={draft.nickname ?? ''} onChange={(event) => setDraft({ ...draft, nickname: event.target.value })} />
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="profile-st-preset">专属酒馆预设文件名 (可选)</Label>
+                    <Input id="profile-st-preset" placeholder="留空跟随全局 st_preset_engine" value={draft.st_preset_file ?? ''} onChange={(event) => setDraft({ ...draft, st_preset_file: event.target.value })} />
+                  </div>
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="profile-aliases">别名（每行一条，可选）</Label>
+                  <Textarea id="profile-aliases" rows={2} value={(draft.alias_names ?? []).join('\n')} onChange={(event) => setDraft({ ...draft, alias_names: event.target.value.split('\n') })} />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="profile-owner-private">Owner 专属私密提示词（仅限最高信任度私聊挂载）</Label>
+                  <Textarea id="profile-owner-private" rows={3} placeholder="仅当与高信任度 Owner 一对一私聊时追加挂载，群聊绝不注入。" value={draft.owner_private_prompt ?? ''} onChange={(event) => setDraft({ ...draft, owner_private_prompt: event.target.value })} />
                 </div>
               </>}
             </div>

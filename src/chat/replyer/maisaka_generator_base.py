@@ -1,8 +1,10 @@
 from dataclasses import dataclass, field, replace
 from datetime import datetime
+from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Dict, List, Literal, Optional, Tuple
 
 import asyncio
+import os
 import random
 import re
 import time
@@ -72,6 +74,7 @@ logger = get_logger("replyer")
 
 REPLYER_MAX_HOOK_RETRIES = 3
 DUPLICATE_TARGET_REPLY_REMINDER_ARG = "_duplicate_target_reply_reminder"
+_LAST_SPEAKER_SLOT_BY_SESSION: Dict[str, str] = {}
 
 
 @dataclass
@@ -103,19 +106,339 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
             request_type=request_type,
             session_id=getattr(chat_stream, "session_id", "") if chat_stream is not None else "",
         )
+        self.elder_express_model = llm_client_cls(
+            task_name="replyer_elder",
+            request_type=request_type,
+            session_id=getattr(chat_stream, "session_id", "") if chat_stream is not None else "",
+        )
+
+    @staticmethod
+    def _resolve_effective_persona_slot(reply_tool_args: Optional[Dict[str, Any]] = None) -> str:
+        """解析本次值班的姐妹声带槽位，默认 sister_younger。"""
+        raw_slot = str((reply_tool_args or {}).get("persona_slot") or "sister_younger").strip()
+        return "sister_elder" if raw_slot == "sister_elder" else "sister_younger"
+
+    def _resolve_slot_profile(self, reply_tool_args: Optional[Dict[str, Any]] = None) -> Any:
+        """解析当前值班槽位对应的完整人格 Profile（带配置缺省兼容）。"""
+        slot = self._resolve_effective_persona_slot(reply_tool_args)
+        personality_cfg = getattr(global_config, "personality", None)
+        bot_cfg = getattr(global_config, "bot", None)
+        chat_cfg = getattr(global_config, "chat", None)
+        reply_style_cfg = getattr(chat_cfg, "reply_style", None) if chat_cfg is not None else None
+        if personality_cfg is not None and callable(getattr(personality_cfg, "resolve_slot_profile", None)):
+            try:
+                return personality_cfg.resolve_slot_profile(slot, bot_cfg, reply_style_cfg)
+            except Exception as exc:
+                logger.debug(f"resolve_slot_profile 回退默认配置: {exc}")
+        return SimpleNamespace(
+            name=slot,
+            nickname=str(getattr(bot_cfg, "nickname", "") or ""),
+            alias_names=list(getattr(bot_cfg, "alias_names", []) or []),
+            personality=str(getattr(personality_cfg, "personality", "") or ""),
+            behavior_style=str(getattr(personality_cfg, "behavior_style", "") or ""),
+            reply_style=str(getattr(personality_cfg, "reply_style", "") or ""),
+            group_chat_prompt=str(getattr(reply_style_cfg, "group_chat_prompt", "") or ""),
+            private_chat_prompts=str(getattr(reply_style_cfg, "private_chat_prompts", "") or ""),
+            multiple_reply_style=list(getattr(personality_cfg, "multiple_reply_style", []) or []),
+            multiple_probability=float(getattr(personality_cfg, "multiple_probability", 0.0) or 0.0),
+            owner_private_prompt=str(getattr(personality_cfg, "owner_private_prompt", "") or ""),
+            st_preset_file="",
+        )
+
+    @staticmethod
+    def _resolve_slot_display_name(persona_slot: str, slot_profile: Any = None) -> str:
+        """获取值班姐妹的展示昵称。"""
+        nickname = str(getattr(slot_profile, "nickname", "") or "").strip() if slot_profile is not None else ""
+        if nickname:
+            return nickname
+        name = str(getattr(slot_profile, "name", "") or "").strip() if slot_profile is not None else ""
+        if name and name not in {"default", "sister_younger", "sister_elder"}:
+            return name
+        if persona_slot == "sister_elder":
+            return "姐姐"
+        return str(getattr(getattr(global_config, "bot", None), "nickname", "") or "许妍").strip() or "许妍"
+
+    def _extract_sender_identity_for_reply(
+        self,
+        *,
+        session_id: str,
+        reply_message: Optional[SessionMessage],
+    ) -> Tuple[Optional[bool], str, str, str]:
+        """提取当前回复对象的 (is_group_chat, platform, sender_id, person_id)。"""
+        is_group_chat: Optional[bool] = None
+        if session_id:
+            try:
+                is_group_chat, _ = get_chat_type_and_target_info(session_id)
+            except Exception:
+                is_group_chat = None
+        if is_group_chat is None and getattr(self, "chat_stream", None) is not None:
+            is_group_chat = bool(getattr(self.chat_stream, "is_group_session", True))
+        if not is_group_chat and getattr(self, "chat_stream", None) is not None:
+            if getattr(self.chat_stream, "is_group_session", False):
+                is_group_chat = True
+        if not is_group_chat and reply_message is not None:
+            msg_info = getattr(reply_message, "message_info", None)
+            group_info = getattr(msg_info, "group_info", None) if msg_info is not None else None
+            if group_info is not None and getattr(group_info, "group_id", ""):
+                is_group_chat = True
+
+        sender_id = ""
+        person_id = ""
+        platform = "wechat"
+        if reply_message is not None:
+            platform = str(getattr(reply_message, "platform", "") or platform).strip() or platform
+            msg_info = getattr(reply_message, "message_info", None)
+            user_info = getattr(msg_info, "user_info", None) if msg_info is not None else None
+            if user_info is not None:
+                sender_id = str(getattr(user_info, "user_id", "") or "").strip()
+                person_id = str(getattr(user_info, "person_id", "") or "").strip()
+        if not sender_id and getattr(self, "chat_stream", None) is not None:
+            sender_id = str(getattr(self.chat_stream, "user_id", "") or "").strip()
+            platform = str(getattr(self.chat_stream, "platform", "") or platform).strip() or platform
+        return is_group_chat, platform, sender_id, person_id
+
+    def _resolve_is_owner_private(
+        self,
+        *,
+        session_id: str,
+        reply_message: Optional[SessionMessage],
+        reply_tool_args: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[bool, str]:
+        """Fail-Closed 身份强校验：仅当非群聊且发送者真值角色明确为 OWNER 时放行。"""
+        del reply_tool_args
+        is_group_chat, platform, sender_id, person_id = self._extract_sender_identity_for_reply(
+            session_id=session_id,
+            reply_message=reply_message,
+        )
+        if is_group_chat is not False:
+            return False, "GROUP_MEMBER"
+
+        if not sender_id and not person_id:
+            return False, "STRANGER"
+
+        try:
+            from src.companion_vault import runtime_bridge
+
+            truth_db_path = (
+                os.environ.get("MAIBOT_TRUTH_DB_PATH", "").strip()
+                or runtime_bridge.DEFAULT_TRUTH_DB_PATH
+            )
+            sender_trust_role = str(
+                runtime_bridge._resolve_trust_role_sync(
+                    truth_db_path,
+                    person_id=person_id,
+                    user_id=sender_id,
+                    platform=platform,
+                )
+                or "STRANGER"
+            ).strip()
+        except Exception as exc:
+            logger.debug(f"Replyer 身份强校验失败（Fail-Closed）: {exc}")
+            return False, "STRANGER"
+
+        is_owner_private = (not bool(is_group_chat)) and (sender_trust_role == "OWNER")
+        return is_owner_private, sender_trust_role
+
+    def _resolve_owner_private_and_truth_overlay(
+        self,
+        *,
+        session_id: str,
+        reply_message: Optional[SessionMessage],
+        reply_tool_args: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[bool, str]:
+        """Fail-Closed 校验 Owner 私聊身份，并在通过后装载 companion_truth.db 专属关系层。"""
+        is_owner_private, sender_trust_role = self._resolve_is_owner_private(
+            session_id=session_id,
+            reply_message=reply_message,
+            reply_tool_args=reply_tool_args,
+        )
+        if not is_owner_private:
+            return False, ""
+
+        _, platform, sender_id, _ = self._extract_sender_identity_for_reply(
+            session_id=session_id,
+            reply_message=reply_message,
+        )
+        try:
+            from src.companion_vault import runtime_bridge
+
+            truth_db_path = (
+                os.environ.get("MAIBOT_TRUTH_DB_PATH", "").strip()
+                or runtime_bridge.DEFAULT_TRUTH_DB_PATH
+            )
+            if not os.path.isfile(truth_db_path):
+                return True, ""
+            db = runtime_bridge._open_truth_db(truth_db_path)
+            try:
+                overlay = runtime_bridge.build_owner_persona_overlay(
+                    db,
+                    is_group_chat=False,
+                    sender_trust_role=sender_trust_role,
+                    user_id=sender_id,
+                    platform=platform,
+                )
+            finally:
+                db.close()
+            return True, overlay.strip()
+        except Exception as exc:
+            logger.debug(f"Replyer 装载 Owner 专属关系记忆层失败（已安全降级）: {exc}")
+            return True, ""
+
+    def _extract_recent_conversation_text(
+        self,
+        chat_history: List[LLMContextMessage],
+        reply_message: Optional[SessionMessage],
+        max_turns: int = 6,
+    ) -> str:
+        """提取最近对话与当前目标消息纯文本，供 Persona V2 240字符邻近度与关键词语料召回使用。"""
+        snippets: List[str] = []
+        for msg in chat_history[-max_turns:]:
+            if isinstance(msg, SessionBackedMessage):
+                txt = (msg.processed_plain_text or "").strip()
+                if txt:
+                    snippets.append(txt)
+            elif isinstance(msg, ContentContextMessage):
+                txt = (getattr(msg, "content", "") or "").strip()
+                if txt:
+                    snippets.append(txt)
+        if reply_message is not None:
+            target_txt = self._build_target_message_content(reply_message).strip()
+            if target_txt:
+                snippets.append(target_txt)
+        return "\n".join(snippets)
+
+    def _compile_persona_v2_turn_for_replyer(
+        self,
+        *,
+        slot_profile: Optional[Any],
+        is_owner_private: bool,
+        chat_history: List[LLMContextMessage],
+        reply_message: Optional[SessionMessage],
+    ) -> Optional[Any]:
+        """若当前槽位绑定了 PersonaV2Card，编译其静态主干、动态覆写与 MVU 实时状态块。"""
+        if slot_profile is None:
+            return None
+        try:
+            from src.companion_vault import runtime_bridge
+            from src.companion_vault.mvu_engine import MVURuntimeEngine
+            from src.companion_vault.persona_v2_engine import get_persona_v2_manager
+
+            card = get_persona_v2_manager().resolve_card_for_profile(slot_profile)
+            if card is None:
+                return None
+
+            recent_text = self._extract_recent_conversation_text(chat_history, reply_message)
+            mvu_enabled = bool(getattr(slot_profile, "mvu_enabled", True)) and bool(
+                getattr(global_config.personality, "mvu_enabled", True)
+            )
+            truth_db_path = (
+                os.environ.get("MAIBOT_TRUTH_DB_PATH", "").strip()
+                or runtime_bridge.DEFAULT_TRUTH_DB_PATH
+            )
+            db = None
+            try:
+                os.makedirs(os.path.dirname(truth_db_path) or ".", exist_ok=True)
+                db = runtime_bridge._open_truth_db(truth_db_path)
+                return MVURuntimeEngine.compile_turn_persona_and_mvu(
+                    card,
+                    db=db,
+                    is_owner_private=is_owner_private,
+                    recent_text=recent_text,
+                    mvu_enabled_override=mvu_enabled,
+                )
+            finally:
+                if db is not None:
+                    db.close()
+        except Exception as exc:
+            logger.warning(f"编译 Persona V2 / MVU 轮次上下文失败（已安全降级）: {exc}")
+            return None
+
+    def _build_sister_handoff_note(self, session_id: str, persona_slot: str) -> str:
+        """若本轮与上一轮同一会话的值班姐妹不同，生成接力交接提示。"""
+        if not session_id or not bool(getattr(global_config.personality, "twin_mode_enabled", False)):
+            return ""
+        prev_slot = _LAST_SPEAKER_SLOT_BY_SESSION.get(session_id, "")
+        if not prev_slot or prev_slot == persona_slot:
+            return ""
+        prev_prof = self._resolve_slot_profile({"persona_slot": prev_slot})
+        curr_prof = self._resolve_slot_profile({"persona_slot": persona_slot})
+        prev_name = self._resolve_slot_display_name(prev_slot, prev_prof)
+        curr_name = self._resolve_slot_display_name(persona_slot, curr_prof)
+        return (
+            f"[双子接力交接提示：上一条我方发言由 {prev_name}（{prev_slot}）发出，"
+            f"本轮切换为 {curr_name}（{persona_slot}）接手回复。请以当前身份自然衔接语境，勿混淆姐妹视角。]"
+        )
+
+    def _resolve_bot_aliases_text(self, slot_profile: Optional[Any]) -> str:
+        """返回带逗号前缀的昵称别名短语；无别名时返回空串。"""
+        alias_names = (
+            list(getattr(slot_profile, "alias_names", []) or [])
+            if slot_profile is not None and getattr(slot_profile, "alias_names", None)
+            else global_config.bot.alias_names
+        )
+        return f"，也有人叫你{','.join(alias_names)}" if alias_names else ""
+
+    def _build_twin_relation_line(self, active_slot: str, bot_name: str) -> str:
+        """构建双子模式下的姐妹身份互补提示（未开启双子模式返回空串）。"""
+        if not bool(getattr(global_config.personality, "twin_mode_enabled", False)):
+            return ""
+        younger_prof = self._resolve_slot_profile({"persona_slot": "sister_younger"})
+        elder_prof = self._resolve_slot_profile({"persona_slot": "sister_elder"})
+        younger_nick = self._resolve_slot_display_name("sister_younger", younger_prof)
+        elder_nick = self._resolve_slot_display_name("sister_elder", elder_prof)
+        resolved_slot = str(active_slot or "").strip()
+        if not resolved_slot:
+            resolved_slot = "sister_elder" if (bot_name == elder_nick and elder_nick != younger_nick) else "sister_younger"
+        if resolved_slot == "sister_younger" and elder_nick:
+            elder_aliases = [str(a).strip() for a in (getattr(elder_prof, "alias_names", []) or []) if str(a).strip()]
+            alias_hint = f"（常被称作{'、'.join(elder_aliases)}）" if elder_aliases else ""
+            return (
+                f"\n你有一个双胞胎姐姐叫{elder_nick}{alias_hint}。"
+                "当对方提起或呼唤姐姐而由你独立值班时，请以你自己的身份自然回应并照看对话，严禁冒充姐姐本人。"
+            )
+        if resolved_slot == "sister_elder" and younger_nick:
+            younger_aliases = [str(a).strip() for a in (getattr(younger_prof, "alias_names", []) or []) if str(a).strip()]
+            alias_hint = f"（常被称作{'、'.join(younger_aliases)}）" if younger_aliases else ""
+            return f"\n你有一个双胞胎妹妹叫{younger_nick}{alias_hint}。"
+        return ""
 
     def _build_personality_prompt(self) -> str:
         """构建 replyer 使用的人设提示。"""
+        slot_profile = getattr(self, "_active_slot_profile", None)
+        active_slot = str(getattr(self, "_active_persona_slot", "") or "").strip()
         try:
-            bot_name = global_config.bot.nickname
-            alias_names = global_config.bot.alias_names
-            bot_aliases = f"，也有人叫你{','.join(alias_names)}" if alias_names else ""
+            bot_name = (
+                (str(getattr(slot_profile, "nickname", "") or "").strip() if slot_profile is not None else "")
+                or global_config.bot.nickname
+            )
+            bot_aliases = self._resolve_bot_aliases_text(slot_profile)
 
-            prompt_personality = global_config.personality.personality.strip()
+            prompt_personality = (
+                str(getattr(slot_profile, "personality", "") or "").strip()
+                if slot_profile is not None
+                else ""
+            ) or global_config.personality.personality.strip()
             if not prompt_personality:
                 prompt_personality = "是人类。"
 
-            return f"你的名字是{bot_name}{bot_aliases}。\n{prompt_personality}"
+            twin_relation_line = self._build_twin_relation_line(active_slot, bot_name)
+
+            bg_story = str(getattr(global_config.personality, "background_story", "") or "").strip()
+            bg_block = f"\n【项目背景设定】\n{bg_story}" if bg_story else ""
+            v2_static_suffix = ""
+            if slot_profile is not None and not getattr(self, "_suppress_v2_in_personality_prompt", False):
+                try:
+                    from src.companion_vault.persona_v2_engine import (
+                        PersonaV2Engine,
+                        get_persona_v2_manager,
+                    )
+
+                    v2_card = get_persona_v2_manager().resolve_card_for_profile(slot_profile)
+                    if v2_card is not None:
+                        v2_static_suffix = "\n\n" + PersonaV2Engine.build_static_core_block(v2_card)
+                except Exception:
+                    v2_static_suffix = ""
+            return f"你的名字是{bot_name}{bot_aliases}。\n{prompt_personality}{twin_relation_line}{bg_block}{v2_static_suffix}"
         except Exception as exc:
             logger.warning(f"构建 Maisaka 人设提示词失败: {exc}")
             return "你的名字是麦麦。\n是人类。"
@@ -134,13 +457,51 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
         if not candidate_styles:
             return ""
 
-        probability = personality_config.multiple_probability
-        if probability <= 0:
+        if personality_config.multiple_probability <= 0:
             return ""
-        if random.random() > probability:
+        if random.random() > personality_config.multiple_probability:
             return ""
 
         return random.choice(candidate_styles)
+
+    def _get_effective_reply_style(self, slot_profile: Optional[Any]) -> str:
+        """优先应用双子槽位差异化表达风格，否则回退 _select_reply_style()（兼容单测 monkeypatch）。"""
+        if slot_profile is not None:
+            slot_style = str(getattr(slot_profile, "reply_style", "") or "")
+            slot_name = str(getattr(slot_profile, "name", "") or "").strip()
+            has_slot_override = bool(
+                getattr(global_config.personality, "twin_mode_enabled", False)
+                or (slot_name and slot_name != "default")
+            )
+            if (
+                has_slot_override
+                and slot_style.strip()
+                and slot_style != global_config.personality.reply_style
+            ):
+                return slot_style
+        return self._select_reply_style()
+
+    def _get_effective_temporary_reply_style(self, slot_profile: Optional[Any]) -> str:
+        """优先应用双子槽位差异化备用风格，否则回退 _select_temporary_reply_style()。"""
+        personality_config = global_config.personality
+        if slot_profile is not None:
+            raw_styles = list(getattr(slot_profile, "multiple_reply_style", []) or [])
+            slot_name = str(getattr(slot_profile, "name", "") or "").strip()
+            has_slot_override = bool(
+                getattr(personality_config, "twin_mode_enabled", False)
+                or (slot_name and slot_name != "default")
+            )
+            if (
+                has_slot_override
+                and raw_styles
+                and raw_styles != list(personality_config.multiple_reply_style or [])
+            ):
+                candidate_styles = [style.strip() for style in raw_styles if style.strip()]
+                probability = float(getattr(slot_profile, "multiple_probability", 0.0) or 0.0)
+                if candidate_styles and probability > 0 and random.random() <= probability:
+                    return random.choice(candidate_styles)
+                return ""
+        return self._select_temporary_reply_style()
 
     @staticmethod
     def _normalize_content(content: str, limit: int = 500) -> str:
@@ -389,8 +750,12 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
         """根据聊天流 ID 获取匹配的额外 prompt。"""
         return ChatConfigUtils.get_chat_prompt_for_chat(chat_id, is_group_chat)
 
-    def _build_group_chat_attention_block(self, session_id: str) -> str:
+    def _build_group_chat_attention_block(
+        self,
+        session_id: str,
+    ) -> str:
         """构建当前聊天场景下的额外注意事项块。"""
+        slot_profile = getattr(self, "_active_slot_profile", None)
         if not session_id:
             return ""
 
@@ -402,10 +767,20 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
         prompt_lines: List[str] = []
 
         if is_group_chat is True:
-            if group_chat_prompt := global_config.chat.reply_style.group_chat_prompt.strip():
+            group_chat_prompt = (
+                str(getattr(slot_profile, "group_chat_prompt", "") or "").strip()
+                if slot_profile is not None
+                else ""
+            ) or global_config.chat.reply_style.group_chat_prompt.strip()
+            if group_chat_prompt:
                 prompt_lines.append(f"通用注意事项：\n{group_chat_prompt}")
         elif is_group_chat is False:
-            if private_chat_prompt := global_config.chat.reply_style.private_chat_prompts.strip():
+            private_chat_prompt = (
+                str(getattr(slot_profile, "private_chat_prompts", "") or "").strip()
+                if slot_profile is not None
+                else ""
+            ) or global_config.chat.reply_style.private_chat_prompts.strip()
+            if private_chat_prompt:
                 prompt_lines.append(f"通用注意事项：\n{private_chat_prompt}")
 
         if chat_prompt := self._get_chat_prompt_for_chat(session_id, is_group_chat).strip():
@@ -537,23 +912,47 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
         reply_reason: str,
         expression_habits: str = "",
         stream_id: Optional[str] = None,
+        reply_tool_args: Optional[Dict[str, Any]] = None,
     ) -> str:
-        del reply_message
         del reply_reason
         del expression_habits
         session_id = self._resolve_session_id(stream_id)
+        persona_slot = self._resolve_effective_persona_slot(reply_tool_args)
+        slot_profile = self._resolve_slot_profile(reply_tool_args)
+        bot_name = (
+            str(getattr(slot_profile, "nickname", "") or "").strip()
+            or global_config.bot.nickname
+        )
 
+        prev_slot_profile = getattr(self, "_active_slot_profile", None)
+        prev_persona_slot = getattr(self, "_active_persona_slot", "")
+        self._active_slot_profile = slot_profile
+        self._active_persona_slot = persona_slot
         try:
             system_prompt = self._load_prompt(
                 "maisaka_replyer",
-                bot_name=global_config.bot.nickname,
+                bot_name=bot_name,
                 group_chat_attention_block=self._build_group_chat_attention_block(session_id),
                 replyer_output_instruction=self._build_replyer_output_instruction(),
                 identity=self._build_personality_prompt(),
-                reply_style=self._select_reply_style(),
+                reply_style=self._get_effective_reply_style(slot_profile),
             )
         except Exception:
             system_prompt = "你是一个友好的 AI 助手，请根据聊天记录自然回复。"
+        finally:
+            self._active_slot_profile = prev_slot_profile
+            self._active_persona_slot = prev_persona_slot
+
+        is_owner_private, owner_truth_overlay = self._resolve_owner_private_and_truth_overlay(
+            session_id=session_id,
+            reply_message=reply_message,
+            reply_tool_args=reply_tool_args,
+        )
+        owner_priv_prompt = str(getattr(slot_profile, "owner_private_prompt", "") or "").strip()
+        if is_owner_private and owner_priv_prompt:
+            system_prompt += f"\n\n【Owner 私聊专属指令】\n{owner_priv_prompt}"
+        if is_owner_private and owner_truth_overlay:
+            system_prompt += f"\n\n{owner_truth_overlay}"
 
         is_group_chat, _ = get_chat_type_and_target_info(session_id)
         if attention_drift := build_attention_drift_prompt_block(is_group_chat):
@@ -671,14 +1070,20 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
     def _uses_retro_prompt(self) -> bool:
         return global_config.debug.replyer_retro_prompt
 
-    def _uses_st_preset_engine(self) -> bool:
+    def _uses_st_preset_engine(self, reply_tool_args: Optional[Dict[str, Any]] = None) -> bool:
         """当挂载了自定义构建器或在 STPresetRuntimeManager 中开启预设引擎时返回 True。"""
         if callable(getattr(self, "_st_preset_request_builder", None)):
             return True
         try:
             from src.companion_vault.st_preset_engine import get_st_preset_manager
 
-            eng, _ = get_st_preset_manager().get_active_engine()
+            persona_slot = self._resolve_effective_persona_slot(reply_tool_args)
+            slot_profile = self._resolve_slot_profile(reply_tool_args)
+            preset_override = str(getattr(slot_profile, "st_preset_file", "") or "").strip()
+            eng, _ = get_st_preset_manager().get_active_engine(
+                persona_slot=persona_slot,
+                preset_override=preset_override,
+            )
             return eng is not None
         except Exception:
             return False
@@ -702,14 +1107,35 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
         )
 
         args = reply_tool_args or {}
-        persona_slot = str(args.get("persona_slot") or "sister_younger").strip()
-        engine, cfg = get_st_preset_manager().get_active_engine(persona_slot=persona_slot)
+        persona_slot = self._resolve_effective_persona_slot(args)
+        slot_profile = self._resolve_slot_profile(args)
+        preset_override = str(getattr(slot_profile, "st_preset_file", "") or "").strip()
+        engine, cfg = get_st_preset_manager().get_active_engine(
+            persona_slot=persona_slot,
+            preset_override=preset_override,
+        )
         if engine is None:
             raise RuntimeError("STPresetEngine 未激活或未找到对应预设文件")
 
         session_id = self._resolve_session_id(stream_id)
         is_group_chat, _ = get_chat_type_and_target_info(session_id) if session_id else (False, None)
-        bot_name = global_config.bot.nickname or "许妍"
+        if not is_group_chat and getattr(self, "chat_stream", None) is not None:
+            is_group_chat = bool(getattr(self.chat_stream, "is_group_session", False))
+        if not is_group_chat and reply_message is not None:
+            msg_info = getattr(reply_message, "message_info", None)
+            group_info = getattr(msg_info, "group_info", None) if msg_info is not None else None
+            if group_info is not None and getattr(group_info, "group_id", ""):
+                is_group_chat = True
+        is_owner_private, owner_truth_overlay = self._resolve_owner_private_and_truth_overlay(
+            session_id=session_id,
+            reply_message=reply_message,
+            reply_tool_args=args,
+        )
+        bot_name = (
+            str(getattr(slot_profile, "nickname", "") or "").strip()
+            or global_config.bot.nickname
+            or "许妍"
+        )
         user_name = "群友" if is_group_chat else "你"
         last_user_msg = ""
         if reply_message is not None and reply_message.message_info and reply_message.message_info.user_info:
@@ -729,20 +1155,48 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
         if not last_user_msg and turns and turns[-1].role == "user":
             last_user_msg = turns[-1].text
 
+        v2_turn = self._compile_persona_v2_turn_for_replyer(
+            slot_profile=slot_profile,
+            is_owner_private=is_owner_private,
+            chat_history=chat_history,
+            reply_message=reply_message,
+        )
+        self._last_persona_v2_turn = v2_turn
+        self._last_is_owner_private = is_owner_private
+
+        handoff_note = self._build_sister_handoff_note(session_id, persona_slot)
+        # 当已绑定 Persona V2 卡时，Owner 专属核心张力与阶段档案由 persona_v2_static/dynamic 注入，不再重复拼接旧式长篇 owner_private_prompt
+        owner_priv_prompt = (
+            str(getattr(slot_profile, "owner_private_prompt", "") or "").strip()
+            if (is_owner_private and v2_turn is None)
+            else ""
+        )
         director_parts = [
+            handoff_note,
+            f"【Owner 私聊专属指令】\n{owner_priv_prompt}" if owner_priv_prompt else "",
+            owner_truth_overlay if is_owner_private else "",
             self._build_reply_reference_message(reply_reason, str(args.get("reply_reference") or "")),
             reply_requirements.strip(),
             expression_habits.strip(),
         ]
         director_note = "\n".join(p for p in director_parts if p)
 
+        twin_mode = bool(getattr(global_config.personality, "twin_mode_enabled", False))
+        active_task_name = (
+            "replyer_elder"
+            if (twin_mode and persona_slot == "sister_elder")
+            else str(getattr(self.express_model, "task_name", "") or "replyer").strip() or "replyer"
+        )
         detected_client_type = "openai"
         try:
             from src.config.config import model_config as _mc
+            from src.services.service_task_resolver import get_available_models, resolve_task_name
 
-            task_cfg = getattr(_mc.model_task_config, getattr(self.express_model, "task_name", "replyer"), None)
-            if task_cfg and getattr(task_cfg, "model_list", None):
-                first_model = _mc.get_model_info(task_cfg.model_list[0])
+            resolved_task = resolve_task_name(active_task_name)
+            task_cfg = get_available_models().get(resolved_task)
+            model_list = list(getattr(task_cfg, "model_list", []) or [])
+            if model_list:
+                first_model = _mc.get_model_info(model_list[0])
                 prov = _mc.get_provider(first_model.api_provider)
                 detected_client_type = str(getattr(prov, "client_type", "openai") or "openai").lower()
         except Exception:
@@ -753,27 +1207,53 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
             raw_proto if raw_proto in {"auto", "spreset_tool_envelope", "standard_chat"} else "auto"
         )
 
+        prev_slot_profile = getattr(self, "_active_slot_profile", None)
+        prev_persona_slot = getattr(self, "_active_persona_slot", "")
+        self._active_slot_profile = slot_profile
+        self._active_persona_slot = persona_slot
+        self._suppress_v2_in_personality_prompt = True
+        try:
+            if v2_turn is not None:
+                bot_aliases = self._resolve_bot_aliases_text(slot_profile)
+                twin_relation_line = self._build_twin_relation_line(persona_slot, bot_name)
+                char_description = f"你的名字是{bot_name}{bot_aliases}。{twin_relation_line}"
+            else:
+                char_description = self._build_personality_prompt()
+            char_personality = self._get_effective_reply_style(slot_profile)
+        finally:
+            self._suppress_v2_in_personality_prompt = False
+            self._active_slot_profile = prev_slot_profile
+            self._active_persona_slot = prev_persona_slot
+
         ctx = STCompileContext(
             char_name=bot_name,
             user_name=user_name,
-            char_description=self._build_personality_prompt(),
-            char_personality=self._select_reply_style(),
+            char_description=char_description,
+            char_personality=char_personality,
+            scenario=str(getattr(global_config.personality, "background_story", "") or "").strip(),
             shujuku_recalled=str(args.get("_recalled_memory_block") or ""),
             director_note=director_note,
             chat_history=turns,
             last_user_message=last_user_msg,
-            model_name=str(getattr(self.express_model, "task_name", "") or "gemini-3.8-flash"),
+            model_name=active_task_name,
             is_group_chat=bool(is_group_chat),
-            is_owner_private=not bool(is_group_chat),
+            is_owner_private=is_owner_private,
             oracle_mode="chat" if cfg.get("oracle_mode") == "chat" else "theater",
             deep_think=bool(cfg.get("deep_think", False)),
             output_mode="raw_preset" if cfg.get("output_mode") == "raw_preset" else "im_clean",
             protocol_mode=proto_mode,
             client_type=detected_client_type,
+            persona_v2_static=v2_turn.static_core_block if v2_turn is not None else "",
+            persona_v2_dynamic=v2_turn.dynamic_tail_block if v2_turn is not None else "",
+            mvu_state_block=v2_turn.mvu_state_block if v2_turn is not None else "",
+            mvu_update_instruction=v2_turn.mvu_update_instruction_block if v2_turn is not None else "",
+            external_tools=list(args.get("_external_tools") or []),
+            tool_observations=list(args.get("_tool_observations") or []),
         )
         compiled = engine.compile_to_context_items(ctx)
         self._last_st_compiled_request = compiled
         self._last_st_output_mode = ctx.output_mode
+        self._last_st_reply_tool_args = dict(args)
         return compiled.context_items
 
     @staticmethod
@@ -822,7 +1302,7 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
         think_level: int = 1,
     ) -> List[ContextItem]:
         # ST 预设引擎接管分支（默认未启用时返回 False，零侵入现有路径）
-        if self._uses_st_preset_engine():
+        if self._uses_st_preset_engine(reply_tool_args):
             custom_builder = getattr(self, "_st_preset_request_builder", None)
             if callable(custom_builder):
                 return custom_builder(
@@ -871,7 +1351,25 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
             reply_reason=reply_reason,
             expression_habits=expression_habits,
             stream_id=stream_id,
+            reply_tool_args=reply_tool_args,
         )
+        slot_profile = self._resolve_slot_profile(reply_tool_args)
+        persona_slot = self._resolve_effective_persona_slot(reply_tool_args)
+        resolved_session_id = self._resolve_session_id(stream_id)
+        is_owner_private, _ = self._resolve_owner_private_and_truth_overlay(
+            session_id=resolved_session_id,
+            reply_message=reply_message,
+            reply_tool_args=reply_tool_args,
+        )
+        v2_turn = self._compile_persona_v2_turn_for_replyer(
+            slot_profile=slot_profile,
+            is_owner_private=is_owner_private,
+            chat_history=chat_history,
+            reply_message=reply_message,
+        )
+        self._last_persona_v2_turn = v2_turn
+        self._last_is_owner_private = is_owner_private
+        handoff_note = self._build_sister_handoff_note(resolved_session_id, persona_slot)
         final_user_message = self._build_final_user_message(
             chat_history=chat_history,
             reply_message=reply_message,
@@ -879,11 +1377,15 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
             keywords_reaction_prompt=keywords_reaction_prompt,
             reply_tool_args=reply_tool_args,
         )
-        temporary_reply_style_message = self._build_temporary_reply_style_message(self._select_temporary_reply_style())
+        temporary_reply_style_message = self._build_temporary_reply_style_message(
+            self._get_effective_temporary_reply_style(slot_profile)
+        )
         reply_reference_message = self._build_reply_reference_message(
             reply_reason,
             str((reply_tool_args or {}).get("reply_reference") or ""),
         )
+        if handoff_note:
+            reply_reference_message = f"{handoff_note}\n\n{reply_reference_message}" if reply_reference_message else handoff_note
         requested_reply_style_message = self._build_requested_reply_style_message(
             str((reply_tool_args or {}).get("reply_style") or "")
         )
@@ -901,6 +1403,10 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
         if reply_reference_message:
             items.append(ContextItemBuilder().set_role(RoleType.User).add_text_content(reply_reference_message).build())
         items.extend(self._build_recalled_messages(reply_tool_args))
+        if v2_turn is not None and v2_turn.dynamic_tail_block.strip():
+            items.append(
+                ContextItemBuilder().set_role(RoleType.User).add_text_content(v2_turn.dynamic_tail_block.strip()).build()
+            )
         items.append(ContextItemBuilder().set_role(RoleType.User).add_text_content(final_user_message).build())
         if requested_reply_style_message:
             items.append(
@@ -975,8 +1481,9 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
     def _resolve_session_id(self, stream_id: Optional[str]) -> str:
         if stream_id:
             return stream_id
-        if self.chat_stream is not None:
-            return self.chat_stream.session_id
+        chat_stream = getattr(self, "chat_stream", None)
+        if chat_stream is not None:
+            return chat_stream.session_id
         return ""
 
     @staticmethod
@@ -1170,14 +1677,116 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
     def _build_generation_options(self, model_name: Optional[str]) -> LLMGenerationOptions:
         """构建本次请求选项；若当前启用了 STPresetEngine 工具信封则自动附带工具声明与采样温度。"""
         st_compiled = getattr(self, "_last_st_compiled_request", None)
-        if st_compiled is not None and self._uses_st_preset_engine():
+        last_st_args = getattr(self, "_last_st_reply_tool_args", None)
+        if st_compiled is not None and self._uses_st_preset_engine(last_st_args):
             return LLMGenerationOptions(
                 model_name=model_name,
                 tool_options=st_compiled.tool_definitions or None,
                 temperature=st_compiled.temperature,
                 max_tokens=st_compiled.max_tokens,
+                extra_params=dict(getattr(st_compiled, "extra_params", {}) or {}),
             )
         return LLMGenerationOptions(model_name=model_name)
+
+    async def run_st_single_turn(
+        self,
+        *,
+        stream_id: Optional[str] = None,
+        reply_message: Optional[SessionMessage] = None,
+        chat_history: Optional[List[LLMContextMessage]] = None,
+        reply_reason: str = "",
+        reply_tool_args: Optional[Dict[str, Any]] = None,
+        image_recognition_refresher: Optional[Callable[[List[LLMContextMessage]], Awaitable[int]]] = None,
+    ) -> Tuple[LLMResponseResult, Optional[Any]]:
+        """编译 STPresetEngine 单轮上下文并调用模型一次，返回 (LLMResponseResult, STCompiledRequest)。"""
+        if getattr(self, "express_model", None) is None:
+            raise RuntimeError("回复模型尚未初始化")
+
+        active_reply_tool_args = self._normalize_reply_tool_args(reply_tool_args)
+        active_reply_tool_args.pop("_precomputed_st_response", None)
+        filtered_history = [
+            message for message in (chat_history or []) if self._should_keep_replyer_history_message(message)
+        ]
+        preview_chat_id = self._resolve_session_id(stream_id)
+        twin_mode_enabled = bool(getattr(global_config.personality, "twin_mode_enabled", False))
+        effective_persona_slot = self._resolve_effective_persona_slot(active_reply_tool_args)
+        base_express_task = (
+            str(getattr(getattr(self, "express_model", None), "task_name", "") or "replyer").strip() or "replyer"
+        )
+        active_task_name = (
+            "replyer_elder"
+            if (twin_mode_enabled and effective_persona_slot == "sister_elder")
+            else base_express_task
+        )
+        if active_task_name == "replyer_elder" and getattr(self, "elder_express_model", None) is not None:
+            active_model = self.elder_express_model
+        elif active_task_name == base_express_task:
+            active_model = self.express_model
+        else:
+            active_model = self._llm_client_cls(
+                task_name=active_task_name,
+                request_type=self.request_type,
+                session_id=preview_chat_id,
+            )
+
+        self._last_st_compiled_request = None
+        self._last_st_request_messages = None
+        request_messages = self._build_request_messages(
+            chat_history=filtered_history,
+            reply_message=reply_message,
+            reply_reason=reply_reason or "",
+            stream_id=stream_id,
+            reply_tool_args=active_reply_tool_args,
+        )
+        self._last_st_request_messages = list(request_messages)
+        generation_options = self._build_generation_options(None)
+
+        async def context_factory(
+            _client: object,
+            model_info: Optional[ModelInfo] = None,
+        ) -> List[ContextItem]:
+            nonlocal request_messages
+            enable_visual_message = self._resolve_enable_visual_message(model_info)
+            if (
+                not enable_visual_message
+                and resolve_enable_visual_planner()
+                and image_recognition_refresher is not None
+                and chat_history is not None
+            ):
+                await image_recognition_refresher(chat_history)
+                filtered_history[:] = [
+                    message for message in chat_history if self._should_keep_replyer_history_message(message)
+                ]
+            built_request_messages = await asyncio.to_thread(
+                self._build_request_messages,
+                chat_history=filtered_history,
+                reply_message=reply_message,
+                reply_reason=reply_reason or "",
+                stream_id=stream_id,
+                enable_visual_message=enable_visual_message,
+                reply_tool_args=active_reply_tool_args,
+            )
+            request_messages = await self._invoke_before_model_request_hook(
+                request_messages=built_request_messages,
+                session_id=preview_chat_id,
+                active_task_name=active_task_name,
+                active_model_name=None,
+                model_info=model_info,
+                attempt=1,
+                retry_count=0,
+                reply_message=reply_message,
+                reply_reason=reply_reason or "",
+                selected_expression_ids=[],
+                reply_tool_args=dict(active_reply_tool_args),
+            )
+            self._last_st_request_messages = list(request_messages)
+            return request_messages
+
+        generation_result = await active_model.generate_response_with_context(
+            context_factory=context_factory,
+            options=generation_options,
+        )
+        return generation_result, getattr(self, "_last_st_compiled_request", None)
 
     async def generate_reply_with_context(
         self,
@@ -1215,12 +1824,13 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
 
         result = ReplyGenerationResult()
         overall_started_at = time.perf_counter()
-        if self.express_model is None:
+        active_reply_tool_args = self._normalize_reply_tool_args(reply_tool_args)
+        precomputed_st_response = active_reply_tool_args.pop("_precomputed_st_response", None)
+        if getattr(self, "express_model", None) is None and precomputed_st_response is None:
             logger.error("回复模型未初始化")
             result.error_message = "回复模型尚未初始化"
             return finalize(False)
 
-        active_reply_tool_args = self._normalize_reply_tool_args(reply_tool_args)
         plugin_reply_prompt = str(active_reply_tool_args.get("_plugin_reply_prompt", ""))
         if chat_history is None:
             result.error_message = "聊天历史为空"
@@ -1233,24 +1843,27 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
 
         filtered_history = [message for message in chat_history if self._should_keep_replyer_history_message(message)]
 
-        try:
-            reply_context = await self._build_reply_context(
-                chat_history=filtered_history,
-                reply_message=reply_message,
-                reply_reason=reply_reason or "",
-                stream_id=stream_id,
-                sub_agent_runner=sub_agent_runner,
-                reply_tool_args=active_reply_tool_args,
-            )
-        except Exception as exc:
-            import traceback
+        if precomputed_st_response is not None:
+            reply_context = MaisakaReplyContext()
+        else:
+            try:
+                reply_context = await self._build_reply_context(
+                    chat_history=filtered_history,
+                    reply_message=reply_message,
+                    reply_reason=reply_reason or "",
+                    stream_id=stream_id,
+                    sub_agent_runner=sub_agent_runner,
+                    reply_tool_args=active_reply_tool_args,
+                )
+            except Exception as exc:
+                import traceback
 
-            logger.error(f"构建回复上下文失败: {exc}\n{traceback.format_exc()}")
-            result.error_message = f"构建回复上下文失败: {exc}"
-            result.metrics = GenerationMetrics(
-                overall_ms=round((time.perf_counter() - overall_started_at) * 1000, 2),
-            )
-            return finalize(False)
+                logger.error(f"构建回复上下文失败: {exc}\n{traceback.format_exc()}")
+                result.error_message = f"构建回复上下文失败: {exc}"
+                result.metrics = GenerationMetrics(
+                    overall_ms=round((time.perf_counter() - overall_started_at) * 1000, 2),
+                )
+                return finalize(False)
 
         merged_expression_habits = expression_habits.strip() or reply_context.expression_habits
         result.selected_expression_ids = (
@@ -1279,7 +1892,20 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
         reasoning_continuation_count = 0
         reasoning_regeneration_requested = False
         retro_period_regeneration_requested = False
-        default_task_name = str(getattr(self.express_model, "task_name", "") or "replyer").strip() or "replyer"
+        twin_mode_enabled = bool(getattr(global_config.personality, "twin_mode_enabled", False))
+        effective_persona_slot = self._resolve_effective_persona_slot(active_reply_tool_args)
+        active_slot_profile = self._resolve_slot_profile(active_reply_tool_args)
+        base_express_task = (
+            str(getattr(getattr(self, "express_model", None), "task_name", "") or "replyer").strip() or "replyer"
+        )
+        default_task_name = (
+            "replyer_elder"
+            if (twin_mode_enabled and effective_persona_slot == "sister_elder")
+            else base_express_task
+        )
+        unwrapped_st_output = None
+        last_native_reasoning = ""
+        st_engine_used = False
 
         while True:
             try:
@@ -1303,45 +1929,68 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
                     reply_tool_args=dict(active_reply_tool_args),
                 )
                 before_request_kwargs = before_request_result.kwargs
+                prev_default_task = default_task_name
                 if isinstance(before_request_kwargs.get("reply_tool_args"), dict):
                     active_reply_tool_args = dict(before_request_kwargs["reply_tool_args"])
+                    effective_persona_slot = self._resolve_effective_persona_slot(active_reply_tool_args)
+                    active_slot_profile = self._resolve_slot_profile(active_reply_tool_args)
+                    default_task_name = (
+                        "replyer_elder"
+                        if (twin_mode_enabled and effective_persona_slot == "sister_elder")
+                        else base_express_task
+                    )
             except Exception as exc:
                 logger.warning(f"Maisaka 回复器 before_request Hook 调用失败，将继续使用当前请求参数: {exc}")
                 before_request_kwargs = {"extra_prompt": plugin_reply_prompt}
+                prev_default_task = default_task_name
 
-            active_task_name = str(before_request_kwargs.get("task_name") or default_task_name).strip()
-            if not active_task_name:
-                active_task_name = default_task_name
+            hook_task_name = str(before_request_kwargs.get("task_name") or "").strip()
+            if hook_task_name == prev_default_task and default_task_name != prev_default_task:
+                hook_task_name = default_task_name
+            active_task_name = hook_task_name or default_task_name
             active_model_name = str(before_request_kwargs.get("model_name") or "").strip() or None
             active_reply_requirements = self._build_reply_requirements(
                 str(before_request_kwargs.get("extra_prompt") or ""),
                 retry_constraints,
             )
 
+            use_precomputed = precomputed_st_response is not None and retry_count == 0
             prompt_started_at = time.perf_counter()
-            try:
-                request_messages = self._build_request_messages(
-                    chat_history=filtered_history,
+            cached_st_messages = getattr(self, "_last_st_request_messages", None) if use_precomputed else None
+            if use_precomputed:
+                self._last_st_request_messages = None
+            if cached_st_messages is not None:
+                request_messages = list(cached_st_messages)
+                resolved_is_owner_priv, _ = self._resolve_is_owner_private(
+                    session_id=preview_chat_id,
                     reply_message=reply_message,
-                    reply_reason=reply_reason or "",
-                    expression_habits=merged_expression_habits,
-                    reply_requirements=active_reply_requirements,
-                    stream_id=stream_id,
                     reply_tool_args=active_reply_tool_args,
-                    think_level=think_level,
                 )
-            except Exception as exc:
-                import traceback
+                self._last_is_owner_private = resolved_is_owner_priv
+            else:
+                try:
+                    request_messages = self._build_request_messages(
+                        chat_history=filtered_history,
+                        reply_message=reply_message,
+                        reply_reason=reply_reason or "",
+                        expression_habits=merged_expression_habits,
+                        reply_requirements=active_reply_requirements,
+                        stream_id=stream_id,
+                        reply_tool_args=active_reply_tool_args,
+                        think_level=think_level,
+                    )
+                except Exception as exc:
+                    import traceback
 
-                logger.error(f"构建提示词失败: {exc}\n{traceback.format_exc()}")
-                result.error_message = f"构建提示词失败: {exc}"
-                result.metrics = GenerationMetrics(
-                    overall_ms=round((time.perf_counter() - overall_started_at) * 1000, 2),
-                )
-                return finalize(False)
+                    logger.error(f"构建提示词失败: {exc}\n{traceback.format_exc()}")
+                    result.error_message = f"构建提示词失败: {exc}"
+                    result.metrics = GenerationMetrics(
+                        overall_ms=round((time.perf_counter() - overall_started_at) * 1000, 2),
+                    )
+                    return finalize(False)
 
             prompt_ms = round((time.perf_counter() - prompt_started_at) * 1000, 2)
-            prompt_preview = PromptCLIVisualizer.build_prompt_dump_text(request_messages)
+            prompt_preview = PromptCLIVisualizer.build_prompt_dump_text(request_messages) if request_messages else ""
 
             active_client_type = ""
 
@@ -1401,86 +2050,127 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
                 return request_messages
 
             llm_started_at = time.perf_counter()
-            try:
-                active_model = self.express_model
-                if active_task_name != default_task_name:
-                    active_model = self._llm_client_cls(
-                        task_name=active_task_name,
-                        request_type=self.request_type,
-                        session_id=preview_chat_id,
+            if use_precomputed:
+                effective_persona_slot = self._resolve_effective_persona_slot(active_reply_tool_args)
+                active_slot_profile = self._resolve_slot_profile(active_reply_tool_args)
+                generation_result = precomputed_st_response
+                aggregate_prompt_tokens += int(getattr(generation_result, "prompt_tokens", 0) or 0)
+                aggregate_completion_tokens += int(getattr(generation_result, "completion_tokens", 0) or 0)
+                aggregate_total_tokens += int(getattr(generation_result, "total_tokens", 0) or 0)
+                raw_attempts = tuple(getattr(generation_result, "generation_attempts", ()) or ())
+                if raw_attempts:
+                    updated_attempts = tuple(replace(attempt, workflow_attempt=retry_count + 1) for attempt in raw_attempts)
+                    if hasattr(generation_result, "generation_attempts"):
+                        generation_result.generation_attempts = updated_attempts
+                    all_generation_attempts.extend(updated_attempts)
+            else:
+                try:
+                    effective_persona_slot = self._resolve_effective_persona_slot(active_reply_tool_args)
+                    active_slot_profile = self._resolve_slot_profile(active_reply_tool_args)
+                    if active_task_name == "replyer_elder" and getattr(self, "elder_express_model", None) is not None:
+                        active_model = self.elder_express_model
+                    elif active_task_name == base_express_task:
+                        active_model = self.express_model
+                    else:
+                        active_model = self._llm_client_cls(
+                            task_name=active_task_name,
+                            request_type=self.request_type,
+                            session_id=preview_chat_id,
+                        )
+                    generation_options = self._build_generation_options(active_model_name)
+                    generation_result = await active_model.generate_response_with_context(
+                        context_factory=context_factory,
+                        options=generation_options,
                     )
-                generation_options = self._build_generation_options(active_model_name)
-                generation_result = await active_model.generate_response_with_context(
-                    context_factory=context_factory,
-                    options=generation_options,
-                )
-                aggregate_prompt_tokens += generation_result.prompt_tokens
-                aggregate_completion_tokens += generation_result.completion_tokens
-                aggregate_total_tokens += generation_result.total_tokens
-
-                if (
-                    reasoning_continuation_count == 0
-                    and active_client_type == "openai_responses"
-                    and self._is_reasoning_only_response(generation_result)
-                ):
-                    reasoning_continuation_count = 1
-                    continuation_reasoning = generation_result.reasoning.strip()
-                    continuation_model_name = generation_result.model_name.strip() or active_model_name
-                    logger.warning(
-                        "Maisaka 回复器仅收到推理内容，将在本次上下文中续写一次: "
-                        f"session={preview_chat_id} model={continuation_model_name or 'unknown'} "
-                        f"reasoning={self._normalize_content(continuation_reasoning, limit=300)!r}"
-                    )
-                    generation_result, request_messages = await self._continue_reasoning_only_response(
-                        active_model=active_model,
-                        request_messages=request_messages,
-                        generation_result=generation_result,
-                        generation_options=replace(
-                            generation_options,
-                            model_name=generation_result.model_name.strip() or active_model_name,
-                        ),
-                    )
-                    prompt_preview = PromptCLIVisualizer.build_prompt_dump_text(request_messages)
                     aggregate_prompt_tokens += generation_result.prompt_tokens
                     aggregate_completion_tokens += generation_result.completion_tokens
                     aggregate_total_tokens += generation_result.total_tokens
-                    logger.info(
-                        "Maisaka 回复器推理续写完成: "
-                        f"session={preview_chat_id} response={self._normalize_content(generation_result.response, limit=300)!r}"
+
+                    if (
+                        reasoning_continuation_count == 0
+                        and active_client_type == "openai_responses"
+                        and self._is_reasoning_only_response(generation_result)
+                    ):
+                        reasoning_continuation_count = 1
+                        continuation_reasoning = generation_result.reasoning.strip()
+                        continuation_model_name = generation_result.model_name.strip() or active_model_name
+                        logger.warning(
+                            "Maisaka 回复器仅收到推理内容，将在本次上下文中续写一次: "
+                            f"session={preview_chat_id} model={continuation_model_name or 'unknown'} "
+                            f"reasoning={self._normalize_content(continuation_reasoning, limit=300)!r}"
+                        )
+                        generation_result, request_messages = await self._continue_reasoning_only_response(
+                            active_model=active_model,
+                            request_messages=request_messages,
+                            generation_result=generation_result,
+                            generation_options=replace(
+                                generation_options,
+                                model_name=generation_result.model_name.strip() or active_model_name,
+                            ),
+                        )
+                        prompt_preview = PromptCLIVisualizer.build_prompt_dump_text(request_messages)
+                        aggregate_prompt_tokens += generation_result.prompt_tokens
+                        aggregate_completion_tokens += generation_result.completion_tokens
+                        aggregate_total_tokens += generation_result.total_tokens
+                        logger.info(
+                            "Maisaka 回复器推理续写完成: "
+                            f"session={preview_chat_id} response={self._normalize_content(generation_result.response, limit=300)!r}"
+                        )
+                    generation_result.generation_attempts = tuple(
+                        replace(attempt, workflow_attempt=retry_count + 1)
+                        for attempt in generation_result.generation_attempts
                     )
-                generation_result.generation_attempts = tuple(
-                    replace(attempt, workflow_attempt=retry_count + 1)
-                    for attempt in generation_result.generation_attempts
-                )
-                all_generation_attempts.extend(generation_result.generation_attempts)
-            except Exception as exc:
-                logger.exception("Maisaka 回复器调用失败")
-                result.error_message = str(exc)
-                result.metrics = GenerationMetrics(
-                    prompt_ms=prompt_ms,
-                    llm_ms=round((time.perf_counter() - llm_started_at) * 1000, 2),
-                    overall_ms=round((time.perf_counter() - overall_started_at) * 1000, 2),
-                )
-                return finalize(False)
+                    all_generation_attempts.extend(generation_result.generation_attempts)
+                except Exception as exc:
+                    logger.exception("Maisaka 回复器调用失败")
+                    result.error_message = str(exc)
+                    result.metrics = GenerationMetrics(
+                        prompt_ms=prompt_ms,
+                        llm_ms=round((time.perf_counter() - llm_started_at) * 1000, 2),
+                        overall_ms=round((time.perf_counter() - overall_started_at) * 1000, 2),
+                    )
+                    return finalize(False)
 
             result.completion.request_prompt = prompt_preview
             result.request_message_count = len(request_messages)
             # 内存中的结果只做序列化；图片引用在最终记录保存时统一生成。
             result.request_messages = serialize_context_items_snapshot(request_messages)
-            llm_ms = round((time.perf_counter() - llm_started_at) * 1000, 2)
-            response_text = (generation_result.response or "").strip()
-            if self._uses_st_preset_engine() and (generation_result.tool_calls or "<game" in response_text or "<think_nya" in response_text):
+            llm_ms = 0.0 if use_precomputed else round((time.perf_counter() - llm_started_at) * 1000, 2)
+            raw_llm_response_text = (getattr(generation_result, "response", "") or "").strip()
+            response_text = raw_llm_response_text
+            last_native_reasoning = str(getattr(generation_result, "reasoning", "") or "").strip()
+            gen_tool_calls = getattr(generation_result, "tool_calls", None)
+            st_engine_used = self._uses_st_preset_engine(active_reply_tool_args)
+            has_st_markers = bool(
+                gen_tool_calls
+                or any(
+                    tag in response_text.lower()
+                    for tag in ("<game", "<thinking", "<think", "<think_nya", "<summary", "<comment", "<updatevariable")
+                )
+            )
+            unwrapped_st_output = None
+            if st_engine_used or has_st_markers:
                 from src.companion_vault.st_preset_engine import STPresetEngine
 
-                unwrapped = STPresetEngine.unwrap_response(
+                unwrapped_st_output = STPresetEngine.unwrap_response(
                     response_text=response_text,
-                    tool_calls=generation_result.tool_calls,
-                    output_mode=getattr(self, "_last_st_output_mode", "im_clean"),
+                    tool_calls=gen_tool_calls,
+                    output_mode=getattr(self, "_last_st_output_mode", "im_clean") if st_engine_used else "im_clean",
+                    native_reasoning=last_native_reasoning,
                 )
-                if unwrapped.visible_text.strip():
-                    response_text = unwrapped.visible_text.strip()
+                if unwrapped_st_output.visible_text.strip():
+                    response_text = unwrapped_st_output.visible_text.strip()
+            if "<updatevariable" in response_text.lower():
+                from src.companion_vault.mvu_engine import MVURuntimeEngine
+
+                response_text, _, _ = MVURuntimeEngine.extract_and_strip_update_variable(response_text)
+                response_text = response_text.strip()
             hook_original_response = response_text
-            serialized_output_items = serialize_prompt_items(generation_result.output_items)
+            gen_output_items = tuple(getattr(generation_result, "output_items", ()) or ())
+            serialized_output_items = serialize_prompt_items(gen_output_items)
+            gen_prompt_tokens = int(getattr(generation_result, "prompt_tokens", 0) or 0)
+            gen_completion_tokens = int(getattr(generation_result, "completion_tokens", 0) or 0)
+            gen_total_tokens = int(getattr(generation_result, "total_tokens", 0) or 0)
 
             try:
                 after_response_result = await self._get_runtime_manager().invoke_hook(
@@ -1498,15 +2188,15 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
                     reply_message_id=str(reply_message.message_id if reply_message is not None else ""),
                     selected_expression_ids=list(result.selected_expression_ids),
                     reply_tool_args=dict(active_reply_tool_args),
-                    prompt_tokens=generation_result.prompt_tokens,
-                    completion_tokens=generation_result.completion_tokens,
-                    total_tokens=generation_result.total_tokens,
+                    prompt_tokens=gen_prompt_tokens,
+                    completion_tokens=gen_completion_tokens,
+                    total_tokens=gen_total_tokens,
                 )
                 after_response_kwargs = after_response_result.kwargs
             except Exception as exc:
                 logger.warning(f"Maisaka 回复器 after_response Hook 调用失败，将继续使用当前回复: {exc}")
                 after_response_kwargs = {}
-            final_output_items = generation_result.output_items
+            final_output_items = gen_output_items
             raw_output_items = after_response_kwargs.get("output_items")
             if isinstance(raw_output_items, list) and raw_output_items != serialized_output_items:
                 try:
@@ -1515,7 +2205,7 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
                             raw_output_items,
                             item_schema_version=after_response_kwargs.get("item_schema_version"),
                             mode=ContextProtocolMode.MODEL_OUTPUT,
-                            original_items=generation_result.output_items,
+                            original_items=gen_output_items,
                         )
                     )
                     response_text = get_response_text(final_output_items).strip()
@@ -1525,11 +2215,12 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
                     )
             elif "response" in after_response_kwargs:
                 hook_modified_response = str(after_response_kwargs.get("response") or "").strip()
-                final_output_items = replace_output_projection(
-                    generation_result.output_items,
-                    content=hook_modified_response,
-                    replace_content=hook_modified_response != response_text,
-                )
+                if gen_output_items or hook_modified_response != response_text:
+                    final_output_items = replace_output_projection(
+                        gen_output_items,
+                        content=hook_modified_response,
+                        replace_content=hook_modified_response != response_text,
+                    )
                 if hook_modified_response != response_text:
                     rewrite_event = {
                         "attempt": str(retry_count + 1),
@@ -1544,7 +2235,8 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
                         f"after={self._normalize_content(hook_modified_response, limit=300)!r}"
                     )
                 response_text = hook_modified_response
-            generation_result.output_items = tuple(final_output_items)
+            if hasattr(generation_result, "output_items"):
+                generation_result.output_items = tuple(final_output_items)
             retry_requested = self._coerce_hook_bool(after_response_kwargs.get("retry"), default=False)
             matched_regex = str(after_response_kwargs.get("matched_regex") or "").strip()
             matched_regex_pattern = str(after_response_kwargs.get("matched_regex_pattern") or "").strip()
@@ -1568,8 +2260,8 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
                 active_client_type == "openai"
                 and not reasoning_regeneration_requested
                 and not response_text
-                and generation_result.output_items
-                and all(isinstance(item, ReasoningItem) for item in generation_result.output_items)
+                and gen_output_items
+                and all(isinstance(item, ReasoningItem) for item in gen_output_items)
                 and retry_count < REPLYER_MAX_HOOK_RETRIES
             ):
                 reasoning_regeneration_requested = True
@@ -1625,19 +2317,28 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
                 )
             break
 
-        generation_result.generation_attempts = tuple(all_generation_attempts)
+        if hasattr(generation_result, "generation_attempts"):
+            generation_result.generation_attempts = tuple(all_generation_attempts)
+        final_gen_output_items = tuple(getattr(generation_result, "output_items", ()) or ())
+        final_prompt_tokens = int(getattr(generation_result, "prompt_tokens", 0) or 0)
+        final_completion_tokens = int(getattr(generation_result, "completion_tokens", 0) or 0)
+        final_total_tokens = int(getattr(generation_result, "total_tokens", 0) or 0)
         result.success = bool(response_text)
-        result.output_items = serialize_context_items_snapshot(generation_result.output_items)
-        result.generation_attempts = self._serialize_generation_attempts(generation_result)
+        result.output_items = serialize_context_items_snapshot(final_gen_output_items)
+        result.generation_attempts = (
+            self._serialize_generation_attempts(generation_result)
+            if getattr(generation_result, "generation_attempts", None)
+            else []
+        )
         result.completion = LLMCompletionResult(
             request_prompt=prompt_preview,
             response_text=response_text,
-            reasoning_text=generation_result.reasoning or "",
-            model_name=generation_result.model_name or "",
-            tool_calls=generation_result.tool_calls or [],
-            prompt_tokens=generation_result.prompt_tokens,
-            completion_tokens=generation_result.completion_tokens,
-            total_tokens=generation_result.total_tokens,
+            reasoning_text=str(getattr(generation_result, "reasoning", "") or ""),
+            model_name=str(getattr(generation_result, "model_name", "") or ""),
+            tool_calls=list(getattr(generation_result, "tool_calls", None) or []),
+            prompt_tokens=final_prompt_tokens,
+            completion_tokens=final_completion_tokens,
+            total_tokens=final_total_tokens,
         )
         result.metrics = GenerationMetrics(
             prompt_ms=prompt_ms,
@@ -1652,7 +2353,7 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
         prompt_cache_hit_tokens = getattr(generation_result, "prompt_cache_hit_tokens", 0) or 0
         prompt_cache_miss_tokens = getattr(generation_result, "prompt_cache_miss_tokens", 0) or 0
         if prompt_cache_miss_tokens == 0 and prompt_cache_hit_tokens > 0:
-            prompt_cache_miss_tokens = max(generation_result.prompt_tokens - prompt_cache_hit_tokens, 0)
+            prompt_cache_miss_tokens = max(final_prompt_tokens - prompt_cache_hit_tokens, 0)
         prompt_cache_total_tokens = prompt_cache_hit_tokens + prompt_cache_miss_tokens
         prompt_cache_hit_rate = (
             prompt_cache_hit_tokens / prompt_cache_total_tokens * 100 if prompt_cache_total_tokens > 0 else 0
@@ -1676,6 +2377,61 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
             result.metrics.extra["replyer_retry_constraints"] = list(retry_constraints)
         if hook_rewrite_events:
             result.metrics.extra["replyer_hook_rewrite_events"] = list(hook_rewrite_events)
+        telemetry_thinking = (
+            unwrapped_st_output.think_nya.strip() if unwrapped_st_output is not None else ""
+        ) or last_native_reasoning
+        telemetry_summary = unwrapped_st_output.summary.strip() if unwrapped_st_output is not None else ""
+        telemetry_comment = unwrapped_st_output.comment.strip() if unwrapped_st_output is not None else ""
+        mvu_watch_payload: Optional[Dict[str, Any]] = None
+        try:
+            from src.companion_vault import runtime_bridge
+            from src.companion_vault.mvu_engine import MVURuntimeEngine
+            from src.companion_vault.persona_v2_engine import get_persona_v2_manager
+
+            v2_card = get_persona_v2_manager().resolve_card_for_profile(active_slot_profile)
+            if v2_card is not None:
+                is_owner_priv = bool(getattr(self, "_last_is_owner_private", False))
+                truth_db_path = (
+                    os.environ.get("MAIBOT_TRUTH_DB_PATH", "").strip()
+                    or runtime_bridge.DEFAULT_TRUTH_DB_PATH
+                )
+                db = None
+                try:
+                    os.makedirs(os.path.dirname(truth_db_path) or ".", exist_ok=True)
+                    db = runtime_bridge._open_truth_db(truth_db_path)
+                    mvu_res = MVURuntimeEngine.apply_turn_updates(
+                        db,
+                        v2_card,
+                        [raw_llm_response_text, response_text],
+                        is_owner_private=is_owner_priv,
+                        pre_extracted_ops=unwrapped_st_output.mvu_patches if unwrapped_st_output is not None else None,
+                        pre_extracted_analysis=unwrapped_st_output.mvu_analysis if unwrapped_st_output is not None else "",
+                    )
+                    mvu_watch_payload = mvu_res.to_telemetry_dict()
+                finally:
+                    if db is not None:
+                        db.close()
+        except Exception as exc:
+            logger.warning(f"应用 MVU 变量更新或构建 mvu_watch 失败: {exc}")
+
+        if (
+            twin_mode_enabled
+            or st_engine_used
+            or telemetry_thinking
+            or telemetry_summary
+            or telemetry_comment
+            or mvu_watch_payload is not None
+        ):
+            st_telemetry_dict: Dict[str, Any] = {
+                "persona_slot": effective_persona_slot,
+                "persona_name": self._resolve_slot_display_name(effective_persona_slot, active_slot_profile),
+                "thinking": telemetry_thinking,
+                "summary": telemetry_summary,
+                "comment": telemetry_comment,
+            }
+            if mvu_watch_payload is not None:
+                st_telemetry_dict["mvu_watch"] = mvu_watch_payload
+            result.metrics.extra["st_telemetry"] = st_telemetry_dict
         logger.info(
             f"Replyer缓存 输入={generation_result.prompt_tokens} "
             f"命中={prompt_cache_hit_tokens} 未命中={prompt_cache_miss_tokens} "
@@ -1698,5 +2454,7 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
                 f"session={preview_chat_id} attempts={retry_count + 1} "
                 f"retry_count={retry_count} final={self._normalize_content(response_text, limit=300)!r}"
             )
+        if preview_chat_id:
+            _LAST_SPEAKER_SLOT_BY_SESSION[preview_chat_id] = effective_persona_slot
         result.text_fragments = [response_text]
         return finalize(True)

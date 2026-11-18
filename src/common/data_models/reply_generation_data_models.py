@@ -256,6 +256,29 @@ def build_reply_monitor_detail(result: ReplyGenerationResult) -> Dict[str, Any]:
             "title": "阶段日志",
             "content": "\n".join(result.metrics.stage_logs),
         })
+    st_telemetry = result.metrics.extra.get("st_telemetry")
+    if isinstance(st_telemetry, dict) and st_telemetry:
+        slot_name = str(st_telemetry.get("persona_name") or st_telemetry.get("persona_slot") or "").strip()
+        if slot_name:
+            extra_sections.append({
+                "title": "值班声带槽位",
+                "content": f"{slot_name} ({st_telemetry.get('persona_slot', '')})".strip(),
+            })
+        if thinking_text := str(st_telemetry.get("thinking") or "").strip():
+            extra_sections.append({
+                "title": "CoT 思维链 (<thinking>)",
+                "content": thinking_text,
+            })
+        if summary_text := str(st_telemetry.get("summary") or "").strip():
+            extra_sections.append({
+                "title": "场景摘要 (<summary>)",
+                "content": summary_text,
+            })
+        if comment_text := str(st_telemetry.get("comment") or "").strip():
+            extra_sections.append({
+                "title": "猫猫吐槽 (<comment>)",
+                "content": comment_text,
+            })
     if result.error_message.strip():
         extra_sections.append({
             "title": "错误信息",

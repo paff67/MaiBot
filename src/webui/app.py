@@ -27,6 +27,7 @@ logger = get_logger("webui.app")
 
 _DASHBOARD_PACKAGE_NAME = "maibot-dashboard"
 _LOCAL_DASHBOARD_ENV = "MAIBOT_WEBUI_USE_LOCAL_DASHBOARD"
+_LOCAL_DASHBOARD_ALT_ENV = "MAIBOT_USE_LOCAL_DASHBOARD"
 _STATISTICS_REPORT_PATH_ENV = "MAIBOT_STATISTICS_REPORT_PATH"
 _DEFAULT_STATISTICS_REPORT_PATH = "maibot_statistics.html"
 _MANUAL_INSTALL_COMMAND = f"pip install {_DASHBOARD_PACKAGE_NAME}"
@@ -112,7 +113,10 @@ def _resolve_statistics_report_path() -> Path:
 
 
 def _is_local_dashboard_enabled() -> bool:
-    return getenv(_LOCAL_DASHBOARD_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+    for env_name in (_LOCAL_DASHBOARD_ENV, _LOCAL_DASHBOARD_ALT_ENV):
+        if getenv(env_name, "").strip().lower() in {"1", "true", "yes", "on"}:
+            return True
+    return False
 
 
 def _validate_static_path(static_path: Path | None) -> Tuple[str, Dict[str, Any]] | None:
@@ -204,9 +208,18 @@ def _setup_robots_txt(app: FastAPI):
 def _register_api_routes(app: FastAPI):
     try:
         from src.webui.routers import get_all_routers
+        from src.webui.routers.persona_v2 import router as persona_v2_router
 
         for router in get_all_routers():
             app.include_router(router)
+        app.include_router(persona_v2_router)
+
+        try:
+            from src.webui.routers.persona_v2 import ensure_builtin_cards_registered_sync
+
+            ensure_builtin_cards_registered_sync()
+        except Exception as bootstrap_exc:
+            logger.warning(f"启动时注册内置 Persona V2 角色卡失败: {bootstrap_exc}")
 
         logger.debug(t("startup.webui_api_routes_registered"))
     except Exception as e:

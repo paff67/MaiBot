@@ -148,13 +148,33 @@ class RetroReplyPromptMixin:
             think_level=think_level,
             reply_tool_args=reply_tool_args,
         )
+        slot_profile = (
+            self._resolve_slot_profile(reply_tool_args)
+            if callable(getattr(self, "_resolve_slot_profile", None))
+            else None
+        )
         # 复古回复器对齐训练分布：system 消息仅保留人设（训练数据 persona-only，
         # 无 gca 注意事项块与 attention_drift 块——线上注入属训练外成分，会把回复带向啰嗦/书面）。
+        prev_slot_profile = getattr(self, "_active_slot_profile", None)
+        self._active_slot_profile = slot_profile
+        try:
+            persona_prompt = self._build_personality_prompt()
+        finally:
+            self._active_slot_profile = prev_slot_profile
+        system_blocks = [persona_prompt]
+        session_id = self._resolve_session_id(stream_id)
+        if callable(getattr(self, "_resolve_is_owner_private", None)) and slot_profile is not None:
+            is_owner_private, _ = self._resolve_is_owner_private(
+                session_id=session_id,
+                reply_message=reply_message,
+                reply_tool_args=reply_tool_args,
+            )
+            owner_priv_prompt = str(getattr(slot_profile, "owner_private_prompt", "") or "").strip()
+            if is_owner_private and owner_priv_prompt:
+                system_blocks.append(f"【Owner 私聊专属指令】\n{owner_priv_prompt}")
         system_prompt = "\n\n".join(
             block.strip()
-            for block in (
-                self._build_personality_prompt(),
-            )
+            for block in system_blocks
             if block.strip()
         )
         template_context = self._build_retro_template_context(
@@ -164,6 +184,7 @@ class RetroReplyPromptMixin:
             reply_reference=str((reply_tool_args or {}).get("reply_reference") or ""),
             expression_habits=expression_habits,
             reply_requirements=reply_requirements,
+            slot_profile=slot_profile,
         )
         # 有召回时把引用单独放在记忆之前，最终回复模板仍保持在最后。
         recalled_messages = self._build_recalled_messages(reply_tool_args)
@@ -338,14 +359,29 @@ class RetroReplyPromptMixin:
         reply_reference: str,
         expression_habits: str,
         reply_requirements: str,
+        slot_profile: Optional[Any] = None,
     ) -> Dict[str, str]:
         """按旧版的块顺序准备模板占位符内容。"""
 
         combined_reference = self._build_reply_reference_message(reply_reason, reply_reference)
         # 旧版按概率用备选表达风格整体替换人设里的表达风格，而不是追加一条风格消息
-        reply_style = self._select_temporary_reply_style() or self._select_reply_style()
+        temp_style = (
+            self._get_effective_temporary_reply_style(slot_profile)
+            if callable(getattr(self, "_get_effective_temporary_reply_style", None))
+            else self._select_temporary_reply_style()
+        )
+        base_style = (
+            self._get_effective_reply_style(slot_profile)
+            if callable(getattr(self, "_get_effective_reply_style", None))
+            else self._select_reply_style()
+        )
+        reply_style = temp_style or base_style
+        bot_name = (
+            (str(getattr(slot_profile, "nickname", "") or "").strip() if slot_profile is not None else "")
+            or global_config.bot.nickname
+        )
         return {
-            "bot_name": global_config.bot.nickname,
+            "bot_name": bot_name,
             "sender_name": self._build_retro_sender_name(chat_history, reply_message),
             "reply_style": reply_style,
             # 复古回复器对齐训练分布：表达习惯参考块在训练数据中仅 bdpan 源少量出现，

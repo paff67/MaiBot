@@ -520,6 +520,7 @@ def _build_outbound_session_message(
     processed_plain_text: str = "",
     reply_message: Optional[MaiMessage] = None,
     selected_expressions: Optional[List[int]] = None,
+    extra_config: Optional[Dict[str, Any]] = None,
 ) -> Optional[SessionMessage]:
     """根据目标会话构建待发送的内部消息对象。
 
@@ -529,6 +530,7 @@ def _build_outbound_session_message(
         processed_plain_text: 可选的预处理纯文本内容。
         reply_message: 被回复的锚点消息。
         selected_expressions: 可选的表情候选索引列表。
+        extra_config: 可选的附加元配置（如双子值班槽位 `persona_slot` / `persona_name`）。
 
     Returns:
         Optional[SessionMessage]: 构建成功时返回内部消息对象；若目标会话或
@@ -565,8 +567,13 @@ def _build_outbound_session_message(
         )
 
     additional_config: Dict[str, object] = _inherit_platform_io_route_metadata(target_stream)
+    if extra_config:
+        for cfg_key, cfg_val in extra_config.items():
+            if cfg_val is not None:
+                additional_config[cfg_key] = cfg_val
     if selected_expressions is not None:
         additional_config["selected_expressions"] = selected_expressions
+    persona_name = str((extra_config or {}).get("persona_name") or "").strip()
 
     outbound_message = SessionMessage(
         message_id=message_id,
@@ -578,7 +585,7 @@ def _build_outbound_session_message(
     outbound_message.message_info = MessageInfo(
         user_info=UserInfo(
             user_id=bot_user_id,
-            user_nickname=global_config.bot.nickname,
+            user_nickname=persona_name or global_config.bot.nickname,
         ),
         group_info=group_info,
         additional_config=additional_config,
@@ -987,7 +994,7 @@ async def _send_via_platform_io(
                 )
             logger.info(
                 f"[{route_key.account_id or ''}:{route_key.platform}:{driver_names}] "
-                f"[{session_name}] {global_config.bot.nickname}: {_build_outbound_log_preview(message)}"
+                f"[{session_name}] {user_info.user_nickname or global_config.bot.nickname}: {_build_outbound_log_preview(message)}"
             )
         return message
 
@@ -1124,6 +1131,7 @@ async def _send_to_target_with_message(
     selected_expressions: Optional[List[int]] = None,
     sync_to_maisaka_history: bool = False,
     maisaka_source_kind: str = "outbound_send",
+    extra_config: Optional[Dict[str, Any]] = None,
 ) -> Optional[SessionMessage]:
     """向指定目标构建并发送消息。
 
@@ -1155,6 +1163,7 @@ async def _send_to_target_with_message(
             processed_plain_text=processed_plain_text,
             reply_message=reply_message,
             selected_expressions=selected_expressions,
+            extra_config=extra_config,
         )
         if outbound_message is None:
             return None
