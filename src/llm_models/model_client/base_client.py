@@ -235,6 +235,9 @@ StreamResponseHandler = Callable[
 ResponseParser = Callable[[Any], Tuple["APIResponse", UsageTuple | None]]
 """统一的非流式响应解析函数类型。"""
 
+ResponseValidator = Callable[["ResponseRequest", "APIResponse"], None]
+"""请求级响应校验回调函数类型；校验不通过时应抛出 RespParseException 等可重试异常。"""
+
 
 @dataclass(slots=True)
 class RequestTraceContext:
@@ -280,6 +283,8 @@ class ResponseRequest:
     trace_context: RequestTraceContext | None = None
     logical_turn_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     tool_choice: Literal["none"] | None = None
+    validate_required_tool_args: bool = False
+    response_validator: ResponseValidator | None = field(default=None, repr=False)
 
     def copy_with(self, **changes: Any) -> "ResponseRequest":
         """基于当前请求创建一个带局部变更的新请求。
@@ -304,6 +309,8 @@ class ResponseRequest:
             "extra_params": dict(self.extra_params),
             "trace_context": self.trace_context,
             "logical_turn_id": self.logical_turn_id,
+            "validate_required_tool_args": self.validate_required_tool_args,
+            "response_validator": self.response_validator,
         }
         payload.update(changes)
         return ResponseRequest(**payload)
@@ -311,8 +318,11 @@ class ResponseRequest:
     def detached_snapshot(self) -> "ResponseRequest":
         """冻结输入和模型设置，解除中断、回调及诊断上下文的生命周期。"""
         return copy.deepcopy(self.copy_with(
-            stream_response_handler=None, async_response_parser=None,
-            interrupt_flag=None, trace_context=None,
+            stream_response_handler=None,
+            async_response_parser=None,
+            interrupt_flag=None,
+            trace_context=None,
+            response_validator=None,
         ))
 
 

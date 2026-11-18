@@ -1,3 +1,4 @@
+from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
@@ -545,3 +546,49 @@ class ToolCall:
             raise ValueError("工具调用 ID 不能为空")
         if not self.func_name:
             raise ValueError("工具函数名称不能为空")
+
+
+def find_missing_required_tool_args(
+    tool_calls: Sequence[ToolCall] | None,
+    tool_options: Sequence[ToolOption] | None,
+) -> Tuple[str, List[str]] | None:
+    """检查已声明工具调用是否缺失参数 schema 顶层 required 键。
+
+    仅校验本次请求 ``tool_options`` 中实际声明且存在顶层 ``required`` 的工具；
+    无参数工具、仅含可选参数的工具及未声明工具均不在此拦截。
+
+    Args:
+        tool_calls: 模型输出的完整工具调用序列。
+        tool_options: 本次请求实际携带的工具声明序列。
+
+    Returns:
+        Tuple[str, List[str]] | None: 首个违规工具名及缺失必填键列表；全部满足时返回 ``None``。
+    """
+    if not tool_calls or not tool_options:
+        return None
+
+    declared_schemas: Dict[str, Dict[str, Any]] = {}
+    for option in tool_options:
+        schema = option.parameters_schema
+        if isinstance(schema, Mapping):
+            declared_schemas[option.name] = dict(schema)
+
+    if not declared_schemas:
+        return None
+
+    for call in tool_calls:
+        schema = declared_schemas.get(call.func_name)
+        if schema is None:
+            continue
+        raw_required = schema.get("required")
+        if not isinstance(raw_required, Sequence) or isinstance(raw_required, (str, bytes)):
+            continue
+        required_keys = list(dict.fromkeys(k for k in raw_required if isinstance(k, str) and k))
+        if not required_keys:
+            continue
+        call_args = call.args if isinstance(call.args, Mapping) else {}
+        missing_keys = [key for key in required_keys if key not in call_args]
+        if missing_keys:
+            return call.func_name, missing_keys
+
+    return None

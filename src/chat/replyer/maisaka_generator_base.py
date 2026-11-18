@@ -1301,8 +1301,10 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
         reply_tool_args: Optional[Dict[str, Any]] = None,
         think_level: int = 1,
     ) -> List[ContextItem]:
+        self._last_request_used_st = False
         # ST 预设引擎接管分支（默认未启用时返回 False，零侵入现有路径）
         if self._uses_st_preset_engine(reply_tool_args):
+            self._last_request_used_st = True
             custom_builder = getattr(self, "_st_preset_request_builder", None)
             if callable(custom_builder):
                 return custom_builder(
@@ -1674,17 +1676,40 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
             result.request_messages = preview.payload["request_items"]
             result.output_items = preview.payload["output_items"]
 
-    def _build_generation_options(self, model_name: Optional[str]) -> LLMGenerationOptions:
-        """构建本次请求选项；若当前启用了 STPresetEngine 工具信封则自动附带工具声明与采样温度。"""
+    def _reset_st_request_state(self) -> None:
+        """清理上一次请求的 ST 编译状态，避免跨请求泄漏校验策略。"""
+        self._last_st_compiled_request = None
+        self._last_st_output_mode = "im_clean"
+        self._last_st_reply_tool_args = None
+        self._last_request_used_st = False
+
+    def _build_generation_options(
+        self,
+        model_name: Optional[str],
+        *,
+        allow_external_tool_calls: bool = False,
+    ) -> LLMGenerationOptions:
+        """构建本次请求选项；若当前启用了 STPresetEngine 工具信封则自动附带工具声明、采样温度与直答校验。"""
         st_compiled = getattr(self, "_last_st_compiled_request", None)
         last_st_args = getattr(self, "_last_st_reply_tool_args", None)
         if st_compiled is not None and self._uses_st_preset_engine(last_st_args):
+            output_mode = str(getattr(self, "_last_st_output_mode", "im_clean") or "im_clean").strip() or "im_clean"
+            response_validator = None
+            if output_mode == "im_clean":
+                from src.companion_vault.st_preset_engine import build_st_im_clean_response_validator
+
+                response_validator = build_st_im_clean_response_validator(
+                    allow_external_tool_calls=allow_external_tool_calls,
+                    output_mode=output_mode,
+                )
             return LLMGenerationOptions(
                 model_name=model_name,
                 tool_options=st_compiled.tool_definitions or None,
                 temperature=st_compiled.temperature,
                 max_tokens=st_compiled.max_tokens,
                 extra_params=dict(getattr(st_compiled, "extra_params", {}) or {}),
+                validate_required_tool_args=bool(st_compiled.tool_definitions),
+                response_validator=response_validator,
             )
         return LLMGenerationOptions(model_name=model_name)
 
@@ -1729,7 +1754,7 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
                 session_id=preview_chat_id,
             )
 
-        self._last_st_compiled_request = None
+        self._reset_st_request_state()
         self._last_st_request_messages = None
         request_messages = self._build_request_messages(
             chat_history=filtered_history,
@@ -1739,7 +1764,7 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
             reply_tool_args=active_reply_tool_args,
         )
         self._last_st_request_messages = list(request_messages)
-        generation_options = self._build_generation_options(None)
+        generation_options = self._build_generation_options(None, allow_external_tool_calls=True)
 
         async def context_factory(
             _client: object,
@@ -1968,6 +1993,7 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
                 )
                 self._last_is_owner_private = resolved_is_owner_priv
             else:
+                self._reset_st_request_state()
                 try:
                     request_messages = self._build_request_messages(
                         chat_history=filtered_history,
@@ -2124,6 +2150,18 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
                 except Exception as exc:
                     logger.exception("Maisaka 回复器调用失败")
                     result.error_message = str(exc)
+                    trace_ctx = getattr(exc, "generation_trace_context", None)
+                    trace_attempts = tuple(getattr(trace_ctx, "generation_attempts", ()) or ())
+                    if trace_attempts:
+                        failed_attempts = tuple(
+                            replace(attempt, workflow_attempt=retry_count + 1)
+                            for attempt in trace_attempts
+                        )
+                        all_generation_attempts.extend(failed_attempts)
+                    if all_generation_attempts:
+                        result.generation_attempts = self._serialize_generation_attempts(
+                            SimpleNamespace(generation_attempts=tuple(all_generation_attempts))
+                        )
                     result.metrics = GenerationMetrics(
                         prompt_ms=prompt_ms,
                         llm_ms=round((time.perf_counter() - llm_started_at) * 1000, 2),
@@ -2140,7 +2178,10 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
             response_text = raw_llm_response_text
             last_native_reasoning = str(getattr(generation_result, "reasoning", "") or "").strip()
             gen_tool_calls = getattr(generation_result, "tool_calls", None)
-            st_engine_used = self._uses_st_preset_engine(active_reply_tool_args)
+            st_engine_used = bool(
+                getattr(self, "_last_request_used_st", False)
+                or (use_precomputed and self._uses_st_preset_engine(active_reply_tool_args))
+            )
             has_st_markers = bool(
                 gen_tool_calls
                 or any(
@@ -2158,8 +2199,7 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
                     output_mode=getattr(self, "_last_st_output_mode", "im_clean") if st_engine_used else "im_clean",
                     native_reasoning=last_native_reasoning,
                 )
-                if unwrapped_st_output.visible_text.strip():
-                    response_text = unwrapped_st_output.visible_text.strip()
+                response_text = unwrapped_st_output.visible_text.strip()
             if "<updatevariable" in response_text.lower():
                 from src.companion_vault.mvu_engine import MVURuntimeEngine
 

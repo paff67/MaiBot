@@ -21,7 +21,12 @@ from src.llm_models.payload_content.context_item import (
     get_response_text,
     get_response_tool_calls,
 )
-from src.llm_models.model_client.base_client import GenerationAttempt, GenerationTrace, ResponseRequest
+from src.llm_models.model_client.base_client import (
+    GenerationAttempt,
+    GenerationTrace,
+    ResponseRequest,
+    ResponseValidator,
+)
 from src.llm_models.payload_content.native_tool import NativeToolCallSummary
 from src.llm_models.payload_content.resp_format import RespFormat
 from src.llm_models.payload_content.tool_option import ToolCall, ToolDefinitionInput
@@ -259,6 +264,8 @@ class LLMGenerationOptions(BaseDataModel):
     raise_when_empty: bool = True
     force_stream_mode: bool = False
     extra_params: Dict[str, Any] = field(default_factory=dict)
+    validate_required_tool_args: bool = False
+    response_validator: ResponseValidator | None = field(default=None, repr=False)
 
 
 @dataclass(slots=True)

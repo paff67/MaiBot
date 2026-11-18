@@ -22,6 +22,10 @@ from src.common.data_models.message_component_data_model import (
     MessageSequence,
     TextComponent,
 )
+from src.common.data_models.reply_generation_data_models import (
+    ReplyGenerationResult,
+    build_reply_monitor_detail,
+)
 from src.common.logger import get_logger
 from src.config.config import global_config
 from src.companion_vault.runtime_bridge import build_planner_truth_catalog_async
@@ -43,7 +47,8 @@ from src.llm_models.payload_content.context_item import (
     UserMessageItem,
     replace_output_projection,
 )
-from src.llm_models.payload_content.tool_option import ToolCall
+from src.llm_models.payload_content.tool_option import ToolCall, normalize_tool_options
+from src.llm_models.request_snapshot import serialize_generation_attempt
 from src.services import database_service as database_api
 from src.maisaka.display.display_utils import format_tool_call_for_display
 from src.maisaka.utils.tool_post_execution import handle_tool_post_execution_effects
@@ -1399,10 +1404,67 @@ class MaisakaReasoningEngine:
 
             from src.companion_vault.st_preset_engine import STPresetEngine
 
-            unwrapped = STPresetEngine.unwrap_response(
+            st_output_mode = str(getattr(replyer, "_last_st_output_mode", "im_clean") or "im_clean").strip() or "im_clean"
+            compiled_tool_defs = getattr(_compiled_req, "tool_definitions", None) if _compiled_req is not None else None
+            compiled_tool_options = normalize_tool_options(compiled_tool_defs) if compiled_tool_defs else None
+            direct_check = STPresetEngine.evaluate_wechat_direct_reply(
                 response_text=str(getattr(llm_res, "response", "") or ""),
                 tool_calls=raw_tool_calls,
-                output_mode="im_clean",
+                tool_options=compiled_tool_options,
+                output_mode=st_output_mode,
+                native_reasoning=str(getattr(llm_res, "reasoning", "") or ""),
+                allow_external_tool_calls=False,
+                validate_required_args=bool(compiled_tool_options),
+            )
+            if not direct_check.is_valid:
+                ended_at = time.time()
+                cycle_detail.time_records["replyer"] = ended_at - started_at
+                error_message = direct_check.message or "ST 直答结果未通过下游可用性校验"
+                serialized_attempts = [
+                    serialize_generation_attempt(attempt)
+                    for attempt in tuple(getattr(llm_res, "generation_attempts", ()) or ())
+                ]
+                reply_gen_res = ReplyGenerationResult(
+                    success=False,
+                    error_message=error_message,
+                    generation_attempts=serialized_attempts,
+                )
+                monitor_detail = build_reply_monitor_detail(reply_gen_res)
+                monitor_detail["validation_reason"] = direct_check.reason
+                if direct_check.tool_name:
+                    monitor_detail["tool_name"] = direct_check.tool_name
+                if direct_check.missing_keys:
+                    monitor_detail["missing_keys"] = list(direct_check.missing_keys)
+                result = tool_ctx.build_failure_result(
+                    "reply",
+                    error_message,
+                    metadata={
+                        "monitor_detail": monitor_detail,
+                        "validation_reason": direct_check.reason,
+                        "tool_name": direct_check.tool_name,
+                        "missing_keys": list(direct_check.missing_keys),
+                        "generation_attempts": serialized_attempts,
+                    },
+                )
+                summary = result.get_history_content()
+                state.tool_result_summaries = [summary]
+                state.tool_monitor_results = [
+                    self._build_one_pass_monitor_item(
+                        execution_id=execution_id,
+                        arguments=arguments,
+                        result=result,
+                        summary=summary,
+                        started_at=started_at,
+                        ended_at=ended_at,
+                    )
+                ]
+                state.cycle_end = CycleEnd("one_pass_st_failed", f"{mode_label}失败：{summary}")
+                return
+
+            unwrapped = direct_check.unwrapped or STPresetEngine.unwrap_response(
+                response_text=str(getattr(llm_res, "response", "") or ""),
+                tool_calls=raw_tool_calls,
+                output_mode="im_clean" if st_output_mode == "im_clean" else "raw_preset",
                 native_reasoning=str(getattr(llm_res, "reasoning", "") or ""),
             )
             allowed_slots = tuple(getattr(decision, "allowed_slots", ("sister_younger", "sister_elder")) or ())

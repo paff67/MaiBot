@@ -43,6 +43,7 @@ from src.llm_models.model_client.base_client import (
     ImageEmbeddingRequest,
     RequestTraceContext,
     ResponseRequest,
+    ResponseValidator,
     client_registry,
 )
 from src.llm_models.generation_diagnostics import sanitize_diagnostic_url
@@ -62,6 +63,7 @@ from src.llm_models.payload_content.resp_format import RespFormat
 from src.llm_models.payload_content.tool_option import (
     ToolDefinitionInput,
     ToolOption,
+    find_missing_required_tool_args,
     normalize_tool_options,
 )
 from src.llm_models.utils import compress_messages, llm_usage_recorder
@@ -426,6 +428,8 @@ class LLMOrchestrator:
         session_id: str = "",
         force_stream_mode: bool = False,
         extra_params: Optional[Dict[str, Any]] = None,
+        validate_required_tool_args: bool = False,
+        response_validator: ResponseValidator | None = None,
     ) -> LLMResponseResult:
         """异步生成文本响应。
 
@@ -464,6 +468,8 @@ class LLMOrchestrator:
             interrupt_flag=interrupt_flag,
             force_stream_mode=force_stream_mode,
             extra_params=extra_params,
+            validate_required_tool_args=validate_required_tool_args,
+            response_validator=response_validator,
             session_id=session_id,
         )
         response = execution_result.api_response
@@ -501,6 +507,8 @@ class LLMOrchestrator:
         session_id: str = "",
         force_stream_mode: bool = False,
         extra_params: Optional[Dict[str, Any]] = None,
+        validate_required_tool_args: bool = False,
+        response_validator: ResponseValidator | None = None,
     ) -> LLMResponseResult:
         """基于外部消息工厂异步生成响应。
 
@@ -534,6 +542,8 @@ class LLMOrchestrator:
             interrupt_flag=interrupt_flag,
             force_stream_mode=force_stream_mode,
             extra_params=extra_params,
+            validate_required_tool_args=validate_required_tool_args,
+            response_validator=response_validator,
             session_id=session_id,
         )
         response = execution_result.api_response
@@ -741,6 +751,8 @@ class LLMOrchestrator:
         max_tokens: Optional[int],
         trace_context: RequestTraceContext,
         extra_params: Optional[Dict[str, Any]] = None,
+        validate_required_tool_args: bool = False,
+        response_validator: ResponseValidator | None = None,
     ) -> ResponseRequest:
         """构建统一响应请求对象。
 
@@ -771,6 +783,8 @@ class LLMOrchestrator:
             interrupt_flag=interrupt_flag,
             extra_params=merged_extra,
             trace_context=trace_context,
+            validate_required_tool_args=validate_required_tool_args,
+            response_validator=response_validator,
         )
 
     @staticmethod
@@ -858,6 +872,8 @@ class LLMOrchestrator:
         audio_base64: str | None,
         trace_context: RequestTraceContext,
         extra_params: Optional[Dict[str, Any]] = None,
+        validate_required_tool_args: bool = False,
+        response_validator: ResponseValidator | None = None,
     ) -> ClientRequest:
         """按请求类型构建统一客户端请求对象。
 
@@ -894,6 +910,8 @@ class LLMOrchestrator:
                 max_tokens=max_tokens,
                 trace_context=trace_context,
                 extra_params=extra_params,
+                validate_required_tool_args=validate_required_tool_args,
+                response_validator=response_validator,
             )
         if request_type == RequestType.EMBEDDING:
             if embedding_input is None:
@@ -1040,6 +1058,34 @@ class LLMOrchestrator:
         trace_context.generation_attempts.append(attempt)
         response.generation_attempts = tuple(trace_context.generation_attempts)
 
+    @staticmethod
+    def _validate_response(request: ResponseRequest, response: APIResponse) -> None:
+        """在确认单次尝试成功前执行请求级响应完整性校验。
+
+        Args:
+            request: 当前完整响应请求对象。
+            response: 客户端解析并聚合完成的响应对象。
+
+        Raises:
+            RespParseException: 当工具调用缺失必填参数键或未通过请求级语义校验时抛出。
+        """
+        if request.validate_required_tool_args:
+            missing = find_missing_required_tool_args(response.tool_calls, request.tool_options)
+            if missing is not None:
+                tool_name, missing_keys = missing
+                missing_keys_text = ", ".join(missing_keys)
+                raise RespParseException(
+                    ext_info={
+                        "reason": "missing_required_tool_args",
+                        "tool_name": tool_name,
+                        "missing_keys": list(missing_keys),
+                    },
+                    message=f"[missing_required_tool_args] 工具 '{tool_name}' 缺少必填参数键: {missing_keys_text}",
+                    reason="missing_required_tool_args",
+                )
+        if request.response_validator is not None:
+            request.response_validator(request, response)
+
     async def _attempt_request_on_model(
         self,
         api_provider: APIProvider,
@@ -1099,6 +1145,7 @@ class LLMOrchestrator:
                 ):
                     if isinstance(active_request, ResponseRequest):
                         response = await client.get_response(active_request)
+                        self._validate_response(active_request, response)
                     elif isinstance(active_request, EmbeddingRequest):
                         response = await client.get_embedding(active_request)
                     elif isinstance(active_request, ImageEmbeddingRequest):
@@ -1271,11 +1318,12 @@ class LLMOrchestrator:
                     f"任务 '{task_display}' 的模型 '{model_info.name}' 返回内容解析失败(可重试): {str(e)}{original_error_info}。"
                     f"剩余重试次数: {retry_remain}"
                 )
+                retry_reason = f"响应解析失败({e.reason})" if e.reason else "响应解析失败"
                 self._schedule_llm_retry_event(
                     model_name=model_info.name,
                     attempt=max_attempts - retry_remain + 1,
                     max_attempts=max_attempts,
-                    reason="响应解析失败",
+                    reason=retry_reason,
                     retry_interval=api_provider.retry_interval,
                 )
                 await asyncio.to_thread(update_failed_request_attempt, e, status="retrying", retry_interval=api_provider.retry_interval)
@@ -1361,6 +1409,8 @@ class LLMOrchestrator:
         session_id: str = "",
         force_stream_mode: bool = False,
         extra_params: Optional[Dict[str, Any]] = None,
+        validate_required_tool_args: bool = False,
+        response_validator: ResponseValidator | None = None,
     ) -> LLMExecutionResult:
         """执行一次完整的模型调度请求。
 
@@ -1434,6 +1484,8 @@ class LLMOrchestrator:
                     audio_base64=audio_base64,
                     trace_context=trace_context,
                     extra_params=extra_params,
+                    validate_required_tool_args=validate_required_tool_args,
+                    response_validator=response_validator,
                 )
                 if self.request_type.startswith("maisaka."):
                     logger.debug(

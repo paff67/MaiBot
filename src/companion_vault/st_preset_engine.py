@@ -25,6 +25,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
 
+from src.llm_models.exceptions import RespParseException
+from src.llm_models.model_client.base_client import APIResponse, ResponseRequest, ResponseValidator
 from src.llm_models.payload_content.context_item import (
     ContextAudioPart,
     ContextFileUriPart,
@@ -37,7 +39,12 @@ from src.llm_models.payload_content.context_item import (
     FunctionCallOutputItem,
     RoleType,
 )
-from src.llm_models.payload_content.tool_option import ToolCall, ToolDefinitionInput, ToolOption
+from src.llm_models.payload_content.tool_option import (
+    ToolCall,
+    ToolDefinitionInput,
+    ToolOption,
+    find_missing_required_tool_args,
+)
 
 TOKYO_TZ = ZoneInfo("Asia/Tokyo")
 FALLBACK_SIG_B64 = base64.b64encode(b"skip_thought_signature_validator").decode("ascii")
@@ -289,6 +296,19 @@ class STUnwrappedOutput:
     used_tool_envelope: bool = False
     mvu_patches: List[Dict[str, Any]] = field(default_factory=list)
     mvu_analysis: str = ""
+
+
+@dataclass(frozen=True)
+class STDirectReplyCheckResult:
+    """微信 ST 直答候选响应的纯校验结果。"""
+
+    is_valid: bool
+    reason: str = ""
+    message: str = ""
+    tool_name: str = ""
+    missing_keys: Tuple[str, ...] = ()
+    delegated_to_external_tool: bool = False
+    unwrapped: Optional[STUnwrappedOutput] = None
 
 
 def _tokyo_time_str() -> str:
@@ -1495,9 +1515,13 @@ class STPresetEngine:
                     )
                 else:
                     think_nya = str(raw_args.get("think_nya") or raw_args.get("report_nya") or "").strip()
-                    game_body = str(
+                    has_named_body_key = any(k in raw_args for k in ("game_content", "game", "story_body"))
+                    raw_body = (
                         raw_args.get("game_content") or raw_args.get("game") or raw_args.get("story_body") or ""
-                    ).strip()
+                        if has_named_body_key
+                        else raw_args.get("content") or ""
+                    )
+                    game_body = str(raw_body).strip()
                     summary_body = str(raw_args.get("summary") or "").strip()
                     options_body = str(raw_args.get("options") or "").strip()
                     comment_body = str(raw_args.get("comment") or "").strip()
@@ -1595,6 +1619,114 @@ class STPresetEngine:
             mvu_patches=mvu_patches,
             mvu_analysis=" | ".join(mvu_analyses),
         )
+
+    @classmethod
+    def evaluate_wechat_direct_reply(
+        cls,
+        *,
+        response_text: str,
+        tool_calls: Optional[Sequence[ToolCall]] = None,
+        tool_options: Optional[Sequence[ToolOption]] = None,
+        output_mode: str = "im_clean",
+        native_reasoning: str = "",
+        allow_external_tool_calls: bool = False,
+        validate_required_args: bool = True,
+    ) -> STDirectReplyCheckResult:
+        """统一判定 ST 候选响应是否构成有效的微信直答或合法的外部工具调用。
+
+        Args:
+            response_text: 模型原始正文文本。
+            tool_calls: 模型输出的工具调用序列。
+            tool_options: 本次请求实际声明的工具选项序列。
+            output_mode: ST 输出解包模式（默认 ``im_clean``）。
+            native_reasoning: 模型原生 reasoning 内容。
+            allow_external_tool_calls: 是否允许已声明的非 ST 外部工具接管本轮。
+            validate_required_args: 是否检查已声明工具的顶层 ``required`` 键。
+
+        Returns:
+            STDirectReplyCheckResult: 包含失败分类与解包结果的结构化校验结论。
+        """
+        calls = list(tool_calls or ())
+        if validate_required_args:
+            missing = find_missing_required_tool_args(calls, tool_options)
+            if missing is not None:
+                tool_name, missing_keys = missing
+                missing_keys_text = ", ".join(missing_keys)
+                return STDirectReplyCheckResult(
+                    is_valid=False,
+                    reason="missing_required_tool_args",
+                    message=f"[missing_required_tool_args] 工具 '{tool_name}' 缺少必填参数键: {missing_keys_text}",
+                    tool_name=tool_name,
+                    missing_keys=tuple(missing_keys),
+                )
+
+        if allow_external_tool_calls and tool_options is not None:
+            declared_external_names = {
+                opt.name for opt in tool_options if opt.name not in {"soliumbra_reply", "context"}
+            }
+            if any(call.func_name in declared_external_names for call in calls):
+                return STDirectReplyCheckResult(
+                    is_valid=True,
+                    delegated_to_external_tool=True,
+                )
+
+        unwrapped = cls.unwrap_response(
+            response_text=response_text,
+            tool_calls=calls,
+            output_mode="im_clean" if output_mode == "im_clean" else "raw_preset",
+            native_reasoning=native_reasoning,
+        )
+        if not unwrapped.visible_text.strip():
+            return STDirectReplyCheckResult(
+                is_valid=False,
+                reason="empty_st_visible_reply",
+                message="[empty_st_visible_reply] ST 直答解包后无可用可见正文",
+                unwrapped=unwrapped,
+            )
+
+        return STDirectReplyCheckResult(
+            is_valid=True,
+            unwrapped=unwrapped,
+        )
+
+
+def build_st_im_clean_response_validator(
+    *,
+    allow_external_tool_calls: bool = False,
+    output_mode: str = "im_clean",
+) -> ResponseValidator:
+    """构建请求级微信 ST 直答响应校验回调。
+
+    Args:
+        allow_external_tool_calls: 首轮 ST 决策为 True，收敛生成/直答为 False。
+        output_mode: 目标 ST 输出解包模式。
+
+    Returns:
+        ResponseValidator: 挂载在 ``ResponseRequest.response_validator`` 的校验函数。
+    """
+
+    def _validate(request: ResponseRequest, response: APIResponse) -> None:
+        check = STPresetEngine.evaluate_wechat_direct_reply(
+            response_text=response.content or "",
+            tool_calls=response.tool_calls,
+            tool_options=request.tool_options,
+            output_mode=output_mode,
+            native_reasoning=response.reasoning_content or "",
+            allow_external_tool_calls=allow_external_tool_calls,
+            validate_required_args=False,
+        )
+        if not check.is_valid:
+            raise RespParseException(
+                ext_info={
+                    "reason": check.reason,
+                    "tool_name": check.tool_name,
+                    "missing_keys": list(check.missing_keys),
+                },
+                message=check.message or "ST 直答响应未通过可见性校验",
+                reason=check.reason,
+            )
+
+    return _validate
 
 
 class STPresetRuntimeManager:

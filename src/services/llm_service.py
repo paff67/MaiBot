@@ -315,6 +315,8 @@ class LLMServiceClient:
             interrupt_flag=active_options.interrupt_flag,
             force_stream_mode=active_options.force_stream_mode,
             extra_params=active_options.extra_params,
+            validate_required_tool_args=active_options.validate_required_tool_args,
+            response_validator=active_options.response_validator,
             session_id=self._resolve_effective_session_id(session_id),
         )
         self._record_cache_stats(result, prompt_text=prompt_text, session_id=session_id)
@@ -374,6 +376,8 @@ class LLMServiceClient:
             interrupt_flag=active_options.interrupt_flag,
             force_stream_mode=active_options.force_stream_mode,
             extra_params=active_options.extra_params,
+            validate_required_tool_args=active_options.validate_required_tool_args,
+            response_validator=active_options.response_validator,
             session_id=self._resolve_effective_session_id(session_id),
         )
         self._record_cache_stats(result, prompt_text=prompt_text_holder.get("prompt_text"), session_id=session_id)

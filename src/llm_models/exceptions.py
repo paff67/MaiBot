@@ -87,10 +87,11 @@ class ResponseContextException(Exception):
 
     default_message: str = "请求失败"
 
-    def __init__(self, ext_info: Any = None, message: str | None = None):
+    def __init__(self, ext_info: Any = None, message: str | None = None, *, reason: str = ""):
         super().__init__(message)
         self.ext_info = ext_info
         self.message = message
+        self.reason = reason
 
     def __str__(self):
         return self.message or self.default_message
