@@ -2,9 +2,12 @@
 
 from datetime import datetime
 from math import ceil
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Literal, Optional, Sequence
 import asyncio
 import json
+import os
+import sqlite3
 import time
 import uuid
 
@@ -173,6 +176,7 @@ class MaisakaHeartFlowChatting(MaisakaRuntimeDisplayMixin):
         self._deferred_message_turn_task: Optional[asyncio.Task[None]] = None
         self._fixed_message_debouncer = MessageDebouncer()
         self._message_debounce_was_enabled = False
+        self._media_hydration_first_seen: Dict[str, float] = {}
         self._last_message_received_at = 0.0
         self._talk_frequency_adjust = 1.0
         self._wait_timeout_task: Optional[asyncio.Task[None]] = None
@@ -1717,6 +1721,115 @@ class MaisakaHeartFlowChatting(MaisakaRuntimeDisplayMixin):
             return 0.0
         deadline = self._fixed_message_debouncer.deadline
         return 0.0 if deadline is None else max(0.0, deadline - time.monotonic())
+
+    def _get_media_hydration_wait_seconds(self) -> float:
+        """微信媒体原件就绪门控：待处理批次中存在正在下载/解码的微信媒体时，返回短暂重试等待秒数。"""
+        if os.environ.get("MAIBOT_DISABLE_MEDIA_WAIT"):
+            return 0.0
+        try:
+            max_wait_s = float(os.environ.get("MAIBOT_MEDIA_HYDRATION_MAX_WAIT_S", "10.0") or "10.0")
+        except (TypeError, ValueError):
+            max_wait_s = 10.0
+        if max_wait_s <= 0.0:
+            return 0.0
+
+        pending_messages = self.message_cache[self._last_processed_index :]
+        if not pending_messages:
+            return 0.0
+
+        candidates: list[tuple[str, str, str, str, bool]] = []
+        for message in pending_messages:
+            if str(getattr(message, "platform", "") or "").strip().lower() != "wechat":
+                continue
+            msg_info = getattr(message, "message_info", None)
+            additional_config = getattr(msg_info, "additional_config", None) or {}
+            if additional_config.get("wechat_media_state") != "resolve_from_vault":
+                continue
+            wechat_msg_id = str(additional_config.get("wechat_msg_id") or "").strip()
+            if not wechat_msg_id:
+                pieces = str(getattr(message, "message_id", "") or "").split(":")
+                if len(pieces) == 4 and pieces[3].isdigit():
+                    wechat_msg_id = pieces[3]
+            if not wechat_msg_id:
+                continue
+            account = str(getattr(message, "account_id", "") or "").strip()
+            group_info = getattr(msg_info, "group_info", None)
+            user_info = getattr(msg_info, "user_info", None)
+            chat_id = str(
+                (getattr(group_info, "group_id", "") if group_info is not None else "")
+                or (getattr(user_info, "user_id", "") if user_info is not None else "")
+            ).strip()
+            if not account or not chat_id:
+                continue
+
+            raw_msg_type = additional_config.get("wechat_msg_type")
+            try:
+                wechat_msg_type = int(raw_msg_type) if raw_msg_type is not None else None
+            except (TypeError, ValueError):
+                wechat_msg_type = None
+            raw_text = str(getattr(message, "processed_plain_text", "") or "").strip()
+            if not raw_text and getattr(message, "raw_message", None) is not None:
+                raw_text = "".join(
+                    c.text for c in message.raw_message.components if isinstance(c, TextComponent)
+                ).strip()
+            is_known_media = (
+                wechat_msg_type in {3, 34, 43, 47}
+                or raw_text in {"[图片]", "[表情包]", "[语音]", "[视频]", "[文件]"}
+                or (raw_text.startswith("{") and '"type"' in raw_text)
+            )
+            track_key = f"{account}:{chat_id}:{wechat_msg_id}"
+            candidates.append((track_key, account, chat_id, wechat_msg_id, is_known_media))
+
+        if not candidates:
+            return 0.0
+
+        truth_db_path = os.environ.get("MAIBOT_TRUTH_DB_PATH", "").strip() or "data/companion_truth.db"
+        if not Path(truth_db_path).is_file():
+            return 0.0
+
+        first_seen: Dict[str, float] = getattr(self, "_media_hydration_first_seen", None)
+        if first_seen is None:
+            first_seen = {}
+            self._media_hydration_first_seen = first_seen
+
+        now_mono = time.monotonic()
+        if len(first_seen) > 64:
+            cutoff = now_mono - 120.0
+            for stale_key in [k for k, ts in first_seen.items() if ts < cutoff]:
+                first_seen.pop(stale_key, None)
+
+        wait_seconds = 0.0
+        enqueue_grace_s = min(6.0, max_wait_s)
+        conn: Optional[sqlite3.Connection] = None
+        try:
+            conn = sqlite3.connect(Path(truth_db_path).resolve().as_uri() + "?mode=ro", uri=True, timeout=0.2)
+            has_table = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='message_media_jobs'"
+            ).fetchone()
+            if not has_table:
+                return 0.0
+            for track_key, account, chat_id, wechat_msg_id, is_known_media in candidates:
+                seen_at = first_seen.setdefault(track_key, now_mono)
+                elapsed = max(0.0, now_mono - seen_at)
+                if elapsed >= max_wait_s:
+                    continue
+                rows = conn.execute(
+                    "SELECT state FROM message_media_jobs WHERE account=? AND chat_id=? AND msg_id=?",
+                    (account, chat_id, wechat_msg_id),
+                ).fetchall()
+                states = {str(r[0] or "").strip() for r in rows}
+                if "ready" in states:
+                    continue
+                if states & {"pending", "running", "waiting_file", "decode_required", "retry"}:
+                    wait_seconds = max(wait_seconds, min(0.5, max_wait_s - elapsed))
+                elif not states and is_known_media and elapsed < enqueue_grace_s:
+                    wait_seconds = max(wait_seconds, min(0.5, enqueue_grace_s - elapsed))
+        except Exception:
+            return 0.0
+        finally:
+            if conn is not None:
+                conn.close()
+        return wait_seconds
 
     async def _wait_for_message_quiet_period(self) -> None:
         """等待消息批次允许判断；新消息会唤醒等待并重算，兼容截止时间提前和延后；停止时可取消。"""

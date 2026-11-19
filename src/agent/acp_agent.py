@@ -20,7 +20,7 @@ from src.computer.provider import ComputerToolProvider
 from src.files.provider import FileToolProvider
 
 from src.llm_models.payload_content.context_item import (
-    AssistantMessageItem, ContextAudioPart, ContextFileUriPart, ContextImagePart, ContextItem, ContextItemBuilder, ContextItemMeta, ContextTextPart,
+    AssistantMessageItem, ContextAudioPart, ContextBinaryPart, ContextFileUriPart, ContextImagePart, ContextItem, ContextItemBuilder, ContextItemMeta, ContextTextPart,
     ProviderActivityItem, ReasoningItem, ReasoningRepresentation, RoleType,
 )
 
@@ -229,6 +229,8 @@ class AcpAgent:
                         prompt.append({"type": "image", "data": part.image_base64, "mimeType": "image/" + part.image_format})
                     elif isinstance(part, ContextAudioPart):
                         prompt.append({"type": "text", "text": f"[音频附件: {part.mime_type}]"})
+                    elif isinstance(part, ContextBinaryPart):
+                        prompt.append({"type": "text", "text": f"[文件附件: {part.file_code or part.mime_type}]"})
                     elif isinstance(part, ContextFileUriPart):
                         prompt.append({"type": "text", "text": f"[文件附件: {part.file_code or part.file_uri}]"})
                     elif isinstance(part, ContextTextPart):

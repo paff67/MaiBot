@@ -677,6 +677,35 @@ class CompanionTruthDB:
                     vis = "PUBLIC"
                 scope_key = "OWNER_PRIVATE" if vis == "PRIVATE" else "GLOBAL_PUBLIC"
                 serialized = self._serialize_mvu_value(vtype, vdef.get("default_value", ""))
+                if vis == "PRIVATE":
+                    # 若变量从 PUBLIC 收紧为 PRIVATE，安全迁移旧 PUBLIC 行到 OWNER_PRIVATE 并清理旧 PUBLIC 残留行
+                    legacy_pub = self.conn.execute(
+                        """
+                        SELECT var_type, var_value, updated_at
+                        FROM mvu_variables
+                        WHERE card_id = ? AND scope_key = 'GLOBAL_PUBLIC' AND var_key = ?
+                        """,
+                        (cid, vkey),
+                    ).fetchone()
+                    if legacy_pub is not None:
+                        self.conn.execute(
+                            """
+                            INSERT OR IGNORE INTO mvu_variables
+                                (card_id, scope_key, var_key, var_type, var_value, visibility, updated_at)
+                            VALUES (?, 'OWNER_PRIVATE', ?, ?, ?, 'PRIVATE', ?)
+                            """,
+                            (
+                                cid,
+                                vkey,
+                                str(legacy_pub["var_type"] or vtype),
+                                str(legacy_pub["var_value"] if legacy_pub["var_value"] is not None else serialized),
+                                str(legacy_pub["updated_at"] or now_iso),
+                            ),
+                        )
+                        self.conn.execute(
+                            "DELETE FROM mvu_variables WHERE card_id = ? AND scope_key = 'GLOBAL_PUBLIC' AND var_key = ?",
+                            (cid, vkey),
+                        )
                 self.conn.execute(
                     """
                     INSERT OR IGNORE INTO mvu_variables

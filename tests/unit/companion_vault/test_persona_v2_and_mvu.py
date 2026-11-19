@@ -591,7 +591,7 @@ def test_shared_twin_xu_cross_card_sync_and_fail_closed(truth_db: CompanionTruth
     xuyue = _load_card("maibot_xuyue")
     xuyan = _load_card("maibot_xuyan")
 
-    # 在 maibot_xuyue 上更新跨卡共享变量 apartment_scene (PUBLIC) 与 love_locked (PRIVATE, shared_key=twin_harmony_locked)
+    # 在 maibot_xuyue 上更新跨卡共享变量 apartment_scene (PRIVATE) 与 love_locked (PRIVATE, shared_key=twin_harmony_locked)
     new_scene = "主卧浴缸已放满苦橙精油热水，许玥把吧台共用手机交接给刚走出琴房的许妍"
     res = MVURuntimeEngine.apply_turn_updates(
         truth_db,
@@ -613,18 +613,115 @@ def test_shared_twin_xu_cross_card_sync_and_fail_closed(truth_db: CompanionTruth
     assert xuyan_priv["love_locked"] is True
     assert xuyan_priv["affection"] == 25  # 保持许妍独立默认值
 
-    # Fail-Closed（非 Owner / 群聊）：暴露 PUBLIC 的 apartment_scene，彻底隐藏 PRIVATE 的 love_locked
+    # Fail-Closed（非 Owner / 群聊）：apartment_scene 与 love_locked 均严格隔离，严禁向群聊泄露公寓私密切片
     xuyan_pub = MVURuntimeEngine.load_turn_variables(truth_db, xuyan, is_owner_private=False)
-    assert xuyan_pub["apartment_scene"] == new_scene
+    assert "apartment_scene" not in xuyan_pub
     assert "love_locked" not in xuyan_pub
     assert "affection" not in xuyan_pub
     shared_pub_rows = truth_db.get_mvu_variables("shared:twin_xu", is_owner_private=False)
-    assert shared_pub_rows == {"apartment_scene": new_scene}
+    assert shared_pub_rows == {}
+
+    # 兼容旧库平滑收紧：若旧库存在 GLOBAL_PUBLIC 的 apartment_scene 行，ensure_mvu_defaults 自动迁移至 OWNER_PRIVATE 并清理旧行
+    truth_db.upsert_mvu_variable(
+        "shared:twin_xu",
+        scope_key="GLOBAL_PUBLIC",
+        var_key="apartment_scene",
+        var_type="string",
+        var_value="旧库遗留公开切片",
+        visibility="PUBLIC",
+    )
+    MVURuntimeEngine.ensure_card_mvu_defaults(truth_db, xuyan)
+    assert truth_db.get_mvu_variables("shared:twin_xu", is_owner_private=False) == {}
+    assert truth_db.get_mvu_variables("shared:twin_xu", is_owner_private=True)["apartment_scene"] == new_scene
 
     # 重置后共享命名空间同步恢复默认值
     MVURuntimeEngine.reset_card_mvu_variables(truth_db, xuyue)
     after_reset = MVURuntimeEngine.load_turn_variables(truth_db, xuyan, is_owner_private=True)
     assert after_reset["love_locked"] is False
+
+
+def test_public_mvu_update_instruction_hides_custom_instr_and_private_examples(
+    truth_db: CompanionTruthDB,
+) -> None:
+    """非 Owner 会话严禁暴露 update_instruction（含金主/亲密细则）、/affection 或错误的 /current_mood 示例。"""
+    for card_id in ("maibot_xuyan", "maibot_xuyue"):
+        card = _load_card(card_id)
+        pub_block = MVURuntimeEngine.build_update_instruction_block(card, is_owner_private=False)
+        assert pub_block
+        assert "金主" not in pub_block
+        assert "打屁股" not in pub_block
+        assert "affection" not in pub_block
+        assert "apartment_scene" not in pub_block
+        assert "/current_mood" not in pub_block
+        assert '"/mood"' in pub_block
+
+        priv_block = MVURuntimeEngine.build_update_instruction_block(card, is_owner_private=True)
+        assert "角色专属变量演进细则" in priv_block
+        assert '"/affection"' in priv_block
+        assert "/current_mood" not in priv_block
+
+        # 确认 6 张内置卡 planner_summary 均无 Owner 私密泄露
+    forbidden_tokens = ("paff", "金主", "打屁股", "挠腰窝", "泌乳", "真空", "充血", "潜令", "恋爱锁定", "{{user}}", "Owner")
+    for card_id in BUILTIN_CARDS:
+        card = _load_card(card_id)
+        for token in forbidden_tokens:
+            assert token.lower() not in card.planner_summary.lower(), (
+                f"{card_id}.planner_summary 泄露敏感词: {token}"
+            )
+
+
+def test_affinity_guard_clamps_cumulative_multi_patch_in_single_turn(
+    truth_db: CompanionTruthDB,
+) -> None:
+    """同一轮中多条 affection 补丁叠加或重复来源输入，累计净变化严格受限于 [-1, +5]。"""
+    card = _load_card("maibot_xuyan")
+    _set_private(truth_db, card, "affection", "number", 20)
+
+    # 1. 同轮两条 +4 补丁，累计不得超过 +5（应为 25 而非 28）
+    res_pos = MVURuntimeEngine.apply_turn_updates(
+        truth_db,
+        card,
+        [
+            _patch(
+                {"op": "delta", "path": "/affection", "value": 4},
+                {"op": "delta", "path": "/affection", "value": 4},
+            )
+        ],
+        is_owner_private=True,
+    )
+    assert res_pos.variables["affection"] == 25
+    assert len(res_pos.changes) == 1
+    assert res_pos.changes[0].old == 20
+    assert res_pos.changes[0].new == 25
+    assert res_pos.changes[0].delta == 5
+
+    # 2. 同轮两条 -1 补丁，累计不得低于 -1（应为 24 而非 23）
+    res_neg = MVURuntimeEngine.apply_turn_updates(
+        truth_db,
+        card,
+        [
+            _patch(
+                {"op": "delta", "path": "/affection", "value": -1},
+                {"op": "delta", "path": "/affection", "value": -1},
+            )
+        ],
+        is_owner_private=True,
+    )
+    assert res_neg.variables["affection"] == 24
+    assert len(res_neg.changes) == 1
+    assert res_neg.changes[0].delta == -1
+
+    # 3. 相同 raw_sources 传入两次时自动去重，仅结算一次 (+2 -> 26)
+    dup_src = "好的呀" + _patch({"op": "delta", "path": "/affection", "value": 2})
+    res_dup = MVURuntimeEngine.apply_turn_updates(
+        truth_db,
+        card,
+        [dup_src, dup_src],
+        is_owner_private=True,
+    )
+    assert res_dup.variables["affection"] == 26
+    assert len(res_dup.changes) == 1
+    assert res_dup.changes[0].delta == 2
 
 
 def test_system_readonly_variables_injection_and_update_immunity(truth_db: CompanionTruthDB) -> None:

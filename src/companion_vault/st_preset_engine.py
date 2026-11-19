@@ -29,11 +29,13 @@ from src.llm_models.exceptions import RespParseException
 from src.llm_models.model_client.base_client import APIResponse, ResponseRequest, ResponseValidator
 from src.llm_models.payload_content.context_item import (
     ContextAudioPart,
+    ContextBinaryPart,
     ContextFileUriPart,
     ContextImagePart,
     ContextItem,
     ContextItemBuilder,
     ContextItemMeta,
+    ContextTextPart,
     ContextToolCall,
     FunctionCallItem,
     FunctionCallOutputItem,
@@ -264,6 +266,7 @@ class STCompileContext:
     mvu_update_instruction: str = ""
     external_tools: List[ToolDefinitionInput] = field(default_factory=list)
     tool_observations: List[Dict[str, Any]] = field(default_factory=list)
+    recalled_media_parts: List[Any] = field(default_factory=list)
 
 
 @dataclass
@@ -421,7 +424,11 @@ def _build_signed_tool_call_items(
 def _attach_media_parts_to_builder(builder: ContextItemBuilder, media_parts: Sequence[Any]) -> bool:
     added = False
     for part in media_parts:
-        if isinstance(part, ContextImagePart):
+        if isinstance(part, ContextTextPart):
+            if part.text:
+                builder.add_text_part(part.text)
+                added = True
+        elif isinstance(part, ContextImagePart):
             builder.add_image_base64_part(image_format=part.normalized_image_format, image_base64=part.image_base64)
             added = True
         elif isinstance(part, ContextAudioPart):
@@ -429,11 +436,22 @@ def _attach_media_parts_to_builder(builder: ContextItemBuilder, media_parts: Seq
                 audio_base64=part.audio_base64, mime_type=part.mime_type, file_code=part.file_code
             )
             added = True
+        elif isinstance(part, ContextBinaryPart):
+            builder.add_binary_base64_part(
+                data_base64=part.data_base64,
+                mime_type=part.mime_type,
+                file_code=part.file_code,
+                semantic_name=part.semantic_name,
+            )
+            added = True
         elif isinstance(part, ContextFileUriPart):
             builder.add_file_uri_part(part.file_uri, part.mime_type, part.file_code)
             added = True
         elif isinstance(part, dict):
-            if part.get("image_base64"):
+            if part.get("text"):
+                builder.add_text_part(str(part["text"]))
+                added = True
+            elif part.get("image_base64"):
                 builder.add_image_base64_part(
                     image_format=part.get("image_format", "jpeg"), image_base64=part["image_base64"]
                 )
@@ -443,6 +461,16 @@ def _attach_media_parts_to_builder(builder: ContextItemBuilder, media_parts: Seq
                     audio_base64=part["audio_base64"],
                     mime_type=part.get("mime_type", "audio/wav"),
                     file_code=part.get("file_code", ""),
+                )
+                added = True
+            elif part.get("binary_base64") or part.get("pdf_base64"):
+                binary_data = part.get("binary_base64") or part.get("pdf_base64")
+                default_mime = "application/pdf" if part.get("pdf_base64") else "application/octet-stream"
+                builder.add_binary_base64_part(
+                    data_base64=binary_data,
+                    mime_type=part.get("mime_type", default_mime),
+                    file_code=part.get("file_code", ""),
+                    semantic_name=part.get("semantic_name", ""),
                 )
                 added = True
             elif part.get("file_uri"):
@@ -982,12 +1010,18 @@ class STPresetEngine:
 
         # 处理历史对话对：先清理助手噪声并按 Meowssiah 2.1.7 阶梯规则（12轮起每8轮归档前序<summary>）构建历史片段
         raw_turns = list(ctx.chat_history)
+        popped_last_media_parts: List[Any] = []
         effective_last_user = (ctx.last_user_message or explicit_last_msg or "").strip()
         if not effective_last_user and raw_turns and raw_turns[-1].role == "user":
             effective_last_user = raw_turns[-1].text.strip()
+            popped_last_media_parts = list(raw_turns[-1].media_parts or [])
             raw_turns = raw_turns[:-1]
         if not effective_last_user:
-            effective_last_user = "请继续互动喵！"
+            effective_last_user = (
+                "（用户发送了媒体/附件，请结合附带的画面、音频或文档内容直接回复）"
+                if (popped_last_media_parts or ctx.recalled_media_parts)
+                else "请继续互动喵！"
+            )
 
         history_pairs: List[Dict[str, Any]] = []
         pending_ai_raw = "<game>\n【剧场通道开启】\n</game>"
@@ -1105,6 +1139,13 @@ class STPresetEngine:
                 mb = ContextItemBuilder().set_role(RoleType.User)
                 if _attach_media_parts_to_builder(mb, pair["media_parts"]):
                     items.append(mb.build())
+
+        combined_turn_media = [*popped_last_media_parts, *(ctx.recalled_media_parts or [])]
+        if combined_turn_media:
+            rm_builder = ContextItemBuilder().set_role(RoleType.User)
+            rm_builder.add_text_content("【本轮附带的最新原文件 / 引用召回 / 工具调取原件，请直接查看画面、音频或文档内容作答】")
+            if _attach_media_parts_to_builder(rm_builder, combined_turn_media):
+                items.append(rm_builder.build())
 
         normalized_external_tools = self._normalize_external_tools(ctx.external_tools)
         external_tool_names = [t["name"] for t in normalized_external_tools]
@@ -1420,6 +1461,13 @@ class STPresetEngine:
             _attach_media_parts_to_builder(b, turn.media_parts)
             if turn.text.strip() or turn.media_parts:
                 chat_items.append(b.build())
+
+        if ctx.recalled_media_parts:
+            rm_builder = ContextItemBuilder().set_role(RoleType.User)
+            rm_builder.add_text_content("【本轮附带的引用召回 / 工具调取原件，请直接查看画面、音频或文档内容作答】")
+            if _attach_media_parts_to_builder(rm_builder, ctx.recalled_media_parts):
+                insert_idx = max(0, len(chat_items) - 1) if (chat_items and chat_items[-1].role == RoleType.User) else len(chat_items)
+                chat_items.insert(insert_idx, rm_builder.build())
 
         if ctx.director_note.strip():
             depth_injections.append((1, 999, RoleType.User, f"[导演意图指引]\n{ctx.director_note.strip()}"))

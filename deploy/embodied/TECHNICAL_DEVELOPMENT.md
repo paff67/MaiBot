@@ -74,7 +74,7 @@ flowchart LR
   2. **定点 ID 复查**：针对刚插入或刚更新的 `msgId` 集合立即复查 `message` 与辅助表（`ImgInfo2`、`voiceinfo`、`videoinfo2`、`appattach`）；
   3. **近期窗口复查**：定期复查最近 100 条消息，捕获撤回（`type=268445456` / `10000`）与缩略图/原图状态更新；
   4. **全表滚动巡检**：按游标每轮扫描 200 行历史消息，确保较早消息的修订最终一致。
-- **单写者原则**：`/data/user/0/com.tencent.mm/files/maibot_message_journal.db` 仅由微信进程内的 `message_capture.js` 写入（WAL 模式），`edge_server.py` 始终通过 `?mode=ro` 只读查询 `message_events`、`send_outbox` 与 `group_members_snapshot`，彻底杜绝多进程写锁冲突与 SELinux/UID 权限污染。
+- **单写者原则**：`/data/user/0/com.tencent.mm/files/maibot_message_journal.db` 仅由微信进程内的 `message_capture.js` 写入（WAL 模式），`edge_server.py` 始终通过 `?mode=ro` 只读查询 `message_events`、`send_outbox` 与 `group_member_snapshots`，彻底杜绝多进程写锁冲突与 SELinux/UID 权限污染。
 
 ### 2. 后台无 UI 文本与原生引用消息发送（`ISendMsgMgr` & `AppMsgLogic` Hook + `SendLedger`）
 - **常规文本发送（`ISendMsgMgr` Hook）**：
@@ -107,7 +107,7 @@ flowchart LR
   1. `edge_server.py` 收到 `POST /wechat/send_text` 或 `POST /wechat/send_quote` 后，先在 `SendLedger`（`send_ledger.py`）校验 `request_id` 幂等性、目标会话合法性（支持 `MAIBOT_ALLOWED_SEND_CHATS="*"`）及滑动窗口限流；
   2. 执行拟人打字延迟 `compute_typing_delay_ms(text)`（按字数加随机抖动 `800ms ~ 10000ms`）；
   3. 将指令写入 `/data/user/0/com.tencent.mm/files/maibot_send_spool/<request_id>.json`（包含 `msg_type: "quote"` 与完整 `quote` 节点）；
-  4. `message_capture.js` 先在 `send_outbox` 持久化 `status='queued'` 后再删除 Spool 文件（防止崩溃丢单），调用 `k0.I()` 或 `Jj()` 后置为 `status='sending'`，并在启动时自动执行 `recoverInterruptedSends()` 恢复未决任务；
+  4. `message_capture.js` 先在 `send_outbox` 持久化 `status='accepted'` 后再删除 Spool 文件（防止崩溃丢单），调用 `k0.I()` 或 `Jj()` 后置为 `status='sending'`，并在启动时由 `initialize()` 自动重载最近 60 秒内 `status='sending'` 的未决任务；
   5. `pollActiveSends()` 在 `EnMicroMsg.db` 中观测到 `isSend=1 AND talker=chatId AND msgId > maxMsgIdBefore AND status=2 AND msgSvrId > 0`（或匹配 `k0.I` 返回的 `localId`）后，更新 `send_outbox.status='confirmed'` 并返回真实 `msg_id` 与 `msg_svr_id`。
 - **双层滑动窗口防封限流**：
   - **单会话限流**：同一 `chat_id` 每分钟最多发送 `max_sends_per_chat_per_minute`（默认 3 条）；
@@ -117,7 +117,7 @@ flowchart LR
 ### 3. 通讯录与群成员全量导出（`scanGroupMembers`）
 - `message_capture.js` 每 60 秒（以及启动时）从 `EnMicroMsg.db` 读取：
   - `chatroom` 表：所有 `*@chatroom` 的 `memberlist` 与 `displayname`；
-  - `rcontact` 表：所有非系统联系人的 `username`、`nickname`、`conRemark`（备注名）与 `alias`，以特殊键 `group_id = '__contacts__'` 存入 `group_members_snapshot`。
+  - `rcontact` 表：所有非系统联系人的 `username`、`nickname`、`conRemark`（备注名），以特殊键 `group_id = '__contacts__'` 存入 `group_member_snapshots`。
 - 云端通过 `GET /wechat/group_members` 拉取后，由 [`apply_directory_snapshot`](../../src/companion_vault/group_members.py) 自动更新 `companion_truth.db` 的 `group_members` 表与 `person_info` 表（自动补全好友昵称与微信备注，但**绝不自动授予 `OWNER` 权限**，新联系人默认 `trust_role='GROUP_MEMBER'`）。
 
 ### 4. 原生媒体解析与 `WxGF` / `SILK` 无损转码（`message_media.py`）
@@ -141,7 +141,7 @@ flowchart LR
 
 ### 2. 多会话路由与系统账号过滤（`driver.py`）
 - **`is_supported_wechat_chat_id(chat_id)`**：
-  当 `allowed_chats = ["*"]` 时，允许所有正常好友（`wxid_*` 或自定义微信号）与群聊（`*@chatroom`），同时硬性过滤 `weixin`、`notifymessage`、`fmessage`、`medianote`、`floatbottle`、` filehelper`、`gh_*`（公众号）及 `@openim` 等系统伪账号。
+  当 `allowed_chats = ["*"]` 时，允许所有正常好友（`wxid_*` 或自定义微信号）与群聊（`*@chatroom`），同时硬性过滤 `_SYSTEM_WECHAT_TALKERS`（`weixin`、`notifymessage`、`fmessage`、`medianote`、`floatbottle`、`filehelper` 等 27 个系统伪账号）及 `gh_*`（公众号）。
 - **私聊与群聊双栈出站路由**：
   `WeChatRootDriver.send_message` 按优先级依次解析目标会话 ID：
   1. `message.message_info.group_info.group_id`（群聊）
@@ -153,7 +153,7 @@ flowchart LR
 为支持用户随时在 WebUI 切换 Profile（人设卡）或修改名字设定，系统构建了**平台物理身份与认知身份解耦的三层模型**：
 1. **三层身份分工**：
    - **平台物理层（Physical Platform Layer）**：由底层微信号（`self_wxid`，如 `wxid_w5d0efdxczt322`）作为不可变基石；全局昵称（`userinfo id=4`）与各群名片（`chatroom.displayname`）构成外部视角；
-   - **投影路由层（Projection & Routing Layer）**：[`projection.py`](../../src/platform_io/wechat/projection.py) 不再硬编码任何名字常量，通过 `get_bot_self_aliases()` 动态读取 `global_config.bot.nickname` 与 `alias_names` 维护 `name_to_wxid` 字典，确保无论艾特新旧人设名字还是底层 wxid 都能精确解析；
+   - **投影路由层（Projection & Routing Layer）**：[`projection.py`](../../src/platform_io/wechat/projection.py) 不再硬编码任何名字常量，通过 `get_dynamic_bot_aliases()` 动态读取 `global_config.bot.nickname`、`alias_names` 及双子槽位昵称维护 `name_to_wxid` 字典，确保无论艾特新旧人设名字还是底层 wxid 都能精确解析；
    - **认知与真值层（Cognitive & Truth Layer）**：以 `bot_config.toml` 为单一事实源，[`truth_db.py`](../../src/companion_vault/truth_db.py) 动态生成 `<自身账号与提及判定准则>`。
 2. **认知层双重身份排他准则（Dual-Identity Perception）**：
    在上下文头部显式注入模型自我认知与排他防漂移规则：

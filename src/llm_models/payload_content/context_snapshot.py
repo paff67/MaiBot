@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Any, List, Sequence, Tuple
 
 from .context_item import (
-    AssistantMessageItem, ContextAudioPart, ContextContentPart, ContextFileUriPart, ContextImagePart, ContextItem, ContextItemMeta,
+    AssistantMessageItem, ContextAudioPart, ContextBinaryPart, ContextContentPart, ContextFileUriPart, ContextImagePart, ContextItem, ContextItemMeta,
     ContextRefusalPart, ContextTextPart,
     ContextToolCall, FunctionCallItem, FunctionCallOutputItem, ProviderActivityItem, ProviderOpaqueItem,
     ReasoningItem, ReasoningRepresentation, SystemMessageItem, UserMessageItem,
@@ -94,6 +94,17 @@ def _serialize_content_parts(parts: Sequence[Any]) -> list[dict[str, Any]]:
                 }
             )
             continue
+        if isinstance(part, ContextBinaryPart):
+            parts_payload.append(
+                {
+                    "type": "binary",
+                    "data_base64": part.data_base64,
+                    "mime_type": part.mime_type,
+                    "file_code": part.file_code,
+                    "semantic_name": part.semantic_name,
+                }
+            )
+            continue
         if isinstance(part, ContextImagePart):
             parts_payload.append(
                 {
@@ -135,9 +146,25 @@ def _deserialize_content_parts(raw_parts: Any) -> Tuple[ContextContentPart, ...]
             audio_base64 = raw_part.get("audio_base64")
             mime_type = raw_part.get("mime_type", "audio/wav")
             file_code = raw_part.get("file_code", "")
-            if not isinstance(audio_base64, str) or not isinstance(mime_type, str):
+            if not isinstance(audio_base64, str) or not isinstance(mime_type, str) or not isinstance(file_code, str):
                 raise ValueError("音频 part 缺少 audio_base64 或 mime_type")
             parts.append(ContextAudioPart(audio_base64=audio_base64, mime_type=mime_type, file_code=file_code))
+            continue
+        if part_type == "binary":
+            data_base64 = raw_part.get("data_base64")
+            mime_type = raw_part.get("mime_type")
+            file_code = raw_part.get("file_code", "")
+            semantic_name = raw_part.get("semantic_name", "")
+            if not all(isinstance(value, str) for value in (data_base64, mime_type, file_code, semantic_name)):
+                raise ValueError("二进制附件 part 的 data_base64、mime_type、file_code、semantic_name 必须是字符串")
+            parts.append(
+                ContextBinaryPart(
+                    data_base64=data_base64,
+                    mime_type=mime_type,
+                    file_code=file_code,
+                    semantic_name=semantic_name,
+                )
+            )
             continue
         if part_type == "image":
             image_format = raw_part.get("image_format")

@@ -411,4 +411,56 @@ async def test_compute_ledger_twins_away_arc_st_slots_and_inline_media_bypass(tm
     fail_client.files.upload.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_compute_ledger_and_routing_respect_dynamic_thrifty_threshold(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ComputeLedger 与 runtime_bridge.get_twin_routing_state 必须统一遵循动态 thrifty_threshold_usd。"""
+    from src.config.config import global_config
 
+    db_path = tmp_path / "truth_dynamic_thr.db"
+    CompanionTruthDB(str(db_path)).close()
+
+    events: list[str] = []
+
+    async def on_away(bal: float) -> str:
+        events.append(f"away:{bal:.2f}")
+        return "动态阈值触发姐姐离场"
+
+    async def on_return(bal: float, arc: str) -> None:
+        events.append(f"return:{bal:.2f}:{arc}")
+
+    # 1. 上调阈值至 6.0 USD：余额 5.5 / 5.0 必须进入 THRIFTY 且触发离场与回归
+    monkeypatch.setattr(global_config.twin_economy, "thrifty_threshold_usd", 6.0)
+    monkeypatch.setattr(global_config.twin_economy, "hibernating_threshold_usd", 0.5)
+    monkeypatch.setattr(global_config.twin_economy, "supercharged_threshold_usd", 15.0)
+
+    ledger = ComputeLedger(
+        truth_db_path=db_path,
+        on_elder_away_enter=on_away,
+        on_elder_return=on_return,
+    )
+    await ledger.apply_remote_balance_reading(8.0, is_available=True)
+    ledger._active_persona_slot = PERSONA_SLOT_ELDER
+
+    snap_local = ledger.record_local_cost(2.5)
+    assert snap_local.balance_usd == 5.5
+    assert snap_local.tier_code == "THRIFTY"
+    assert snap_local.active_persona_slot == PERSONA_SLOT_YOUNGER
+    assert get_twin_routing_state(str(db_path))["force_younger_planner"] is True
+
+    snap_away = await ledger.apply_remote_balance_reading(5.0, is_available=True)
+    assert snap_away.tier_code == "THRIFTY"
+    assert snap_away.elder_away_arc == "动态阈值触发姐姐离场"
+    assert any(e == "away:5.00" for e in events)
+
+    snap_back = await ledger.apply_remote_balance_reading(7.0, is_available=True)
+    assert snap_back.tier_code == "STANDARD"
+    assert any(e.startswith("return:7.00:") for e in events)
+
+    # 2. 下调阈值至 1.5 USD：余额 2.2 应保持 STANDARD，不再被旧常量 3.0 误判锁定
+    monkeypatch.setattr(global_config.twin_economy, "thrifty_threshold_usd", 1.5)
+    snap_mid = await ledger.apply_remote_balance_reading(2.2, is_available=True)
+    assert snap_mid.tier_code == "STANDARD"
+    assert get_twin_routing_state(str(db_path))["force_younger_planner"] is False

@@ -22,6 +22,7 @@ from src.llm_models.model_client.base_client import GenerationAttempt
 from src.llm_models.payload_content.context_item import (
     AssistantMessageItem,
     ContextAudioPart,
+    ContextBinaryPart,
     ContextFileUriPart,
     ContextImagePart,
     ContextItem,
@@ -440,6 +441,9 @@ class PromptCLIVisualizer:
                 content.append((part.image_format, part.image_base64))
             elif isinstance(part, ContextAudioPart):
                 content.append(f"[音频: {part.mime_type} ({len(part.audio_base64)} 字符)]")
+            elif isinstance(part, ContextBinaryPart):
+                label = part.file_code or part.semantic_name or part.mime_type
+                content.append(f"[二进制附件: {part.mime_type} {label} ({len(part.data_base64)} 字符)]")
             elif isinstance(part, ContextFileUriPart):
                 content.append(f"[文件: {part.file_code or part.file_uri}]")
             elif isinstance(part, ContextRefusalPart):

@@ -163,12 +163,14 @@ class RetroReplyPromptMixin:
             self._active_slot_profile = prev_slot_profile
         system_blocks = [persona_prompt]
         session_id = self._resolve_session_id(stream_id)
+        self._last_is_owner_private = False
         if callable(getattr(self, "_resolve_is_owner_private", None)) and slot_profile is not None:
             is_owner_private, _ = self._resolve_is_owner_private(
                 session_id=session_id,
                 reply_message=reply_message,
                 reply_tool_args=reply_tool_args,
             )
+            self._last_is_owner_private = bool(is_owner_private)
             owner_priv_prompt = str(getattr(slot_profile, "owner_private_prompt", "") or "").strip()
             if is_owner_private and owner_priv_prompt:
                 system_blocks.append(f"【Owner 私聊专属指令】\n{owner_priv_prompt}")

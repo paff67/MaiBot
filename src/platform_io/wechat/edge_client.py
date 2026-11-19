@@ -5,10 +5,15 @@ from typing import Any, Deque, Dict, Optional
 import asyncio
 import hashlib
 import json
+import logging
 import random
 import time
 
 import httpx
+
+from .edge_tls import build_edge_httpx_kwargs
+
+logger = logging.getLogger(__name__)
 
 
 class WeChatEdgeClient:
@@ -17,16 +22,29 @@ class WeChatEdgeClient:
         source: str,
         account: str,
         *,
+        transport_url: Optional[str] = None,
         token: str = "",
         client=None,
+        ca_path: Optional[str] = None,
+        cert_path: Optional[str] = None,
+        key_path: Optional[str] = None,
         use_hook_send: bool = False,
         max_sends_per_minute: int = 6,
         max_sends_per_chat_per_minute: Optional[int] = None,
         rate_limit_wait_seconds: float = 0.0,
     ):
         self.source, self.account = source.rstrip("/"), account
+        self.transport_url = (str(transport_url).strip().rstrip("/") if transport_url else "") or self.source
         self.client = client or httpx.AsyncClient(
-            timeout=120, headers={"Authorization": "Bearer " + token} if token else {}
+            limits=httpx.Limits(max_keepalive_connections=0),
+            **build_edge_httpx_kwargs(
+                self.transport_url,
+                token=token,
+                timeout=120,
+                ca_path=ca_path,
+                cert_path=cert_path,
+                key_path=key_path,
+            ),
         )
         self.owns_client = client is None
         self.input_lock = asyncio.Lock()
@@ -96,7 +114,7 @@ class WeChatEdgeClient:
             await asyncio.sleep(min(remaining_budget, wait_needed + jitter))
 
     async def snapshot(self, chat_id: str) -> Dict[str, Any]:
-        response = await self.client.get(self.source + "/wechat/chat_snapshot")
+        response = await self.client.get(self.transport_url + "/wechat/chat_snapshot")
         response.raise_for_status()
         data = response.json()
         if data.get("protocol_version") != 2 or data.get("account") != self.account or data.get("chat_id") != chat_id:
@@ -126,7 +144,15 @@ class WeChatEdgeClient:
                 endpoint = "/wechat/send_quote"
             else:
                 endpoint = "/wechat/send_text"
-            response = await self.client.post(self.source + endpoint, json=payload)
+            try:
+                response = await self.client.post(self.transport_url + endpoint, json=payload)
+            except httpx.RemoteProtocolError as exc:
+                logger.warning(
+                    "WeChat edge send disconnected before response (%s), retrying once with request_id=%s",
+                    exc,
+                    request_id[:12],
+                )
+                response = await self.client.post(self.transport_url + endpoint, json=payload)
             if response.status_code == 429:
                 body = response.json()
                 raise ValueError(body.get("error") or "Edge per-minute send rate limit exceeded")
@@ -180,7 +206,7 @@ class WeChatEdgeClient:
                 request_id=request_id,
             )
             payload["tap_x"], payload["tap_y"] = state.input_box_center
-            response = await self.client.post(self.source + "/touch/input_text", json=payload)
+            response = await self.client.post(self.transport_url + "/touch/input_text", json=payload)
             response.raise_for_status()
             ack = response.json()
             if not ack.get("ok") or not ack.get("sent"):

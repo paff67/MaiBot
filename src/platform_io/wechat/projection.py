@@ -448,6 +448,7 @@ def project_message(record: Dict[str, Any]) -> Dict[str, Any]:
             "additional_config": {
                 "wechat_msg_id": record["msg_id"],
                 "wechat_revision": record["revision"],
+                "wechat_msg_type": kind,
                 "wechat_media_state": "resolve_from_vault" if kind != 1 else "text",
             },
         },

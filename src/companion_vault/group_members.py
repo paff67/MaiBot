@@ -91,13 +91,15 @@ async def sync_chat_directory_async(
     source: str,
     account: str,
     chat_id: str,
+    transport_url: Optional[str] = None,
 ) -> Optional[str]:
     if not truth_path or async_client is None or not chat_id:
         return None
     target_group = chat_id if chat_id.endswith("@chatroom") else "__contacts__"
+    http_base = (str(transport_url).strip() if transport_url else "") or source
     try:
         response = await async_client.get(
-            source.rstrip("/") + "/wechat/group_members",
+            http_base.rstrip("/") + "/wechat/group_members",
             params={"account": account, "group_id": target_group},
         )
         if response.status_code != 200:
@@ -117,9 +119,10 @@ async def sync_chat_directory_async(
         return None
 
 
-def sync_group(db, client, *, source, account, group_id):
+def sync_group(db, client, *, source, account, group_id, transport_url: Optional[str] = None):
+    http_base = (str(transport_url).strip() if transport_url else "") or source
     response = client.get(
-        source.rstrip("/") + "/wechat/group_members", params={"account": account, "group_id": group_id}
+        http_base.rstrip("/") + "/wechat/group_members", params={"account": account, "group_id": group_id}
     )
     response.raise_for_status()
     payload = response.json()
@@ -143,20 +146,31 @@ def main():
     parser.add_argument("operation", choices=["sync", "add", "remove", "list"])
     parser.add_argument("--db", default="data/companion_truth.db")
     parser.add_argument("--source", required=True)
+    parser.add_argument("--transport-url", default=os.environ.get("MAIBOT_EDGE_TRANSPORT_URL", ""))
     parser.add_argument("--account", required=True)
     parser.add_argument("--group", required=True)
     parser.add_argument("--user")
     args = parser.parse_args()
     source = args.source.rstrip("/")
+    eff_transport = str(args.transport_url or "").strip().rstrip("/") or source
     db = CompanionTruthDB(args.db)
     key = dict(source=source, account=args.account, group_id=args.group)
     try:
         if args.operation == "sync":
             import httpx
 
+            from src.platform_io.wechat.edge_tls import build_edge_httpx_kwargs
+
             token = os.environ.get("MAIBOT_EDGE_TOKEN", "")
-            with httpx.Client(timeout=30, headers={"Authorization": "Bearer " + token} if token else {}) as client:
-                print(json.dumps({"group": args.group, "members": sync_group(db.conn, client, **key)}))
+            with httpx.Client(**build_edge_httpx_kwargs(eff_transport, token=token, timeout=30)) as client:
+                print(
+                    json.dumps(
+                        {
+                            "group": args.group,
+                            "members": sync_group(db.conn, client, **key, transport_url=eff_transport),
+                        }
+                    )
+                )
         elif args.operation in ("add", "remove"):
             if not args.user:
                 parser.error("--user required")

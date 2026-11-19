@@ -710,14 +710,16 @@ def calculate_typing_time(
     english_time: float = 0.15,
     is_emoji: bool = False,
     is_image: bool = False,
+    max_typing_time: float = 3.5,
 ) -> float:
     """
     计算输入字符串所需的时间，中文和英文字符有不同的输入时间
         input_string (str): 输入的字符串
-        chinese_time (float): 中文字符的输入时间，默认为0.2秒
-        english_time (float): 英文字符的输入时间，默认为0.1秒
+        chinese_time (float): 中文字符的输入时间，默认为0.3秒
+        english_time (float): 英文字符的输入时间，默认为0.15秒
         is_emoji (bool): 是否为emoji，默认为False
         is_image (bool): 是否为纯图片消息，默认为False
+        max_typing_time (float): 模拟打字耗时封顶上限（秒），默认 3.5 秒，避免长气泡卡死发送链
 
     特殊情况：
     - 如果只有一个中文字符，将使用3倍的中文输入时间
@@ -731,7 +733,8 @@ def calculate_typing_time(
 
     # 如果只有一个中文字符，使用3倍时间
     if not (is_emoji or is_image) and chinese_chars == 1 and len(input_string.strip()) == 1:
-        return chinese_time * 3 + 0.3  # 加上回车时间
+        single_time = chinese_time * 3 + 0.3  # 加上回车时间
+        return min(single_time, max_typing_time) if max_typing_time > 0 else single_time
 
     # 正常计算所有字符的输入时间
     total_time = 0.0
@@ -744,6 +747,8 @@ def calculate_typing_time(
     if typing_speed <= 0:
         return 0
     total_time *= typing_speed
+    if max_typing_time > 0:
+        total_time = min(total_time, max_typing_time)
 
     # if time.time() - thinking_start_time > 10:
     #     total_time = 1

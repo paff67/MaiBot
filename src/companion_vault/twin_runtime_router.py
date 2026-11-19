@@ -57,6 +57,36 @@ def _text_mentions_any_name(text: str, names: Sequence[str]) -> bool:
     return False
 
 
+def _resolve_batch_slot_mentions(
+    batch_texts: Sequence[str],
+    elder_tokens: Sequence[str],
+    younger_tokens: Sequence[str],
+) -> Tuple[bool, bool, Optional[str]]:
+    """扫描整批消息文本，返回 (calls_elder, calls_younger, last_explicit_slot)。
+
+    当同一批次中先后呼唤两位姐妹时，按批次顺序以最后一次显式点名为准；
+    若同一条消息内同时提及两位姐妹（如“许妍让你姐姐看一下”），优先 sister_elder。
+    """
+    calls_elder = False
+    calls_younger = False
+    last_explicit_slot: Optional[str] = None
+    for raw in batch_texts:
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        hit_elder = _text_mentions_any_name(text, elder_tokens)
+        hit_younger = _text_mentions_any_name(text, younger_tokens)
+        if hit_elder:
+            calls_elder = True
+        if hit_younger:
+            calls_younger = True
+        if hit_elder:
+            last_explicit_slot = "sister_elder"
+        elif hit_younger:
+            last_explicit_slot = "sister_younger"
+    return calls_elder, calls_younger, last_explicit_slot
+
+
 async def _evolve_away_arc_background(
     ledger: ComputeLedger,
     director: TwinNarrativeDirector,
@@ -85,6 +115,7 @@ async def resolve_turn_route(
     person_id: str = "",
     is_group_chat: bool = False,
     latest_user_text: str = "",
+    batch_user_texts: Optional[Sequence[str]] = None,
     recent_context: str = "",
     batch_sender_ids: Optional[Sequence[str]] = None,
     mentions_bot: bool = False,
@@ -253,6 +284,15 @@ async def resolve_turn_route(
             elder_profile=elder_profile,
         )
 
+    # 收集整批消息文本，避免末尾表情/短消息（如 [合十]）淹没同批前序消息中的点名/唤姐意图
+    effective_batch_texts: list[str] = [
+        str(t).strip() for t in (batch_user_texts or ()) if str(t or "").strip()
+    ]
+    clean_latest_text = str(latest_user_text or "").strip()
+    if clean_latest_text and (not effective_batch_texts or effective_batch_texts[-1] != clean_latest_text):
+        effective_batch_texts.append(clean_latest_text)
+    routing_text = "\n".join(effective_batch_texts)
+
     # Step C: 吃紧省流态 (hibernating <= balance_usd < thrifty_threshold_usd)
     if balance_usd < thrifty_threshold:
         away_arc = str(snapshot.elder_away_arc or "").strip()
@@ -265,8 +305,8 @@ async def resolve_turn_route(
             elder_names.extend(str(a) for a in (getattr(elder_profile, "alias_names", []) or []) if str(a).strip())
         if not elder_names:
             elder_names = ["许玥", "玥姐", "阿玥"]
-        calls_elder = bool(twin_mode_enabled and _text_mentions_any_name(latest_user_text, [*elder_names, "姐姐"]))
-        excerpt = recent_context.strip() or latest_user_text.strip()
+        calls_elder = bool(twin_mode_enabled and _text_mentions_any_name(routing_text, [*elder_names, "姐姐"]))
+        excerpt = recent_context.strip() or routing_text or clean_latest_text
         note = ""
 
         if not away_arc:
@@ -389,9 +429,15 @@ async def resolve_turn_route(
             bot_names.append(str(resolved_bot.nickname))
         bot_names.extend(str(a) for a in (getattr(resolved_bot, "alias_names", []) or []))
 
-    calls_elder = bool(twin_mode_enabled and _text_mentions_any_name(latest_user_text, [*elder_names, "姐姐"]))
-    calls_younger = bool(twin_mode_enabled and _text_mentions_any_name(latest_user_text, [*younger_names, "妹妹"]))
-    mentions_any = bool(mentions_bot or _text_mentions_any_name(latest_user_text, bot_names))
+    if twin_mode_enabled:
+        calls_elder, _calls_younger, last_explicit_slot = _resolve_batch_slot_mentions(
+            effective_batch_texts,
+            [*elder_names, "姐姐"],
+            [*younger_names, "妹妹"],
+        )
+    else:
+        calls_elder, last_explicit_slot = False, None
+    mentions_any = bool(mentions_bot or _text_mentions_any_name(routing_text, bot_names))
 
     use_argon_planner = (
         is_owner_private
@@ -407,9 +453,9 @@ async def resolve_turn_route(
     else:
         allowed_slots = ("sister_younger", "sister_elder")
         forced_slot = None
-        if calls_younger and not calls_elder:
-            recommended_slot = "sister_younger"
-        elif calls_elder or (bool(return_note) and is_owner_private) or (compute_tier == "SUPERCHARGED" and is_owner_private):
+        if last_explicit_slot is not None:
+            recommended_slot = last_explicit_slot
+        elif (bool(return_note) and is_owner_private) or (compute_tier == "SUPERCHARGED" and is_owner_private):
             recommended_slot = "sister_elder"
         else:
             recommended_slot = "sister_younger"

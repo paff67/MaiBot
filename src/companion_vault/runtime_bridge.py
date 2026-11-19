@@ -154,9 +154,12 @@ def get_twin_routing_state(db_path: str = DEFAULT_TRUTH_DB_PATH) -> Dict[str, An
         ).fetchone()
         if row is None:
             return default_state
+        from .compute_ledger import ComputeLedger
+
+        _, thr, _, _, _, _ = ComputeLedger._resolve_economy_settings()
         tier = str(row["fairy_compute_tier"] or "STANDARD")
         eff_bal = max(0.0, float(row["fairy_remote_balance_usd"] or 5.0) - float(row["fairy_unsettled_cost_usd"] or 0.0))
-        force_younger = tier in ("THRIFTY", "HIBERNATING") or eff_bal < 3.0
+        force_younger = tier in ("THRIFTY", "HIBERNATING") or eff_bal < thr
         slot = "sister_younger" if force_younger else (str(row["active_persona_slot"] or "sister_younger").strip() or "sister_younger")
         mode = str(row["chat_execution_mode"] or "dual_director").strip()
         if mode not in ("dual_director", "one_pass_st"):
@@ -271,6 +274,10 @@ async def build_planner_truth_catalog_async(
                 enriched_files = []
                 for r in file_rows:
                     entry = {k: r[k] for k in ("file_code", "semantic_name", "mime_type")}
+                    if r.get("drive_url"):
+                        entry["drive_url"] = r["drive_url"]
+                    else:
+                        entry["drive_status"] = r.get("drive_status") or "pending"
                     if has_links:
                         link_row = db.conn.execute(
                             "SELECT msg_id FROM message_asset_links WHERE file_code=? AND account=? AND active=1 "

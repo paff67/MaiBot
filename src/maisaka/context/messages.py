@@ -530,6 +530,16 @@ def _build_item_from_sequence(
                 file_code=part.get("file_code", ""),
             )
             has_content = True
+        elif part.get("binary_base64") or part.get("pdf_base64"):
+            binary_data = part.get("binary_base64") or part.get("pdf_base64")
+            default_mime = "application/pdf" if part.get("pdf_base64") else "application/octet-stream"
+            builder.add_binary_base64_part(
+                data_base64=binary_data,
+                mime_type=part.get("mime_type", default_mime),
+                file_code=part.get("file_code", ""),
+                semantic_name=part.get("semantic_name", ""),
+            )
+            has_content = True
         elif "file_uri" in part and part["file_uri"]:
             builder.add_file_uri_part(
                 part["file_uri"],

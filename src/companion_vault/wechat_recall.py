@@ -443,21 +443,37 @@ async def hydrate_wechat_history_media_async(
 
 
 def _append_descriptor_part(builder, part: Dict[str, Any]) -> None:
-    if "text" in part:
-        builder.add_text_content(part["text"])
-    elif "image_base64" in part:
+    if part.get("text"):
+        builder.add_text_content(str(part["text"]))
+    elif part.get("image_base64"):
         builder.add_image_base64_part(
             image_format=part.get("image_format", "jpeg"),
             image_base64=part["image_base64"],
         )
-    elif "audio_base64" in part:
+    elif part.get("audio_base64"):
         builder.add_audio_base64_part(
             audio_base64=part["audio_base64"],
             mime_type=part.get("mime_type", "audio/wav"),
             file_code=part.get("file_code", ""),
         )
+    elif part.get("binary_base64") or part.get("pdf_base64"):
+        binary_data = part.get("binary_base64") or part.get("pdf_base64")
+        default_mime = "application/pdf" if part.get("pdf_base64") else "application/octet-stream"
+        builder.add_binary_base64_part(
+            data_base64=binary_data,
+            mime_type=part.get("mime_type", default_mime),
+            file_code=part.get("file_code", ""),
+            semantic_name=part.get("semantic_name", ""),
+        )
+    elif part.get("file_uri"):
+        builder.add_file_uri_part(
+            part["file_uri"],
+            part.get("mime_type", "application/octet-stream"),
+            part.get("file_code", ""),
+        )
     else:
-        builder.add_file_uri_part(part["file_uri"], part["mime_type"], part["file_code"])
+        label = part.get("semantic_name") or part.get("file_code") or part.get("mime_type") or "attachment"
+        builder.add_text_content(f"[附件: {label}]")
 
 
 def quote_context_item(block, descriptors):

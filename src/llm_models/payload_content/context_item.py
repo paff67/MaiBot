@@ -119,6 +119,20 @@ class ContextAudioPart:
 
 
 @dataclass(frozen=True, slots=True)
+class ContextBinaryPart:
+    """不可变通用内联二进制附件片段（如 PDF、短视频）。"""
+
+    data_base64: str
+    mime_type: str
+    file_code: str = ""
+    semantic_name: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.data_base64.strip() or not self.mime_type.strip():
+            raise ValueError("二进制附件 base64 与 MIME 类型不能为空")
+
+
+@dataclass(frozen=True, slots=True)
 class ContextFileUriPart:
     """不可变原生多模态文件句柄。"""
 
@@ -142,7 +156,14 @@ class ContextRefusalPart:
             raise ValueError("拒答内容不能为空")
 
 
-ContextContentPart: TypeAlias = ContextTextPart | ContextImagePart | ContextAudioPart | ContextFileUriPart | ContextRefusalPart
+ContextContentPart: TypeAlias = (
+    ContextTextPart
+    | ContextImagePart
+    | ContextAudioPart
+    | ContextBinaryPart
+    | ContextFileUriPart
+    | ContextRefusalPart
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -504,6 +525,37 @@ class ContextItemBuilder:
     ) -> "ContextItemBuilder":
         return self.add_audio_base64_part(audio_base64=audio_base64, mime_type=mime_type, file_code=file_code)
 
+    def add_binary_base64_part(
+        self,
+        data_base64: str,
+        mime_type: str,
+        file_code: str = "",
+        semantic_name: str = "",
+    ) -> "ContextItemBuilder":
+        self.__parts.append(
+            ContextBinaryPart(
+                data_base64=data_base64,
+                mime_type=mime_type,
+                file_code=file_code,
+                semantic_name=semantic_name,
+            )
+        )
+        return self
+
+    def add_binary_content(
+        self,
+        data_base64: str,
+        mime_type: str,
+        file_code: str = "",
+        semantic_name: str = "",
+    ) -> "ContextItemBuilder":
+        return self.add_binary_base64_part(
+            data_base64=data_base64,
+            mime_type=mime_type,
+            file_code=file_code,
+            semantic_name=semantic_name,
+        )
+
     def set_tool_call_id(self, tool_call_id: str) -> "ContextItemBuilder":
         if self.__role != RoleType.Tool:
             raise ValueError("仅当角色为 Tool 时才能设置工具调用 ID")
@@ -716,6 +768,7 @@ __all__ = [
     "AssistantMessageItem",
     "CONTEXT_ITEM_SCHEMA_VERSION",
     "ContextAudioPart",
+    "ContextBinaryPart",
     "ContextContentPart",
     "ContextFileUriPart",
     "ContextImagePart",

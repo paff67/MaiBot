@@ -192,6 +192,10 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
             if user_info is not None:
                 sender_id = str(getattr(user_info, "user_id", "") or "").strip()
                 person_id = str(getattr(user_info, "person_id", "") or "").strip()
+                # 私聊场景下若引用/回复目标恰好是 Bot 自身消息，改用会话对端 user_id 校验 Owner 身份
+                if is_group_chat is False and sender_id and is_bot_self(platform, sender_id):
+                    sender_id = ""
+                    person_id = ""
         if not sender_id and getattr(self, "chat_stream", None) is not None:
             sender_id = str(getattr(self.chat_stream, "user_id", "") or "").strip()
             platform = str(getattr(self.chat_stream, "platform", "") or platform).strip() or platform
@@ -314,6 +318,7 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
         is_owner_private: bool,
         chat_history: List[LLMContextMessage],
         reply_message: Optional[SessionMessage],
+        persona_slot: str = "",
     ) -> Optional[Any]:
         """若当前槽位绑定了 PersonaV2Card，编译其静态主干、动态覆写与 MVU 实时状态块。"""
         if slot_profile is None:
@@ -345,6 +350,7 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
                     is_owner_private=is_owner_private,
                     recent_text=recent_text,
                     mvu_enabled_override=mvu_enabled,
+                    persona_slot=persona_slot,
                 )
             finally:
                 if db is not None:
@@ -1160,6 +1166,7 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
             is_owner_private=is_owner_private,
             chat_history=chat_history,
             reply_message=reply_message,
+            persona_slot=persona_slot,
         )
         self._last_persona_v2_turn = v2_turn
         self._last_is_owner_private = is_owner_private
@@ -1225,6 +1232,7 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
             self._active_slot_profile = prev_slot_profile
             self._active_persona_slot = prev_persona_slot
 
+        recalled_media_parts = self._collect_st_recalled_media_parts(args)
         ctx = STCompileContext(
             char_name=bot_name,
             user_name=user_name,
@@ -1249,6 +1257,7 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
             mvu_update_instruction=v2_turn.mvu_update_instruction_block if v2_turn is not None else "",
             external_tools=list(args.get("_external_tools") or []),
             tool_observations=list(args.get("_tool_observations") or []),
+            recalled_media_parts=recalled_media_parts,
         )
         compiled = engine.compile_to_context_items(ctx)
         self._last_st_compiled_request = compiled
@@ -1257,7 +1266,30 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
         return compiled.context_items
 
     @staticmethod
-    def _build_recalled_messages(reply_tool_args: Optional[Dict[str, Any]]) -> List[ContextItem]:
+    def _collect_st_recalled_media_parts(reply_tool_args: Optional[Dict[str, Any]]) -> List[Any]:
+        """收集 ST 模式本轮召回与工具观测返回的多模态原件并按文件标识去重。"""
+        if not reply_tool_args:
+            return []
+        merged: List[Any] = []
+        seen_keys: set[tuple[str, int, str]] = set()
+        for source_key in ("_recalled_file_parts", "_tool_observation_file_parts"):
+            for part in list(reply_tool_args.get(source_key) or []):
+                if isinstance(part, dict):
+                    file_code = str(part.get("file_code") or "").strip()
+                    if file_code:
+                        dedupe_key = (
+                            file_code,
+                            int(part.get("part_index", 0) or 0),
+                            str(part.get("mime_type") or ""),
+                        )
+                        if dedupe_key in seen_keys:
+                            continue
+                        seen_keys.add(dedupe_key)
+                merged.append(part)
+        return merged
+
+    @classmethod
+    def _build_recalled_messages(cls, reply_tool_args: Optional[Dict[str, Any]]) -> List[ContextItem]:
         """装载层产物按原生文件句柄传入，不转换为文字描述。"""
         if reply_tool_args is None:
             return []
@@ -1265,7 +1297,7 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
         memory_block = reply_tool_args.get("_recalled_memory_block", "")
         if memory_block:
             items.append(ContextItemBuilder().set_role(RoleType.User).add_text_part(memory_block).build())
-        file_parts = reply_tool_args.get("_recalled_file_parts", [])
+        file_parts = cls._collect_st_recalled_media_parts(reply_tool_args)
         if file_parts:
             builder = ContextItemBuilder().set_role(RoleType.User)
             builder.add_text_part("【系统已为你挂载点亮的历史原文件，请直接查看原文件画面/音频/文档作答】")
@@ -1282,6 +1314,15 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
                         audio_base64=part["audio_base64"],
                         mime_type=part.get("mime_type", "audio/wav"),
                         file_code=part.get("file_code", ""),
+                    )
+                elif part.get("binary_base64") or part.get("pdf_base64"):
+                    binary_data = part.get("binary_base64") or part.get("pdf_base64")
+                    default_mime = "application/pdf" if part.get("pdf_base64") else "application/octet-stream"
+                    builder.add_binary_base64_part(
+                        data_base64=binary_data,
+                        mime_type=part.get("mime_type", default_mime),
+                        file_code=part.get("file_code", ""),
+                        semantic_name=part.get("semantic_name", ""),
                     )
                 elif 'file_uri' in part and part['file_uri']:
                     builder.add_file_uri_part(part["file_uri"], part["mime_type"], part.get("file_code", ""))
@@ -1368,6 +1409,7 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
             is_owner_private=is_owner_private,
             chat_history=chat_history,
             reply_message=reply_message,
+            persona_slot=persona_slot,
         )
         self._last_persona_v2_turn = v2_turn
         self._last_is_owner_private = is_owner_private
@@ -1677,11 +1719,13 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
             result.output_items = preview.payload["output_items"]
 
     def _reset_st_request_state(self) -> None:
-        """清理上一次请求的 ST 编译状态，避免跨请求泄漏校验策略。"""
+        """清理上一次请求的 ST 编译状态，避免跨请求泄漏校验策略与私聊身份。"""
         self._last_st_compiled_request = None
         self._last_st_output_mode = "im_clean"
         self._last_st_reply_tool_args = None
         self._last_request_used_st = False
+        self._last_is_owner_private = False
+        self._last_persona_v2_turn = None
 
     def _build_generation_options(
         self,
@@ -2428,8 +2472,17 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
             from src.companion_vault.mvu_engine import MVURuntimeEngine
             from src.companion_vault.persona_v2_engine import get_persona_v2_manager
 
-            v2_card = get_persona_v2_manager().resolve_card_for_profile(active_slot_profile)
-            if v2_card is not None:
+            mvu_enabled = bool(getattr(active_slot_profile, "mvu_enabled", True)) and bool(
+                getattr(global_config.personality, "mvu_enabled", True)
+            )
+            v2_mgr = get_persona_v2_manager()
+            compiled_v2_turn = getattr(self, "_last_persona_v2_turn", None)
+            v2_card = None
+            if use_precomputed and compiled_v2_turn is not None and getattr(compiled_v2_turn, "card_id", ""):
+                v2_card = v2_mgr.get_card(str(compiled_v2_turn.card_id))
+            if v2_card is None:
+                v2_card = v2_mgr.resolve_card_for_profile(active_slot_profile)
+            if v2_card is not None and mvu_enabled:
                 is_owner_priv = bool(getattr(self, "_last_is_owner_private", False))
                 truth_db_path = (
                     os.environ.get("MAIBOT_TRUTH_DB_PATH", "").strip()
@@ -2439,10 +2492,18 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
                 try:
                     os.makedirs(os.path.dirname(truth_db_path) or ".", exist_ok=True)
                     db = runtime_bridge._open_truth_db(truth_db_path)
+                    # STPresetEngine.unwrap_response 已完整提取过 raw/clean 里的 <UpdateVariable>，
+                    # 不得再次把 raw_llm_response_text 传入 raw_sources，避免同一 delta 被双倍结算。
+                    if unwrapped_st_output is not None:
+                        mvu_raw_sources = (
+                            [response_text] if "<updatevariable" in response_text.lower() else []
+                        )
+                    else:
+                        mvu_raw_sources = [raw_llm_response_text, response_text]
                     mvu_res = MVURuntimeEngine.apply_turn_updates(
                         db,
                         v2_card,
-                        [raw_llm_response_text, response_text],
+                        mvu_raw_sources,
                         is_owner_private=is_owner_priv,
                         pre_extracted_ops=unwrapped_st_output.mvu_patches if unwrapped_st_output is not None else None,
                         pre_extracted_analysis=unwrapped_st_output.mvu_analysis if unwrapped_st_output is not None else "",

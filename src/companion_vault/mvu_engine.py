@@ -280,8 +280,8 @@ class MVURuntimeEngine:
         """
         加载当前轮次可见的 MVU 变量字典（含 Layer 1 只读系统变量 + Layer 2 `shared:twin_xu` 共享变量 + Layer 3 角色独立变量）：
         - Fail-Closed：当 `is_owner_private == False` 时，仅返回 `visibility == 'PUBLIC'` 的变量，
-          且底层 SQL 仅查询 `visibility = 'PUBLIC' AND scope_key = 'GLOBAL_PUBLIC'`（如共享的 `apartment_scene` 可见，
-          而共享的 `love_locked` 物理隔离不可见）。
+          且底层 SQL 仅查询 `visibility = 'PUBLIC' AND scope_key = 'GLOBAL_PUBLIC'`（共享的 `apartment_scene` 与
+          `love_locked` 等 PRIVATE 变量均物理隔离不可见）。
         """
         allowed_schemas = [
             v
@@ -515,8 +515,32 @@ class MVURuntimeEngine:
                 "- 当前处于公共/非Owner会话：仅允许更新 PUBLIC 公开状态变量，严禁输出或修改任何 PRIVATE 私密变量。"
             )
 
-        if custom_instr:
+        if is_owner_private and custom_instr:
             lines.append(f"- 角色专属变量演进细则：{custom_instr}")
+
+        example_patches: List[str] = []
+        first_str_var = next((v for v in visible_schemas if v.type == "string"), None)
+        if first_str_var is not None:
+            sample_val = (
+                first_str_var.enum_values[0]
+                if first_str_var.enum_values
+                else "平稳"
+            )
+            example_patches.append(
+                f'  {{"op": "replace", "path": "/{first_str_var.key}", "value": {json.dumps(sample_val, ensure_ascii=False)}}}'
+            )
+        if is_owner_private and any(v.key == guard.target_var for v in visible_schemas):
+            example_patches.append(
+                f'  {{"op": "delta", "path": "/{guard.target_var}", "value": 1}}'
+            )
+        if not example_patches:
+            first_var = visible_schemas[0]
+            if first_var.type == "number":
+                example_patches.append(f'  {{"op": "delta", "path": "/{first_var.key}", "value": 1}}')
+            elif first_var.type == "boolean":
+                example_patches.append(f'  {{"op": "replace", "path": "/{first_var.key}", "value": true}}')
+            else:
+                example_patches.append(f'  {{"op": "replace", "path": "/{first_var.key}", "value": "平稳"}}')
 
         lines.extend(
             [
@@ -525,8 +549,7 @@ class MVURuntimeEngine:
                 "<Analysis>简述本轮变量变化的原因与幅度校验</Analysis>",
                 "<JSONPatch>",
                 "[",
-                '  {"op": "replace", "path": "/current_mood", "value": "平稳"},',
-                '  {"op": "delta", "path": "/affection", "value": 1}',
+                ",\n".join(example_patches),
                 "]",
                 "</JSONPatch>",
                 "</UpdateVariable>",
@@ -667,11 +690,14 @@ class MVURuntimeEngine:
 
         combined_ops: List[Dict[str, Any]] = list(pre_extracted_ops or [])
         analyses: List[str] = [pre_extracted_analysis] if pre_extracted_analysis else []
+        seen_raw_sources: set[str] = set()
 
         for src in raw_sources:
-            if not src:
+            clean_src = str(src or "").strip()
+            if not clean_src or clean_src in seen_raw_sources:
                 continue
-            _, ops, analysis = cls.extract_and_strip_update_variable(src)
+            seen_raw_sources.add(clean_src)
+            _, ops, analysis = cls.extract_and_strip_update_variable(clean_src)
             if ops:
                 combined_ops.extend(ops)
             if analysis and analysis not in analyses:
@@ -701,7 +727,9 @@ class MVURuntimeEngine:
             key=lambda item: 1 if item.get("key") == target_aff_key else 0,
         )
 
+        initial_vars: Dict[str, Any] = dict(current_vars)
         changes: List[MVUVariableChange] = []
+        change_index_by_key: Dict[str, int] = {}
         now_iso = datetime.now(timezone.utc).isoformat()
 
         for patch in ordered_ops:
@@ -758,14 +786,18 @@ class MVURuntimeEngine:
                 except Exception:
                     continue
 
-                # 潜令V1.8 好感度护栏
+                # 潜令V1.8 好感度护栏：按整轮初始基准值累计限幅，防止同轮多条补丁叠加击穿 [-1, +5]
                 if guard.enabled and vkey == target_aff_key:
-                    raw_delta = candidate_num - old_num
+                    try:
+                        turn_initial_num = float(initial_vars.get(target_aff_key, old_num))
+                    except Exception:
+                        turn_initial_num = old_num
+                    cumulative_delta = candidate_num - turn_initial_num
                     clamped_delta = max(
                         float(guard.min_delta_per_turn),
-                        min(float(guard.max_delta_per_turn), raw_delta),
+                        min(float(guard.max_delta_per_turn), cumulative_delta),
                     )
-                    candidate_num = old_num + clamped_delta
+                    candidate_num = turn_initial_num + clamped_delta
                     is_locked = bool(
                         current_vars.get(
                             lock_var_key,
@@ -844,16 +876,37 @@ class MVURuntimeEngine:
                 except Exception as exc:
                     logger.warning(f"持久化 MVU 变量失败 ({storage_cid}.{storage_vkey}): {exc}")
 
-            changes.append(
-                MVUVariableChange(
+            if vkey in change_index_by_key:
+                existing_change = changes[change_index_by_key[vkey]]
+                turn_old_val = existing_change.old
+                net_delta: Optional[float] = None
+                if vschema.type == "number":
+                    try:
+                        net_delta = round(float(new_val) - float(turn_old_val), 4)
+                    except Exception:
+                        net_delta = None
+                changes[change_index_by_key[vkey]] = MVUVariableChange(
                     key=vkey,
                     label=vschema.label,
-                    old=old_val,
+                    old=turn_old_val,
                     new=new_val,
-                    delta=delta_val,
+                    delta=net_delta,
                     visibility=vschema.visibility,
                 )
-            )
+            else:
+                change_index_by_key[vkey] = len(changes)
+                changes.append(
+                    MVUVariableChange(
+                        key=vkey,
+                        label=vschema.label,
+                        old=old_val,
+                        new=new_val,
+                        delta=delta_val,
+                        visibility=vschema.visibility,
+                    )
+                )
+
+        changes = [c for c in changes if c.new != c.old]
 
         active_stage = cls.resolve_active_stage(
             card, current_vars, is_owner_private=is_owner_private

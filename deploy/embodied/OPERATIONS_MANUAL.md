@@ -2,9 +2,30 @@
 
 > **最后更新**：2026-11-19
 > **生产版本边界**：运行目录不是 Git 工作树。不能用远端 `main` 的提交推定线上版本；以发布清单、文件摘要和服务探针为准。
-> **当前热修复**：`feat/phase6-twins-native-runtime` 上的 `ed77a1304`；本次仅发布该提交中的 9 个运行时文件，不含测试和前端产物。
+> **当前热修复**：`feat/phase6-twins-native-runtime` 本地工作区（基于 `2ee3dd8e5`）；本次发布 15 个 Python 运行时文件 + 6 个内置 Persona V2 模板（同步热修线上 `data/personas/*.json` 并保留自定义 `aliases`），不含测试和前端产物。
 
 ---
+
+## 2026-11-19 方案 A：`source` 与 `transport_url` 解耦及全链路 mTLS（`:8443`）切换发布记录
+
+为在不改动 `message_ledger.db` 与 `companion_truth.db` 历史 `source='http://100.87.39.37:8765'` 主键及游标的前提下启用应用层双向 TLS（mTLS）认证，已完成代码解耦并灰度切换线上全量流量：
+
+1. **逻辑键与物理传输解耦（无损保留游标）**：更新 `/opt/maibot-brain` 下 7 个运行时文件（`src/platform_io/wechat/edge_client.py`、`driver.py`、`message_ingestor.py`、`src/companion_vault/message_media_worker.py`、`media_ingestor.py`、`group_members.py`、`src/phone_edge/notification_inbox.py`，SHA-256 逐一核验通过），新增 `transport_url` / `MAIBOT_EDGE_TRANSPORT_URL` 物理通信层配置；`source` / `MAIBOT_EDGE_URL` 继续冻结为 `'http://100.87.39.37:8765'` 作为数据库主键。
+2. **私有 PKI 与 `jp-main:8443` mTLS 中继**：在 `jp-main` 签发自建 Root CA（10 年期，`/etc/maibot-mtls/ca.crt`）、服务端证书（`CN=100.87.39.37`、`SAN=IP:100.87.39.37`）与 `DMIT-US` 客户端证书（`CN=dmit-us-brain`，私钥仅留存 `DMIT-US:/etc/maibot-mtls/client.key` `chmod 600` 并已从 `jp-main` 清理）。部署 `/usr/local/bin/maibot-mtls-relay.py` 与 `maibot-edge-mtls-relay.service`（TLS 1.2+ + `ssl.CERT_REQUIRED` 强制双向认证，监听 `100.87.39.37:8443` 转发至手机 `100.115.216.110:8765`）。
+3. **验证与切换**：在 `DMIT-US` 通过 3 项 `curl` 门禁测试（合法证书 200、缺客户端证书 rc=56 拒绝、未信 CA rc=60 拒绝）后，更新 `/etc/maibot-media.env`（`MAIBOT_EDGE_TRANSPORT_URL=https://100.87.39.37:8443` 与 `MAIBOT_MTLS_*`）及 `config/wechat_driver.toml`（新增 `transport_url`），重启 `maibot-main`、`maibot-message-ingest`、`maibot-message-media`、`maibot-drive-sync`。随后已在 `jp-main` 停用并禁用旧明文监听 `maibot-edge-relay.service`（`:8765` 端口已关闭，仅保留单元文件备回滚）。
+4. **切流后实测验收**：`jp-main` 仅 `100.87.39.37:8443` 监听；`DMIT-US` 全部 6 项服务 `active`，WebUI `http://127.0.0.1:8001/openapi.json` 返回 200，`127.0.0.1:18790` 正常监听；`message_ledger.db` 中 `source_cursors` / `messages` / `source_health` 的 `source` 唯一且保持 `'http://100.87.39.37:8765'`，`source_health.error = None`，在关闭 `:8765` 后 `maibot-message-ingest` 持续无报错推进心跳游标 `38312`。
+
+回滚包位于 DMIT-US `/opt/maibot-backups/option-a-mtls-20261119-IMydmK/before.tar`（含上述 7 个 Python 文件、`config/wechat_driver.toml` 与 `/etc/maibot-media.env`，共 9 个文件，SHA-256 `2f3a9eb6b4405b4840779e869668e6d4f4d886dbdcaad01d3059739406f1e732`）。如需紧急回滚：先在 `jp-main` 执行 `systemctl enable --now maibot-edge-relay.service` 恢复 `:8765`，再在 `DMIT-US` 恢复 `before.tar`（注意 `/etc/maibot-media.env` 在归档内路径为 `etc/maibot-media.env`），重启上述 4 项服务并复查 `source_health` 与 `/openapi.json`。
+
+## 2026-11-19 第一批隐私隔离 / MVU 耦合修复与 mTLS 客户端发布记录
+
+DMIT-US 运行目录 `/opt/maibot-brain` 已部署本批次 15 个 Python 文件（含新增 `src/platform_io/wechat/edge_tls.py`、全量 6 个边缘 `httpx` 客户端 mTLS 接入、Batch 1 A1/A2/C1/C2 隐私隔离与 MVU 修复以及动态 `thrifty_threshold_usd` 阈值修复）及 6 个去敏后的内置 Persona V2 模板，并同步更新线上 `data/personas/*.json` 的 `planner_summary` 与双子卡 `apartment_scene`（收紧为 `PRIVATE`）同时保留用户自定义 `aliases`。部署后逐一校验 21 个发布文件 SHA-256 全部通过，并通过 `ensure_card_mvu_defaults` 将 `companion_truth.db` 内 `apartment_scene` 历史公开行平滑迁移至 `OWNER_PRIVATE / PRIVATE`。
+
+重启 `maibot-main`、`maibot-message-ingest`、`maibot-message-media`、`maibot-drive-sync` 后，6 个核心服务均为 `active`，`http://127.0.0.1:8001/openapi.json` 返回 200，`127.0.0.1:18790` 正常监听，`maibot-message-ingest` 延续游标 `38312` 无报错运行，4 个重启服务启动日志零异常。
+
+> **注（mTLS 传输切换边界）**：线上客户端现已全面支持 `MAIBOT_MTLS_CA` / `MAIBOT_MTLS_CERT` / `MAIBOT_MTLS_KEY`（对 `https://` 端点生效、`http://` 端点保持零侵入兼容）。核查现状发现 `DMIT-US`（`100.84.36.67`）与 `jp-main`（`100.87.39.37:8765`）当前仍在 Tailscale 加密隧道内使用 `http://100.87.39.37:8765`，尚未生成 `/etc/maibot-mtls` 证书与 `:8443` TLS 监听，且 `message_ledger.db` / `companion_truth.db` 全部游标与溯源主键均以 `source='http://100.87.39.37:8765'` 索引；因此本次仅上线客户端 mTLS 能力，未擅自更改线上 URL 或改写数据库主键。
+
+回滚包位于 DMIT-US `/opt/maibot-backups/batch1-mtls-20261119-i6DSm2/before.tar`（涵盖全部 26 个旧文件，SHA-256 `77e5a170b49510cdcdaca18405b0d3c10e2a00605b263bf89e42b4ca4e9e640f`）及一致性数据库备份 `companion_truth.before.db`（SHA-256 `567d99fdfeb3203c28b8a6567f3759c22ae1dbbf3791d42389e97ecbdba89204`）。回滚时从 `/opt/maibot-brain` 解压 `before.tar`、移除新增的 `src/platform_io/wechat/edge_tls.py`（如需回滚 `apartment_scene` 可见性再酌情恢复 `mvu_variables`），重启上述 4 项服务并复查探针。
 
 ## 2026-11-19 微信直答修复发布记录
 
@@ -21,8 +42,8 @@ DMIT-US 的 `maibot-main` 从 `/opt/maibot-brain` 运行。本次从发布包更
 | 节点角色 | 主机标识 | 访问方式 / 端口 | 核心路径 |
 | :--- | :--- | :--- | :--- |
 | **云端主脑 (`DMIT-US`)** | `DMIT-US` | `ssh DMIT-US` | 代码与运行目录：`/opt/maibot-brain`<br/>环境配置文件：`/etc/maibot-media.env`<br/>mTLS 证书目录：`/etc/maibot-mtls/`<br/>Google Drive 挂载：`/mnt/gdrive/companion_vault` |
-| **亚太中继 (`jp-main`)** | `jp-main` | `ssh jp-main` | mTLS 边缘中继：`https://100.90.156.92:8443` / `http://100.87.39.37:8765` |
-| **手机边缘端 (`小米 10 / umi`)** | Android 13 / MIUI 14 (APatch Root) | 本机 ADB (`adb shell`) 或经 `DMIT-US` mTLS 访问 `https://100.90.156.92:8443` | 边缘服务目录：`/data/adb/maibot_edge`<br/>设备守护目录：`/data/adb/device_services`<br/>微信单写者日志：`/data/user/0/com.tencent.mm/files/maibot_message_journal.db` |
+| **亚太中继 (`jp-main`)** | `jp-main` | `ssh jp-main` | mTLS 边缘中继（`maibot-edge-mtls-relay.service`）：`https://100.87.39.37:8443`（`100.87.39.37:8765` 明文入口已停用） |
+| **手机边缘端 (`小米 10 / umi`)** | Android 13 / MIUI 14 (APatch Root) | 本机 ADB (`adb shell`) 或经 `DMIT-US` mTLS 访问 `https://100.87.39.37:8443` | 边缘服务目录：`/data/adb/maibot_edge`<br/>设备守护目录：`/data/adb/device_services`<br/>微信单写者日志：`/data/user/0/com.tencent.mm/files/maibot_message_journal.db` |
 
 ---
 
@@ -147,13 +168,14 @@ block_ids = []
    - 控制命令：
      ```bash
      adb shell su -c "sh /data/adb/device_services/control.sh status"
-     adb shell su -c "sh /data/adb/device_services/control.sh restart"
+     adb shell su -c "sh /data/adb/device_services/control.sh stop"
+     adb shell su -c "sh /data/adb/device_services/control.sh start"
      ```
 
 ### 2. 手机端健康检查与进程重启注意事项
 - **从云端检查手机端健康状态**：
   ```bash
-  ssh DMIT-US 'curl -s --cacert /etc/maibot-mtls/ca.crt --cert /etc/maibot-mtls/client.crt --key /etc/maibot-mtls/client.key https://100.90.156.92:8443/health'
+  ssh DMIT-US 'curl -s --cacert /etc/maibot-mtls/ca.crt --cert /etc/maibot-mtls/client.crt --key /etc/maibot-mtls/client.key https://100.87.39.37:8443/health'
   ```
 - **在手机端重启 `edge_server` 或 `message_daemon` 的重要注意事项**：
   > **切勿在 `adb shell su -c "..."` 中直接使用 `pkill -f edge_server.py`**：Android Toybox 的 `pkill -f` 会匹配 `su -c` 自身的命令行字符串并误杀当前 Shell（返回 Exit Code `143`）。
@@ -177,7 +199,7 @@ print("=== Driver Cursors ===")
 for r in conn.execute("SELECT * FROM wechat_driver_cursors"):
     print(r)
 print("=== Quarantined Messages ===")
-for r in conn.execute("SELECT * FROM wechat_driver_quarantine ORDER BY updated_at DESC LIMIT 5"):
+for r in conn.execute("SELECT * FROM wechat_driver_quarantine ORDER BY quarantined_at_ms DESC LIMIT 5"):
     print(r)
 PY'
 ```
@@ -319,4 +341,4 @@ PY'
 
 5. **Persona V2 卡片模板自举与 3 层共享 MVU 运维**：
    - 内置角色卡片模板位于 `plugins/st_preset_engine/templates/personas/*.json`，启动或访问 `GET /api/webui/persona-v2/cards` 时自动自举同步至 `data/personas/*.json` 并登记至 `config/bot_config.toml`；
-   - 双子核心卡（`maibot_xuyue` / `maibot_xuyan` 及其全量副本 `*_qianling_full`）共用 `shared_namespace = "twin_xu"`：在 `companion_truth.db` 的 `mvu_variables` 表中，`apartment_scene`（`PUBLIC`）与 `love_locked`（`PRIVATE` / `twin_harmony_locked`）写入 `card_id = 'shared:twin_xu'`，支持通过 `/config/bot`「Persona V2 立体人设工作台」在线查看、修改与重置实时变量（注：系统只读变量 `balance_tier` 与 `phone_holder` 由算力账本与值班槽位实时映射，不可由模型或手动覆盖）。
+   - 双子核心卡（`maibot_xuyue` / `maibot_xuyan` 及其全量副本 `*_qianling_full`）共用 `shared_namespace = "twin_xu"`：在 `companion_truth.db` 的 `mvu_variables` 表中，`apartment_scene`（`PRIVATE`）与 `love_locked`（`PRIVATE` / `twin_harmony_locked`）写入 `card_id = 'shared:twin_xu'`，仅在 Owner 私聊可见与跨卡共享（群聊与非 Owner 会话物理隔离），支持通过 `/config/bot`「Persona V2 立体人设工作台」在线查看、修改与重置实时变量（注：系统只读变量 `balance_tier` 与 `phone_holder` 由算力账本与值班槽位实时映射，不可由模型或手动覆盖）。

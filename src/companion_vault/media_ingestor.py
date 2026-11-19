@@ -1,6 +1,6 @@
 """独立于屏幕轮询的 Root 媒体归档服务，可恢复游标和云端重试。"""
 
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 import argparse
 import hashlib
 import json
@@ -9,19 +9,28 @@ import time
 
 import httpx
 
+from src.platform_io.wechat.edge_tls import build_edge_httpx_kwargs
+
 from .asset_pipeline import AssetPipeline
 from .runtime_bridge import _open_truth_db
 
 
-def collect_page(pipeline: AssetPipeline, http: httpx.Client, edge_url: str) -> Dict[str, Any]:
+def collect_page(
+    pipeline: AssetPipeline,
+    http: httpx.Client,
+    edge_url: str,
+    *,
+    transport_url: Optional[str] = None,
+) -> Dict[str, Any]:
     source = edge_url.rstrip("/")
-    identity_response = http.get(source + "/wechat/active_dir")
+    http_base = (str(transport_url).strip().rstrip("/") if transport_url else "") or source
+    identity_response = http.get(http_base + "/wechat/active_dir")
     identity_response.raise_for_status()
     account = identity_response.json()["path"].rstrip("/").rsplit("/", 1)[-1]
     cursor_source = source + "/" + account
     cursor = pipeline.db.conn.execute("SELECT * FROM ingestion_cursors WHERE source=?", (cursor_source,)).fetchone()
     params = {"mtime_ns": cursor["mtime_ns"] if cursor else 0, "after": cursor["after_key"] if cursor else "", "limit": 5}
-    response = http.get(source + "/wechat/media_since", params=params)
+    response = http.get(http_base + "/wechat/media_since", params=params)
     response.raise_for_status()
     page = response.json()
     if page["account"] != account:
@@ -31,7 +40,7 @@ def collect_page(pipeline: AssetPipeline, http: httpx.Client, edge_url: str) -> 
         source_id = "wechat:" + hashlib.sha256(identity.encode()).hexdigest()
         exists = pipeline.db.conn.execute("SELECT 1 FROM asset_sources WHERE source_id=?", (source_id,)).fetchone()
         if exists is None:
-            response = http.get(source + "/wechat/media_file", params={
+            response = http.get(http_base + "/wechat/media_file", params={
                 "account": item["account"], "kind": item["kind"], "path": item["relative_path"],
                 "mtime_ns": item["mtime_ns"], "ctime_ns": item["ctime_ns"], "size": item["size"],
             })
@@ -43,7 +52,7 @@ def collect_page(pipeline: AssetPipeline, http: httpx.Client, edge_url: str) -> 
         if item["mime_type"] == "audio/x-silk":
             derived_id = source_id + ":wav"
             if pipeline.db.conn.execute("SELECT 1 FROM asset_sources WHERE source_id=?", (derived_id,)).fetchone() is None:
-                response = http.get(source + "/wechat/media_wav", params={
+                response = http.get(http_base + "/wechat/media_wav", params={
                     "account": item["account"], "kind": item["kind"], "path": item["relative_path"],
                     "mtime_ns": item["mtime_ns"], "ctime_ns": item["ctime_ns"], "size": item["size"],
                 })
@@ -69,19 +78,21 @@ def main() -> None:
     parser.add_argument("--mode", choices=("all", "collect", "observe", "sync"), default="all")
     parser.add_argument("--db-path", default="data/companion_truth.db")
     parser.add_argument("--edge-url", default=os.environ.get("MAIBOT_EDGE_URL", "http://100.87.39.37:8765"))
+    parser.add_argument("--transport-url", default=os.environ.get("MAIBOT_EDGE_TRANSPORT_URL", ""))
     args = parser.parse_args()
     if args.mode in {"all", "collect"}:
         parser.error("全目录自动回填已停用；媒体由微信实时桥接器按新气泡批次采集，维护任务可用 observe/sync")
     db = _open_truth_db(args.db_path)
     pipeline = AssetPipeline(db, spool=os.environ.get("MAIBOT_ASSET_SPOOL", "data/companion_assets"),
                              remote=os.environ.get("MAIBOT_DRIVE_REMOTE", ""))
+    transport_url = str(args.transport_url or "").strip().rstrip("/") or args.edge_url.rstrip("/")
     token = os.environ.get("MAIBOT_EDGE_TOKEN", "")
     try:
-        with httpx.Client(timeout=120, headers={"Authorization": "Bearer " + token} if token else {}) as http:
+        with httpx.Client(**build_edge_httpx_kwargs(transport_url, token=token, timeout=120)) as http:
             while True:
                 try:
                     if args.mode in {"all", "collect"}:
-                        result = collect_page(pipeline, http, args.edge_url)
+                        result = collect_page(pipeline, http, args.edge_url, transport_url=transport_url)
                         print(json.dumps(result), flush=True)
                 except Exception as exc:
                     if args.once:
@@ -89,7 +100,7 @@ def main() -> None:
                     print(json.dumps({"error": str(exc)}), flush=True)
                 try:
                     if args.mode in {"all", "observe"}:
-                        response = http.get(args.edge_url.rstrip("/") + "/wechat/chat_snapshot")
+                        response = http.get(transport_url + "/wechat/chat_snapshot")
                         response.raise_for_status()
                         snapshot = response.json()
                         # 观察归档不触发回复，不依赖 LLM 是否接话，也不依赖媒体匹配是否完成。

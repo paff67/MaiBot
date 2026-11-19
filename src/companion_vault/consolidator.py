@@ -599,6 +599,12 @@ class MemoryConsolidator:
                 if is_group_scope:
                     before_user_status = [tuple(row) for row in self.db.execute("SELECT * FROM user_status ORDER BY key")]
                     before_global_state = [tuple(row) for row in self.db.execute("SELECT * FROM global_state ORDER BY row_id")]
+                    before_mvu_variables = [
+                        tuple(row)
+                        for row in self.db.execute(
+                            "SELECT * FROM mvu_variables ORDER BY card_id, scope_key, var_key"
+                        )
+                    ]
                     before_person_names = {
                         row["person_id"]: row["person_name"]
                         for row in self.db.execute(
@@ -617,16 +623,33 @@ class MemoryConsolidator:
                         raw_sql,
                         manage_tx=False,
                         forbid_private_person_columns=is_group_scope,
+                        forbid_owner_state_tables=is_group_scope,
                     )
                 except sqlite3.DatabaseError as exc:
                     if is_group_scope and "not authorized" in str(exc).lower():
+                        if re.search(r"\b(user_status|global_state|mvu_variables)\b", raw_sql, re.IGNORECASE):
+                            raise ValueError(
+                                "Group chat consolidation cannot modify owner user_status or global_state or mvu_variables"
+                            ) from exc
                         raise ValueError("Group chat consolidation cannot read or modify owner_private_notes") from exc
                     raise
                 if is_group_scope:
                     after_user_status = [tuple(row) for row in self.db.execute("SELECT * FROM user_status ORDER BY key")]
                     after_global_state = [tuple(row) for row in self.db.execute("SELECT * FROM global_state ORDER BY row_id")]
-                    if before_user_status != after_user_status or before_global_state != after_global_state:
-                        raise ValueError("Group chat consolidation cannot modify owner user_status or global_state")
+                    after_mvu_variables = [
+                        tuple(row)
+                        for row in self.db.execute(
+                            "SELECT * FROM mvu_variables ORDER BY card_id, scope_key, var_key"
+                        )
+                    ]
+                    if (
+                        before_user_status != after_user_status
+                        or before_global_state != after_global_state
+                        or before_mvu_variables != after_mvu_variables
+                    ):
+                        raise ValueError(
+                            "Group chat consolidation cannot modify owner user_status or global_state or mvu_variables"
+                        )
                     after_person_names = {
                         row["person_id"]: row["person_name"]
                         for row in self.db.execute("SELECT person_id, person_name FROM person_info")

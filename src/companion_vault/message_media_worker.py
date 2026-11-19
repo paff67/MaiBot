@@ -1,5 +1,6 @@
 """Message-driven asset jobs. Identity, byte integrity and cloud status stay distinct."""
 
+from typing import Optional
 import argparse
 import hashlib
 import io
@@ -18,7 +19,15 @@ from .truth_db import CompanionTruthDB
 
 
 class MessageMediaQueue:
-    def __init__(self, assets: AssetPipeline, ledger: sqlite3.Connection, edge: str, client: httpx.Client):
+    def __init__(
+        self,
+        assets: AssetPipeline,
+        ledger: sqlite3.Connection,
+        edge: str,
+        client: httpx.Client,
+        *,
+        transport_url: Optional[str] = None,
+    ):
         self.assets, self.db, self.ledger, self.edge, self.client = (
             assets,
             assets.db.conn,
@@ -26,6 +35,7 @@ class MessageMediaQueue:
             edge.rstrip("/"),
             client,
         )
+        self.transport_url = (str(transport_url).strip().rstrip("/") if transport_url else "") or self.edge
         self.db.executescript("""
         CREATE TABLE IF NOT EXISTS media_job_cursor(name TEXT PRIMARY KEY,seq INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS message_media_jobs(
@@ -174,7 +184,7 @@ class MessageMediaQueue:
                 self.finish(job, "satisfied_by_peer")
                 return True
             params = {k: job[k] for k in ("account", "msg_id", "revision", "ref_index")}
-            response = self.client.get(self.edge + "/messages/media_resolve", params=params)
+            response = self.client.get(self.transport_url + "/messages/media_resolve", params=params)
             response.raise_for_status()
             result = response.json()
             if result["chat_id"] != job["chat_id"]:
@@ -203,7 +213,7 @@ class MessageMediaQueue:
                 ctime_ns=file["ctime_ns"],
                 size=file["size"],
             )
-            response = self.client.get(self.edge + "/wechat/media_file", params=read_params)
+            response = self.client.get(self.transport_url + "/wechat/media_file", params=read_params)
             response.raise_for_status()
             data = response.content
             digest = hashlib.sha256(data).hexdigest()
@@ -247,7 +257,7 @@ class MessageMediaQueue:
             elif file["representation"] == "medium":
                 state = "medium_only"
             elif file["mime_type"] == "audio/x-silk":
-                response = self.client.get(self.edge + "/wechat/media_wav", params=read_params)
+                response = self.client.get(self.transport_url + "/wechat/media_wav", params=read_params)
                 response.raise_for_status()
                 wav = response.content
                 if hashlib.sha256(wav).hexdigest() != response.headers.get("X-Content-SHA256"):
@@ -308,10 +318,13 @@ def main():
     assets = AssetPipeline(
         db, os.environ.get("MAIBOT_ASSET_SPOOL", "data/companion_assets"), os.environ.get("MAIBOT_DRIVE_REMOTE", "")
     )
-    edge = os.environ.get("MAIBOT_EDGE_URL", "http://100.87.39.37:8765")
+    from src.platform_io.wechat.edge_tls import build_edge_httpx_kwargs
+
+    edge = os.environ.get("MAIBOT_EDGE_URL", "http://100.87.39.37:8765").rstrip("/")
+    transport_url = os.environ.get("MAIBOT_EDGE_TRANSPORT_URL", "").strip().rstrip("/") or edge
     token = os.environ.get("MAIBOT_EDGE_TOKEN", "")
-    with httpx.Client(timeout=120, headers={"Authorization": "Bearer " + token} if token else {}) as client:
-        worker = MessageMediaQueue(assets, ledger, edge, client)
+    with httpx.Client(**build_edge_httpx_kwargs(transport_url, token=token, timeout=120)) as client:
+        worker = MessageMediaQueue(assets, ledger, edge, client, transport_url=transport_url)
         while True:
             try:
                 scanned = worker.enqueue()

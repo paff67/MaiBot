@@ -115,8 +115,16 @@ def message_media_refs(row: Dict[str, Any]) -> List[Dict[str, Any]]:
                 if local and "://" not in local:
                     total = int(info.get("totalLen") or 0)
                     original_size = int(image.get("hdlength") or 0) if image is not None else 0
-                    mid_size = int(image.get("length") or image.get("hevc_mid_size") or 0) if image is not None else 0
-                    if field == "bigImgPath" and original_size and total not in {original_size, mid_size}:
+                    mid_sizes = (
+                        {
+                            int(val)
+                            for val in (image.get("length"), image.get("hevc_mid_size"))
+                            if val is not None and str(val).isdigit() and int(val) > 0
+                        }
+                        if image is not None
+                        else set()
+                    )
+                    if field == "bigImgPath" and original_size and total not in ({original_size} | mid_sizes):
                         variant = "medium"
                     refs.append(
                         dict(

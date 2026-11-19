@@ -11,6 +11,8 @@ import time
 
 import httpx
 
+from src.platform_io.wechat.edge_tls import build_edge_httpx_kwargs
+
 
 class NotificationInbox:
     def __init__(self, path: str) -> None:
@@ -100,15 +102,17 @@ def main() -> None:
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--db", default="data/notification_inbox.db")
     parser.add_argument("--edge-url", default=os.environ.get("MAIBOT_EDGE_URL", "http://127.0.0.1:8765"))
+    parser.add_argument("--transport-url", default=os.environ.get("MAIBOT_EDGE_TRANSPORT_URL", ""))
     args = parser.parse_args()
     inbox = NotificationInbox(args.db)
     edge = str(args.edge_url).rstrip("/")
+    transport_url = str(args.transport_url or "").strip().rstrip("/") or edge
     token = os.environ.get("MAIBOT_EDGE_TOKEN", "")
-    with httpx.Client(timeout=45, headers={"Authorization": "Bearer " + token} if token else {}) as client:
+    with httpx.Client(**build_edge_httpx_kwargs(transport_url, token=token, timeout=45)) as client:
         while True:
             try:
                 response = client.get(
-                    edge + "/notifications/events", params={"after": inbox.cursor(edge), "limit": 100}
+                    transport_url + "/notifications/events", params={"after": inbox.cursor(edge), "limit": 100}
                 )
                 response.raise_for_status()
                 events = response.json()["events"]

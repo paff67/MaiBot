@@ -34,6 +34,12 @@ from .subagent import handle_stop_tool as handle_subagent_stop_tool
 from .subagent import handle_tool as handle_subagent_tool
 from .tool_search import get_tool_spec as get_tool_search_tool_spec
 from .tool_search import handle_tool as handle_tool_search_tool
+from .vault_file_tools import (
+    get_inspect_vault_file_tool_spec,
+    get_search_vault_files_tool_spec,
+    handle_inspect_vault_file_tool,
+    handle_search_vault_files_tool,
+)
 from .view_forward_message import get_tool_spec as get_view_forward_message_tool_spec
 from .view_forward_message import handle_tool as handle_view_forward_message_tool
 from .wait import get_tool_spec as get_wait_tool_spec
@@ -107,6 +113,20 @@ BUILTIN_TOOL_ENTRIES: List[BuiltinToolEntry] = [
         get_read_tool_result_tool_spec,
         handle_read_tool_result_tool,
         stage="action",
+    ),
+    BuiltinToolEntry(
+        "search_vault_files",
+        get_search_vault_files_tool_spec,
+        handle_search_vault_files_tool,
+        stage="action",
+        visibility="deferred",
+    ),
+    BuiltinToolEntry(
+        "inspect_vault_file",
+        get_inspect_vault_file_tool_spec,
+        handle_inspect_vault_file_tool,
+        stage="action",
+        visibility="deferred",
     ),
 ]
 

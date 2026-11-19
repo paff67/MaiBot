@@ -9,6 +9,19 @@ from .asset_encoder import encode_inline_descriptor, is_files_api_enabled
 from .asset_pipeline import AssetPipeline
 
 
+def _format_file_link(row: Dict[str, Any]) -> Dict[str, Any]:
+    link: Dict[str, Any] = {
+        "file_code": row["file_code"],
+        "semantic_name": row.get("semantic_name") or "",
+        "mime_type": row.get("mime_type") or "",
+    }
+    if row.get("drive_url"):
+        link["drive_url"] = row["drive_url"]
+    else:
+        link["drive_status"] = row.get("drive_status") or "pending"
+    return link
+
+
 def recall_quotes(
     ledger: sqlite3.Connection,
     assets: AssetPipeline,
@@ -53,12 +66,13 @@ def recall_quotes(
             )
             codes = [r["file_code"] for r in authorized]
             item["file_codes"] = codes
-            for code in codes:
+            if authorized:
+                item["file_links"] = [_format_file_link(r) for r in authorized]
+            for auth_row in authorized:
+                code = auth_row["file_code"]
                 if code not in seen:
                     seen.add(code)
-                    files.append(
-                        dict(assets.db.conn.execute("SELECT * FROM media_vault WHERE file_code=?", (code,)).fetchone())
-                    )
+                    files.append(dict(auth_row))
         recalled.append(item)
     return json.dumps({"recall_type": "explicit_message_reference", "items": recalled}, ensure_ascii=False), files
 
@@ -108,6 +122,7 @@ def recall_message_attachments(
             "msg_id": str(msg_id),
             "revision": revision,
             "file_codes": [f["file_code"] for f in files],
+            "file_links": [_format_file_link(f) for f in files],
         },
         ensure_ascii=False,
     )

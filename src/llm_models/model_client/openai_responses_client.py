@@ -20,6 +20,7 @@ from src.llm_models.payload_content.context_item import (
     PROVIDER_REPLAY_SCHEMA_VERSION,
     AssistantMessageItem,
     ContextAudioPart,
+    ContextBinaryPart,
     ContextFileUriPart,
     ContextImagePart,
     ContextItem,
@@ -153,6 +154,11 @@ def _convert_user_content(item: UserMessageItem) -> List[Dict[str, Any]]:
 
         if isinstance(part, ContextAudioPart):
             content.append({"type": "input_text", "text": f"[音频附件: {part.mime_type}]"})
+            continue
+
+        if isinstance(part, ContextBinaryPart):
+            label = part.semantic_name or part.file_code or part.mime_type
+            content.append({"type": "input_text", "text": f"[文件附件: {label} ({part.mime_type})]"})
             continue
 
         if isinstance(part, ContextFileUriPart):

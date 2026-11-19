@@ -191,6 +191,7 @@ class WeChatRootDriver(PlatformIODriver):
                     source=self.edge.source,
                     account=self.edge.account,
                     chat_id=chat_id,
+                    transport_url=self.edge.transport_url,
                 )
                 if g_name:
                     self._group_names[chat_id] = g_name
@@ -379,10 +380,17 @@ def configured_wechat_drivers(config_path: str) -> list[WeChatRootDriver]:
             raise ValueError("Duplicate WeChat driver scope")
         seen.add(key)
         token = item.get("token") or os.environ.get("MAIBOT_EDGE_TOKEN", "")
+        transport_url = (
+            str(item.get("transport_url") or os.environ.get("MAIBOT_EDGE_TRANSPORT_URL") or "").strip() or None
+        )
         edge = WeChatEdgeClient(
             source,
             account,
+            transport_url=transport_url,
             token=token,
+            ca_path=item.get("mtls_ca"),
+            cert_path=item.get("mtls_cert"),
+            key_path=item.get("mtls_key"),
             use_hook_send=bool(item.get("use_hook_send", True)),
             max_sends_per_minute=int(item.get("max_sends_per_minute", 15)),
             max_sends_per_chat_per_minute=item.get("max_sends_per_chat_per_minute"),

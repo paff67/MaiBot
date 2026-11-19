@@ -150,6 +150,7 @@ class CycleRuntimeState:
     cycle_end: CycleEnd = field(default_factory=lambda: CycleEnd("continue", "本轮思考完成，继续后续内部轮次。"))
     tool_result_summaries: list[str] = field(default_factory=list)
     tool_monitor_results: list[dict[str, Any]] = field(default_factory=list)
+    tool_multimodal_parts: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1020,9 +1021,14 @@ class MaisakaReasoningEngine:
                 or ""
             ).strip()
             person_id = str(getattr(user_info, "person_id", "") or "").strip()
+            eff_sources = list(source_messages) if source_messages else [trigger_message]
             latest_user_text = str(getattr(trigger_message, "processed_plain_text", "") or "").strip()
+            batch_user_texts: list[str] = []
             batch_sender_ids: list[str] = []
-            for msg in source_messages:
+            for msg in eff_sources:
+                m_text = str(getattr(msg, "processed_plain_text", "") or "").strip()
+                if m_text:
+                    batch_user_texts.append(m_text)
                 m_uinfo = getattr(getattr(msg, "message_info", None), "user_info", None)
                 uid = str(getattr(m_uinfo, "user_id", "") or "").strip()
                 if uid:
@@ -1035,7 +1041,10 @@ class MaisakaReasoningEngine:
                     if txt:
                         recent_lines.append(txt[:200])
             recent_context = "\n".join(recent_lines)
-            mentions_bot = bool(getattr(trigger_message, "is_mentioned", False))
+            mentions_bot = any(
+                bool(getattr(msg, "is_mentioned", False) or getattr(msg, "is_at", False))
+                for msg in eff_sources
+            )
 
             return await resolve_turn_route(
                 session_id=str(self._runtime.session_id or ""),
@@ -1044,6 +1053,7 @@ class MaisakaReasoningEngine:
                 person_id=person_id,
                 is_group_chat=is_group_chat,
                 latest_user_text=latest_user_text,
+                batch_user_texts=batch_user_texts or None,
                 recent_context=recent_context,
                 batch_sender_ids=batch_sender_ids or None,
                 mentions_bot=mentions_bot,
@@ -1095,7 +1105,14 @@ class MaisakaReasoningEngine:
         deferred_map = getattr(self._runtime, "deferred_tool_specs_by_name", None)
         if isinstance(deferred_map, dict):
             promoted_names: list[str] = []
-            for direct_name in ("query_memory", "query_image_memory", "query_person_profile", "view_forward_message"):
+            for direct_name in (
+                "query_memory",
+                "query_image_memory",
+                "query_person_profile",
+                "view_forward_message",
+                "search_vault_files",
+                "inspect_vault_file",
+            ):
                 spec = deferred_map.get(direct_name)
                 if spec is not None and getattr(spec, "enabled", True) and direct_name not in existing_names:
                     existing_names.add(direct_name)
@@ -1374,6 +1391,8 @@ class MaisakaReasoningEngine:
                 pass2_args = dict(arguments)
                 pass2_args["_tool_observations"] = tool_observations
                 pass2_args["_external_tools"] = []
+                if state.tool_multimodal_parts:
+                    pass2_args["_tool_observation_file_parts"] = list(state.tool_multimodal_parts)
                 self._runtime._update_stage_status("Replyer", "ST工具收敛生成回复中", round_text=round_text)
                 reply_started_at = time.time()
                 result = await execute_reply(
@@ -2831,6 +2850,10 @@ class MaisakaReasoningEngine:
                 result,
                 tool_spec_map.get(invocation.tool_name),
             )
+            if result.success and isinstance(result.metadata.get("_multimodal_parts"), list):
+                state.tool_multimodal_parts.extend(
+                    item for item in result.metadata["_multimodal_parts"] if isinstance(item, dict)
+                )
             # 超长结果先交给子代理按当前意图整理，Planner 历史里只留整理后的结论
             condensed_content: str | None = None
             raw_history_content = result.get_history_content()

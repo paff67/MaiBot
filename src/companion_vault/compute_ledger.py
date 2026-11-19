@@ -244,7 +244,8 @@ class ComputeLedger:
     def record_local_cost(self, estimated_usd: float) -> ComputeLedgerSnapshot:
         if estimated_usd > 0:
             self._unsettled_local_cost_usd = round(self._unsettled_local_cost_usd + float(estimated_usd), 6)
-        if max(0.0, self._remote_balance_usd - self._unsettled_local_cost_usd) < THRIFTY_BALANCE_THRESHOLD_USD:
+        _, thr, _, _, _, _ = self._resolve_economy_settings()
+        if max(0.0, self._remote_balance_usd - self._unsettled_local_cost_usd) < thr:
             self._active_persona_slot = PERSONA_SLOT_YOUNGER
         snap = self.get_snapshot()
         self._persist_snapshot(snap)
@@ -311,13 +312,14 @@ class ComputeLedger:
         self._unsettled_local_cost_usd = 0.0
         self._is_available = bool(is_available)
 
-        if new_remote < THRIFTY_BALANCE_THRESHOLD_USD:
+        _, thr, _, _, _, _ = self._resolve_economy_settings()
+        if new_remote < thr:
             self._active_persona_slot = PERSONA_SLOT_YOUNGER
-            if prev_effective >= THRIFTY_BALANCE_THRESHOLD_USD or not self._elder_away_arc:
+            if prev_effective >= thr or not self._elder_away_arc:
                 if self.on_elder_away_enter is not None:
                     res = self.on_elder_away_enter(new_remote)
                     self._elder_away_arc = str((await res) if asyncio.iscoroutine(res) else res).strip()
-        elif prev_remote is not None and prev_effective < THRIFTY_BALANCE_THRESHOLD_USD <= new_remote:
+        elif prev_remote is not None and prev_effective < thr <= new_remote:
             if self.on_elder_return is not None:
                 await self.on_elder_return(new_remote, self._elder_away_arc)
 

@@ -174,8 +174,11 @@ class AssetPipeline:
         if not separator:
             return ''
         rows = self.db.conn.execute(
-            "SELECT l.msg_id,l.file_code,m.semantic_name,m.mime_type,l.representation "
-            "FROM message_asset_links l JOIN message_media_jobs j USING(job_id) JOIN media_vault m USING(file_code) "
+            "SELECT l.msg_id,l.file_code,m.semantic_name,m.mime_type,l.representation,"
+            "coalesce(a.drive_status,'pending') AS drive_status,"
+            "CASE WHEN a.drive_status='verified' AND coalesce(a.drive_url,'') LIKE 'https://%' THEN a.drive_url ELSE '' END AS drive_url "
+            "FROM message_asset_links l JOIN message_media_jobs j USING(job_id) "
+            "JOIN media_vault m USING(file_code) LEFT JOIN asset_sources a USING(file_code) "
             "WHERE l.account=? AND l.chat_id=? AND l.active=1 AND j.state='ready' "
             "ORDER BY CAST(l.msg_id AS INTEGER) DESC,l.file_code LIMIT ?", (account,chat,limit),
         ).fetchall()

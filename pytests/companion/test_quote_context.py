@@ -286,13 +286,13 @@ def test_unified_greenlight_asset_pipeline_descriptors(tmp_path, monkeypatch):
         chat_id=ACCOUNT + "/" + CHAT,
     )
     assets.ingest(
-        b"RIFF_WAV_LOSSLESS",
+        b"RIFF_WAV_LOSSLESS" + (b"\x00" * (520 * 1024)),
         {"mime_type": "audio/wav", "relative_path": "voice.wav", "representation": "decoded_lossless"},
         source_id="src-voice:wav",
         chat_id=ACCOUNT + "/" + CHAT,
     )
     pdf = assets.ingest(
-        b"%PDF-1.7-original",
+        b"%PDF-1.7-original" + (b"\x00" * (520 * 1024)),
         {"mime_type": "application/pdf", "relative_path": "spec.pdf"},
         source_id="src-pdf",
         chat_id=ACCOUNT + "/" + CHAT,

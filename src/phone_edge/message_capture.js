@@ -7,6 +7,7 @@ const pendingIds = new Map();
 const activeSends = new Map();
 const claimedMsgIds = new Set();
 const imgDownloadAttempts = new Map();
+const imgDownloadState = new Map();
 const pendingImgDownloads = new Map();
 const sendWindowMs = [];
 const SPOOL_PATH = '/data/user/0/com.tencent.mm/files/maibot_send_spool';
@@ -102,6 +103,13 @@ function inspectChattingContext() {
   });
  }catch(e){}
  return state;
+}
+function hasHdOriginalMeta(xml){
+ if(!xml)return false;
+ const hdUrl=xml.match(/cdnbigimgurl="([^"]+)"/);
+ if(hdUrl && hdUrl[1])return true;
+ const hdLen=xml.match(/hdlength="(\d+)"/);
+ return Boolean(hdLen && Number(hdLen[1])>0);
 }
 function escapeXml(s){
  if(!s)return '';
@@ -359,12 +367,19 @@ function scan(sweep, tail, ids) {
    }
    if(hasLocalFull){
     pendingImgDownloads.delete(row.msgId);
+    imgDownloadState.delete(row.msgId);
    }else if(!sweep && targetInfo && row.msgId && row.talker && Number(row.msgId)>0 && (!row.createTime || Date.now()-Number(row.createTime)<86400000)){
     const now=Date.now();
-    const lastAttempt=imgDownloadAttempts.get(row.msgId)||0;
-    if(now-lastAttempt>60000){
+    const st=imgDownloadState.get(row.msgId);
+    const shouldFallback=Boolean(st && st.stage==='hd' && now-st.startedAt>=20000);
+    const lastAttempt=st?st.lastAttempt:(imgDownloadAttempts.get(row.msgId)||0);
+    if(shouldFallback || now-lastAttempt>60000){
+     const preferHd=!shouldFallback && hasHdOriginalMeta(row.content);
+     const nextStage=preferHd?'hd':'std';
+     const startedAt=st?st.startedAt:now;
      imgDownloadAttempts.set(row.msgId,now);
-     pendingImgDownloads.set(row.msgId,now);
+     imgDownloadState.set(row.msgId,{stage:nextStage,startedAt:startedAt,lastAttempt:now});
+     pendingImgDownloads.set(row.msgId,startedAt);
      try{
       try{
        const h2=Java.use('com.tencent.mm.modelcdntran.s1').Kj();
@@ -373,11 +388,26 @@ function scan(sweep, tail, ids) {
       }catch(e2){}
       const rawSvc=Java.cast(Java.use('ni5.n0').c(Java.use('da0.e').class),Java.use('da0.e')).Bj();
       const downloadSvc=Java.cast(rawSvc,Java.use('v51.j'));
-      const scene=Java.use('v51.t0').$new(int64(String(targetInfo.id)),int64(String(row.msgId)),String(row.talker),0,downloadSvc,0);
       const netCore=Java.use('pp0.i1').q();
       const s1=netCore._b?netCore._b.value:netCore.b.value;
-      const started=s1.g(scene);
-      console.log(JSON.stringify({event:'img_download_triggered',msg_id:row.msgId,img_id:targetInfo.id,started:Boolean(started)}));
+      let usedCompressType=preferHd?1:0;
+      let usedFallback=shouldFallback;
+      let started=false;
+      try{
+       const scene=Java.use('v51.t0').$new(int64(String(targetInfo.id)),int64(String(row.msgId)),String(row.talker),usedCompressType,downloadSvc,0);
+       started=Boolean(s1.g(scene));
+      }catch(hdErr){
+       if(!preferHd)throw hdErr;
+       started=false;
+      }
+      if(preferHd && !started){
+       usedCompressType=0;
+       usedFallback=true;
+       imgDownloadState.set(row.msgId,{stage:'std',startedAt:startedAt,lastAttempt:now});
+       const fallbackScene=Java.use('v51.t0').$new(int64(String(targetInfo.id)),int64(String(row.msgId)),String(row.talker),0,downloadSvc,0);
+       started=Boolean(s1.g(fallbackScene));
+      }
+      console.log(JSON.stringify({event:'img_download_triggered',msg_id:row.msgId,img_id:targetInfo.id,compress_type:usedCompressType,fallback:usedFallback,started:started}));
      }catch(e){
       console.log(JSON.stringify({event:'img_download_trigger_error',msg_id:row.msgId,error:String(e)}));
      }
@@ -520,9 +550,14 @@ Java.perform(function(){
      if(!pendingIds.has(account))pendingIds.set(account,new Set());
      const pSet=pendingIds.get(account);const now=Date.now();
      for(const dl of Array.from(pendingImgDownloads.entries())){
-      if(now-dl[1]>45000)pendingImgDownloads.delete(dl[0]);
+      if(now-dl[1]>60000){pendingImgDownloads.delete(dl[0]);imgDownloadState.delete(dl[0]);}
       else pSet.add(dl[0]);
      }
+    }
+    if(tickCount%30===0){
+     const staleCutoff=Date.now()-300000;
+     for(const it of Array.from(imgDownloadState.entries())){if(it[1].startedAt<staleCutoff)imgDownloadState.delete(it[0]);}
+     for(const it of Array.from(imgDownloadAttempts.entries())){if(it[1]<staleCutoff)imgDownloadAttempts.delete(it[0]);}
     }
     const pending=pendingIds.get(account);
     if(pending && pending.size){const ids=Array.from(pending).slice(0,100);scan(false,false,ids);ids.forEach(id=>pending.delete(id));}

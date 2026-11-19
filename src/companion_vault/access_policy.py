@@ -77,6 +77,7 @@ def authorized_file_rows(db, ledger, *, source, account, destination_chat_id, co
     if codes is not None:
         sql += " AND a.file_code IN (" + ",".join("?" for _ in codes) + ")"
         params.extend(codes)
+    sql += " ORDER BY a.file_code"
     result = []
     for (code,) in db.execute(sql, params):
         links = db.execute(
@@ -95,11 +96,19 @@ def authorized_file_rows(db, ledger, *, source, account, destination_chat_id, co
             if not current or current[0] != revision or current[1] != chat or (int(current[2] or 0) & 65535) == 10000:
                 valid = False
                 break
-        origin = db.execute("SELECT chat_id FROM asset_sources WHERE file_code=?", (code,)).fetchone()
+        origin = db.execute(
+            "SELECT chat_id, drive_status, drive_url FROM asset_sources WHERE file_code=?",
+            (code,),
+        ).fetchone()
         if not origin or origin[0] not in {account + "/" + chat for chat in chats}:
             valid = False
         if valid:
             row = db.execute("SELECT * FROM media_vault WHERE file_code=?", (code,)).fetchone()
             if row is not None:
-                result.append(dict(row))
+                item = dict(row)
+                drive_status = str(origin[1] or "pending")
+                raw_url = str(origin[2] or "").strip()
+                item["drive_status"] = drive_status
+                item["drive_url"] = raw_url if (drive_status == "verified" and raw_url.startswith("https://")) else ""
+                result.append(item)
     return result

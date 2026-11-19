@@ -74,6 +74,16 @@ class MessageTurnScheduler:
                 delay_seconds=quiet_seconds,
             )
 
+        # 微信媒体原件门控：刚收到图片/语音/文件且后台正在下载解码时，短暂等待就绪并顺带合批后续说明文字。
+        hydration_fn = getattr(runtime, "_get_media_hydration_wait_seconds", None)
+        hydration_seconds = float(hydration_fn()) if callable(hydration_fn) else 0.0
+        if hydration_seconds > 0:
+            return TurnGateResult(
+                decision="delay",
+                detail=f"等待微信媒体原件就绪 剩余检测={hydration_seconds:.2f}s",
+                delay_seconds=hydration_seconds,
+            )
+
         # 走到这里仍处于 wait 的只有快速反应模式：直接续接挂起的 wait，不再经过群聊频率与退避门控。
         if runtime._agent_state == runtime._STATE_WAIT:
             return TurnGateResult(decision="trigger", detail="快速反应模式收到新消息，提前结束 wait 并进入 Planner")

@@ -1,6 +1,7 @@
 """Exactly-once local application of a replayable phone journal (not exactly-once transport)."""
 
 from pathlib import Path
+from typing import Optional
 import argparse
 import json
 import os
@@ -10,6 +11,7 @@ import time
 
 import httpx
 
+from .edge_tls import build_edge_httpx_kwargs
 from .message_quotes import ensure_quote_schema, save_quote
 
 
@@ -124,9 +126,18 @@ class MessageLedger:
         return True
 
 
-def poll(ledger: MessageLedger, client: httpx.Client, edge: str, epoch: str) -> str:
+def poll(
+    ledger: MessageLedger,
+    client: httpx.Client,
+    edge: str,
+    epoch: str,
+    *,
+    transport_url: Optional[str] = None,
+) -> str:
+    http_base = (str(transport_url).strip() if transport_url else "") or edge
     response = client.get(
-        edge + "/messages/events", params={"after": ledger.cursor(edge, epoch) if epoch else 0, "limit": 500}
+        http_base.rstrip("/") + "/messages/events",
+        params={"after": ledger.cursor(edge, epoch) if epoch else 0, "limit": 500},
     )
     response.raise_for_status()
     page = response.json()
@@ -155,12 +166,13 @@ def main() -> None:
     args = parser.parse_args()
     ledger = MessageLedger(args.db)
     edge = os.environ.get("MAIBOT_EDGE_URL", "http://100.87.39.37:8765").rstrip("/")
+    transport_url = os.environ.get("MAIBOT_EDGE_TRANSPORT_URL", "").strip().rstrip("/") or edge
     token = os.environ.get("MAIBOT_EDGE_TOKEN", "")
     epoch = ""
-    with httpx.Client(timeout=60, headers={"Authorization": "Bearer " + token} if token else {}) as client:
+    with httpx.Client(**build_edge_httpx_kwargs(transport_url, token=token, timeout=60)) as client:
         while True:
             try:
-                epoch = poll(ledger, client, edge, epoch)
+                epoch = poll(ledger, client, edge, epoch, transport_url=transport_url)
                 print(json.dumps({"cursor": ledger.cursor(edge, epoch), "epoch": epoch}), flush=True)
             except Exception as exc:
                 with ledger.db:

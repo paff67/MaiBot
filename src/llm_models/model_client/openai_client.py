@@ -50,6 +50,7 @@ from src.llm_models.openai_compat import (
 from src.llm_models.payload_content.context_item import (
     AssistantMessageItem,
     ContextAudioPart,
+    ContextBinaryPart,
     ContextFileUriPart,
     ContextImagePart,
     ContextItem,
@@ -459,6 +460,11 @@ def _convert_user_message_content(message: UserMessageItem) -> str | List[ChatCo
 
         if isinstance(part, ContextAudioPart):
             content.append(_build_text_content_part(f"[音频附件: {part.mime_type}]"))
+            continue
+
+        if isinstance(part, ContextBinaryPart):
+            label = part.semantic_name or part.file_code or part.mime_type
+            content.append(_build_text_content_part(f"[文件附件: {label} ({part.mime_type})]"))
             continue
 
         if isinstance(part, ContextFileUriPart):

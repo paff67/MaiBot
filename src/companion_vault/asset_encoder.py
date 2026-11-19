@@ -81,6 +81,36 @@ def encode_media_part(
     raise ValueError("Original attachment requires configured Files client")
 
 
+def _build_inline_descriptor(
+    *,
+    file_code: str,
+    semantic_name: str,
+    raw_bytes: bytes,
+    mime_type: str,
+    part_index: int,
+) -> dict[str, Any] | None:
+    if len(raw_bytes) > INLINE_MAX_BYTES:
+        return None
+    b64_str = base64.b64encode(raw_bytes).decode("ascii")
+    if mime_type.startswith("audio/"):
+        return {
+            "file_code": file_code,
+            "semantic_name": semantic_name,
+            "audio_base64": b64_str,
+            "mime_type": mime_type,
+            "part_index": part_index,
+        }
+    if mime_type == "application/pdf" or mime_type.startswith("video/"):
+        return {
+            "file_code": file_code,
+            "semantic_name": semantic_name,
+            "binary_base64": b64_str,
+            "mime_type": mime_type,
+            "part_index": part_index,
+        }
+    return None
+
+
 def encode_inline_descriptor(
     *,
     file_code: str,
@@ -110,7 +140,17 @@ def encode_inline_descriptor(
 
     allow_files = is_files_api_enabled(files_api_enabled)
     size = len(raw_bytes)
-    b64_str = base64.b64encode(raw_bytes).decode("ascii") if size <= INLINE_MAX_BYTES else ""
+    inline_desc = _build_inline_descriptor(
+        file_code=file_code,
+        semantic_name=semantic_name,
+        raw_bytes=raw_bytes,
+        mime_type=mime_type,
+        part_index=part_index,
+    )
+
+    # 与 encode_media_part 保持一致：<=512KB 且支持内联的类型直接走内联，不浪费一次 Files API 上传往返。
+    if inline_desc is not None and (size <= SMALL_INLINE_THRESHOLD_BYTES or not allow_files):
+        return inline_desc, None, None
 
     if allow_files and client is not None:
         try:
@@ -127,44 +167,12 @@ def encode_inline_descriptor(
                 expiry,
             )
         except Exception:
-            if mime_type.startswith("audio/") and size <= INLINE_MAX_BYTES:
-                return (
-                    {
-                        "file_code": file_code,
-                        "semantic_name": semantic_name,
-                        "audio_base64": b64_str,
-                        "mime_type": mime_type,
-                        "part_index": part_index,
-                    },
-                    None,
-                    None,
-                )
+            if inline_desc is not None:
+                return inline_desc, None, None
             raise
 
-    if mime_type.startswith("audio/") and size <= INLINE_MAX_BYTES:
-        return (
-            {
-                "file_code": file_code,
-                "semantic_name": semantic_name,
-                "audio_base64": b64_str,
-                "mime_type": mime_type,
-                "part_index": part_index,
-            },
-            None,
-            None,
-        )
-    if not allow_files and mime_type == "application/pdf" and size <= INLINE_MAX_BYTES:
-        return (
-            {
-                "file_code": file_code,
-                "semantic_name": semantic_name,
-                "pdf_base64": b64_str,
-                "mime_type": mime_type,
-                "part_index": part_index,
-            },
-            None,
-            None,
-        )
+    if inline_desc is not None:
+        return inline_desc, None, None
 
     raise ValueError("Original attachment requires configured Files client")
 
