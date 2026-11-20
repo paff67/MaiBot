@@ -133,12 +133,11 @@ class MVURuntimeEngine:
         解析 Layer 1 系统只读状态变量 (`balance_tier`, `phone_holder`)：
         - `balance_tier`：映射自 `CompanionTruthDB.global_state.fairy_compute_tier`
           (`SUPERCHARGED` -> `"high"`, `STANDARD` -> `"medium"`, `THRIFTY`/`HIBERNATING` -> `"low"`)；
-        - `phone_holder`：映射自当前激活角色卡与槽位 (`maibot_xuyue`/`sister_elder` -> `"xuyue"`,
-          `maibot_xuyan`/`sister_younger` -> `"xuyan"`)。
+        - `phone_holder`：映射自已确认送达的持机槽位，省电档位强制妹妹持机。
         """
         eff_tier = str(compute_tier or "").strip().upper()
         eff_slot = str(persona_slot or "").strip()
-        if db is not None and (not eff_tier or not eff_slot):
+        if db is not None:
             try:
                 row = db.conn.execute(
                     "SELECT fairy_compute_tier, active_persona_slot, active_sister FROM global_state WHERE row_id = 1"
@@ -146,11 +145,10 @@ class MVURuntimeEngine:
                 if row is not None:
                     if not eff_tier:
                         eff_tier = str(row["fairy_compute_tier"] or "STANDARD").strip().upper()
-                    if not eff_slot:
-                        eff_slot = (
-                            str(row["active_persona_slot"] or "").strip()
-                            or str(row["active_sister"] or "").strip()
-                        )
+                    eff_slot = (
+                        str(row["active_persona_slot"] or "").strip()
+                        or str(row["active_sister"] or "").strip()
+                    )
             except Exception:
                 pass
 
@@ -161,13 +159,9 @@ class MVURuntimeEngine:
         else:
             balance_tier = "medium"
 
-        cid = str(card.card_id or "").strip()
-        if cid == "maibot_xuyue" or eff_slot == "sister_elder":
-            phone_holder = "xuyue"
-        elif cid == "maibot_xuyan" or eff_slot == "sister_younger":
-            phone_holder = "xuyan"
-        else:
-            phone_holder = cid or "unknown"
+        if eff_tier in {"THRIFTY", "HIBERNATING"}:
+            eff_slot = "sister_younger"
+        phone_holder = "xuyue" if eff_slot == "sister_elder" else "xuyan"
 
         return {
             "balance_tier": balance_tier,
@@ -308,7 +302,8 @@ class MVURuntimeEngine:
             return result
 
         try:
-            cls.ensure_card_mvu_defaults(db, card)
+            # Missing values are already filled from the card in memory. Reads during
+            # compilation must not initialize or migrate persistent state before delivery.
             bucket_ids = {card.card_id}
             for v in allowed_schemas:
                 storage_cid, _ = cls.resolve_storage_target(card, v)
@@ -668,6 +663,7 @@ class MVURuntimeEngine:
         is_owner_private: bool,
         pre_extracted_ops: Optional[Sequence[Dict[str, Any]]] = None,
         pre_extracted_analysis: str = "",
+        manage_tx: bool = True,
     ) -> MVUTurnUpdateResult:
         """
         综合多个输出文本源（如 raw_response / outer_tail / clean_story）中的 `<UpdateVariable>` 补丁，
@@ -862,6 +858,7 @@ class MVURuntimeEngine:
                         var_value=new_val,
                         visibility=vschema.visibility,
                         updated_at=now_iso,
+                        manage_tx=manage_tx,
                     )
                     if storage_cid != card.card_id:
                         db.upsert_mvu_variable(
@@ -872,8 +869,11 @@ class MVURuntimeEngine:
                             var_value=new_val,
                             visibility=vschema.visibility,
                             updated_at=now_iso,
+                            manage_tx=manage_tx,
                         )
                 except Exception as exc:
+                    if not manage_tx:
+                        raise
                     logger.warning(f"持久化 MVU 变量失败 ({storage_cid}.{storage_vkey}): {exc}")
 
             if vkey in change_index_by_key:

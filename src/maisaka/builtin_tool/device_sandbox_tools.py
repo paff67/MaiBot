@@ -5,7 +5,7 @@ import asyncio
 import json
 
 from src.companion_vault.consolidator import update_body_state
-from src.companion_vault.runtime_bridge import DEFAULT_TRUTH_DB_PATH, _open_truth_db, _resolve_trust_role_sync
+from src.companion_vault.runtime_bridge import resolve_truth_db_path, _open_truth_db, _resolve_trust_role_sync
 from src.core.tooling import ToolExecutionContext, ToolExecutionResult, ToolInvocation, ToolSpec
 from src.maisaka.subagent_tasks import SUBAGENT_MAX_RUNNING_TASKS, SubAgentOutcome, SubAgentTask
 
@@ -36,7 +36,7 @@ async def _is_owner(tool_ctx: BuiltinToolRuntimeContext) -> bool:
     if stream.user_id is None:
         raise ValueError("私聊会话缺少 user_id，无法解析硬件权限")
     role = await asyncio.to_thread(
-        _resolve_trust_role_sync, DEFAULT_TRUTH_DB_PATH, "", stream.user_id, stream.platform,
+        _resolve_trust_role_sync, resolve_truth_db_path(), "", stream.user_id, stream.platform,
     )
     return role == "OWNER"
 
@@ -46,7 +46,7 @@ def _register_phone_request(arguments: Dict[str, Any], task_id: str) -> None:
     action_type = arguments["action_type"]
     states = {"run_sop": "RUN_SOP_PENDING", "resume_confirm": "RESUME_CONFIRM_PENDING", "stop": "STOP_PENDING"}
     state = states[action_type]
-    db = _open_truth_db(DEFAULT_TRUTH_DB_PATH)
+    db = _open_truth_db(resolve_truth_db_path())
     try:
         current = db.conn.execute("SELECT current_app, latest_screen_file_code FROM global_state WHERE row_id=1").fetchone()
         current_app = current["current_app"] if current is not None else ""
@@ -61,7 +61,7 @@ def _register_phone_request(arguments: Dict[str, Any], task_id: str) -> None:
     finally:
         db.close()
     update_body_state(
-        DEFAULT_TRUTH_DB_PATH, body_state=state, current_app=current_app,
+        resolve_truth_db_path(), body_state=state, current_app=current_app,
         live_observation=json.dumps({"task_id": task_id, "phone_action": arguments}, ensure_ascii=False),
         latest_screen_file_code=screen_code,
     )

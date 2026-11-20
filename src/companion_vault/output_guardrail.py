@@ -7,7 +7,7 @@ import sqlite3
 from pathlib import Path
 from typing import Iterable, Sequence
 
-DEFAULT_TRUTH_DB_PATH = "data/companion_truth.db"
+from .paths import resolve_truth_db_path
 
 
 def _parse_env_anchors() -> list[str]:
@@ -17,9 +17,9 @@ def _parse_env_anchors() -> list[str]:
     return [item.strip() for item in raw.split(",") if len(item.strip()) >= 2]
 
 
-def _load_dynamic_balance_anchors(db_path: str = DEFAULT_TRUTH_DB_PATH) -> list[str]:
+def _load_dynamic_balance_anchors(db_path: str | None = None) -> list[str]:
     """提取真值库中精确美元余额特征串（如 '$8.37 USD'），防止模型误将私聊账单发往群聊。"""
-    path = Path(db_path)
+    path = Path(resolve_truth_db_path(db_path))
     if not path.is_file():
         return []
     try:
@@ -56,16 +56,17 @@ def check_group_outbound_text(
     text: str,
     *,
     is_group_chat: bool,
+    is_owner_private: bool = False,
     extra_secret_anchors: Sequence[str] | None = None,
-    db_path: str = DEFAULT_TRUTH_DB_PATH,
+    db_path: str | None = None,
 ) -> tuple[bool, str]:
     """
     校验群聊待发文本是否意外包含硬机密特征锚点。
     返回 (allowed, matched_anchor)：
-    - 私聊消息始终放行 (True, "")；
-    - 群聊消息一旦命中显式敏感词表或精确算力美元账单锚点，立即返回 (False, anchor) 触发熔断拦截。
+    - 经认证的 Owner 私聊放行 (True, "")；
+    - 群聊和普通熟人私聊命中敏感词或精确美元账单锚点时返回 (False, anchor)。
     """
-    if not is_group_chat or not text or not text.strip():
+    if (not is_group_chat and is_owner_private) or not text or not text.strip():
         return True, ""
 
     candidates: list[str] = []
@@ -88,3 +89,13 @@ def collect_configured_secret_anchors(extra: Iterable[str] = ()) -> list[str]:
         if len(clean) >= 2:
             seen[clean] = None
     return list(seen.keys())
+
+
+def is_owner_private_destination(chat_id: str, *, db_path: str | None = None) -> bool:
+    if not chat_id or chat_id.endswith("@chatroom"):
+        return False
+    from .runtime_bridge import _resolve_trust_role_sync
+    try:
+        return _resolve_trust_role_sync(resolve_truth_db_path(db_path), "", chat_id, "wechat") == "OWNER"
+    except (OSError, sqlite3.Error):
+        return False

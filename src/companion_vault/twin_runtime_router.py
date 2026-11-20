@@ -12,12 +12,13 @@ from __future__ import annotations
 
 import asyncio
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Literal, Optional, Sequence, Tuple
 
 from src.common.logger import get_logger
+from src.companion_vault.access_policy import TurnScope
 from src.companion_vault.compute_ledger import ComputeLedger, get_shared_compute_ledger
-from src.companion_vault.runtime_bridge import DEFAULT_TRUTH_DB_PATH, _resolve_trust_role_sync
+from src.companion_vault.runtime_bridge import DEFAULT_TRUTH_DB_PATH, _resolve_trust_role_sync, get_twin_routing_state
 from src.companion_vault.twin_narrative_router import TwinNarrativeDirector, get_twin_narrative_director
 
 logger = get_logger("twin_runtime_router")
@@ -44,7 +45,7 @@ class TwinTurnDecision:
     execution_mode: Literal["dual_director", "one_pass_st"] = "dual_director"
     younger_profile: Optional[Any] = None
     elder_profile: Optional[Any] = None
-
+    scope: Optional[TurnScope] = None
 
 def _text_mentions_any_name(text: str, names: Sequence[str]) -> bool:
     lowered = str(text or "").strip().lower()
@@ -188,16 +189,23 @@ async def resolve_turn_route(
     twin_mode_enabled = bool(getattr(resolved_pers, "twin_mode_enabled", True)) if resolved_pers else True
     eco_enabled = bool(getattr(resolved_eco, "enabled", True)) if resolved_eco else False
     raw_exec_mode = str(getattr(resolved_eco, "chat_execution_mode", "dual_director") or "dual_director").strip()
-    st_preset_enabled = False
-    try:
-        from src.companion_vault.st_preset_engine import get_st_preset_manager
+    from src.companion_vault.st_preset_engine import get_st_preset_manager, is_st_preset_enabled
 
-        st_preset_enabled = bool(get_st_preset_manager().load_config().get("enabled", False))
-    except Exception:
-        st_preset_enabled = False
+    st_config = await asyncio.to_thread(lambda: get_st_preset_manager().load_config())
+    st_preset_enabled = is_st_preset_enabled(st_config)
     execution_mode: Literal["dual_director", "one_pass_st"] = (
-        "one_pass_st" if (raw_exec_mode == "one_pass_st" or st_preset_enabled) else "dual_director"
+        raw_exec_mode if raw_exec_mode in {"dual_director", "one_pass_st"} else "dual_director"
     )
+    if execution_mode == "one_pass_st" and not st_preset_enabled:
+        return TwinTurnDecision(
+            abort_turn=True,
+            abort_reason="invalid_one_pass_st_without_preset",
+            sender_trust_role=normalized_role,
+            is_owner_private=is_owner_private,
+            execution_mode=execution_mode,
+            younger_profile=younger_profile,
+            elder_profile=elder_profile,
+        )
 
     if not eco_enabled:
         return TwinTurnDecision(
@@ -225,6 +233,11 @@ async def resolve_turn_route(
     except Exception:
         pass
     snapshot = effective_ledger.get_snapshot()
+    if isinstance(effective_ledger, ComputeLedger):
+        # Another session may have confirmed delivery since this ledger instance
+        # was loaded. Use the serialized database holder for the next arbitration.
+        persisted = await asyncio.to_thread(get_twin_routing_state, str(effective_ledger.truth_db_path))
+        snapshot = replace(snapshot, active_persona_slot=persisted["active_persona_slot"])
     balance_usd = float(snapshot.balance_usd)
     is_available = bool(snapshot.is_available)
 
@@ -306,7 +319,7 @@ async def resolve_turn_route(
         if not elder_names:
             elder_names = ["许玥", "玥姐", "阿玥"]
         calls_elder = bool(twin_mode_enabled and _text_mentions_any_name(routing_text, [*elder_names, "姐姐"]))
-        excerpt = recent_context.strip() or routing_text or clean_latest_text
+        excerpt = (recent_context.strip() or routing_text or clean_latest_text) if is_group_chat else ""
         note = ""
 
         if not away_arc:
@@ -392,7 +405,7 @@ async def resolve_turn_route(
                 effective_director.generate_elder_return_arc(
                     evolved_arc=prev_away_arc,
                     balance_usd=balance_usd,
-                    recent_chat_excerpt=recent_context.strip() or latest_user_text.strip(),
+                    recent_chat_excerpt=recent_context.strip() if is_group_chat else "",
                     direction_prompt=return_prompt,
                 ),
                 timeout=8.0,
@@ -455,10 +468,15 @@ async def resolve_turn_route(
         forced_slot = None
         if last_explicit_slot is not None:
             recommended_slot = last_explicit_slot
-        elif (bool(return_note) and is_owner_private) or (compute_tier == "SUPERCHARGED" and is_owner_private):
+        elif (return_note and is_owner_private) or (compute_tier == "SUPERCHARGED" and is_owner_private):
             recommended_slot = "sister_elder"
         else:
-            recommended_slot = "sister_younger"
+            previous_slot = str(snapshot.active_persona_slot or "").strip()
+            recommended_slot = (
+                previous_slot
+                if previous_slot in {"sister_younger", "sister_elder"}
+                else "sister_younger"
+            )
 
     return TwinTurnDecision(
         abort_turn=False,

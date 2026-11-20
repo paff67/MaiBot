@@ -1599,8 +1599,8 @@ async def test_unified_st_execution_mode_and_untruncated_owner_bond(
         eco_cfg=eco_dual,
         personality_cfg=pers_cfg,
     )
-    assert d_priv_st.execution_mode == "one_pass_st"
-    assert d_grp_st.execution_mode == "one_pass_st"
+    assert d_priv_st.execution_mode == "dual_director"
+    assert d_grp_st.execution_mode == "dual_director"
 
     # 4. build_planner_d0_director_guidance 保留完整 owner_relationship_bond（不再 [:450] 截断）
     long_bond = "A" * 620 + "_TAIL_BOND_ANCHOR"

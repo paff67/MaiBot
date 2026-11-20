@@ -79,6 +79,7 @@ class SupplementResources:
     allow_at: bool
     allow_emoji: bool
     allow_quote: bool
+    allow_image: bool = True
 
     @classmethod
     def capture(cls, snapshot: PlannerRequestSnapshot, session_id: str, is_group: bool) -> "SupplementResources":
@@ -101,8 +102,15 @@ class SupplementResources:
             global_config.chat.reply_style.group_quote_frequency if is_group
             else global_config.chat.reply_style.private_quote_frequency
         )
-        return cls(messages, pictures, emojis, is_group and global_config.chat.enable_reply_at,
-                   global_config.emoji.use_new_send_logic, frequency != "never")
+        from src.chat.message_receive.chat_manager import chat_manager
+        from src.platform_io.capabilities import channel_capabilities
+        stream = chat_manager.get_session_by_session_id(session_id)
+        platform = stream.platform if stream is not None else next((m.platform for m in messages.values()), "")
+        caps = channel_capabilities(platform, session_id)
+        return cls(messages, pictures if caps["send_image"] else {}, emojis if caps["send_emoji"] else {},
+                   is_group and global_config.chat.enable_reply_at and caps["mention"],
+                   global_config.emoji.use_new_send_logic and caps["send_emoji"],
+                   frequency != "never" and caps["native_quote"], caps["send_image"])
 
     @staticmethod
     def resolve_id(value: str, candidates: Dict[str, Any]) -> str:
@@ -174,6 +182,8 @@ async def resolve_supplement(
             components.append(AtComponent(target_user_id=user.user_id, target_user_nickname=user.user_nickname,
                                           target_user_cardname=user.user_cardname))
         elif isinstance(part, PictureNode):
+            if not resources.allow_image:
+                raise ValueError("Channel image capability unavailable")
             images = resources.pictures[resources.resolve_id(part.source, resources.pictures)]
             if part.index >= len(images):
                 raise ValueError(f"回复补充器图片序号超出范围：{part.source}:{part.index}")

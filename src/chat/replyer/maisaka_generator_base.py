@@ -8,6 +8,7 @@ import os
 import random
 import re
 import time
+import uuid
 
 from src.chat.message_receive.chat_manager import BotChatSession
 from src.chat.message_receive.message import SessionMessage
@@ -86,6 +87,25 @@ class MaisakaReplyContext:
     selected_expressions: List[Dict[str, Any]] = field(default_factory=list)
 
 
+def _request_local_generation(method):
+    from functools import wraps
+    from copy import copy
+
+    @wraps(method)
+    async def isolated(self, *args, **kwargs):
+        from types import MethodType
+
+        request_generator = copy(self)
+        request_generator._reset_st_request_state()
+        request_generator._last_st_request_messages = None
+        # Rebind instance-level hooks/builders to the request-local receiver as well.
+        for name, value in self.__dict__.items():
+            if isinstance(value, MethodType) and value.__self__ is self:
+                setattr(request_generator, name, MethodType(value.__func__, request_generator))
+        return await method(request_generator, *args, **kwargs)
+    return isolated
+
+
 class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
     """Maisaka replyer 的共享实现。"""
 
@@ -117,6 +137,105 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
         """解析本次值班的姐妹声带槽位，默认 sister_younger。"""
         raw_slot = str((reply_tool_args or {}).get("persona_slot") or "sister_younger").strip()
         return "sister_elder" if raw_slot == "sister_elder" else "sister_younger"
+
+    def commit_successful_delivery(self, reply_result: ReplyGenerationResult) -> bool:
+        """Commit MVU and holder state atomically after a confirmed visible delivery."""
+        pending = reply_result.pending_side_effects
+        delivery = pending.get("delivery")
+        if not isinstance(delivery, dict):
+            return False
+
+        from src.companion_vault import runtime_bridge
+        from src.companion_vault.compute_ledger import get_shared_compute_ledger
+        from src.companion_vault.mvu_engine import MVURuntimeEngine
+        from src.companion_vault.persona_v2_engine import get_persona_v2_manager
+
+        db_path = str(delivery["db_path"])
+        ledger = get_shared_compute_ledger(db_path)
+        update_holder = bool(delivery.get("update_holder", True))
+        slot = str(delivery["persona_slot"])
+        if slot not in {"sister_younger", "sister_elder"}:
+            raise ValueError("Unknown confirmed persona slot")
+        session_id = str(delivery["session_id"])
+        logical_turn_id = str(delivery["logical_turn_id"])
+        turn_order = int(delivery.get("turn_order") or time.time_ns())
+        db = runtime_bridge._open_truth_db(db_path)
+        mvu_watch = None
+        holder_updated = False
+        try:
+            with db.conn:
+                db.conn.execute("BEGIN IMMEDIATE")
+                holder = db.conn.execute(
+                    "SELECT fairy_compute_tier,active_persona_slot,last_confirmed_reply_order "
+                    "FROM global_state WHERE row_id=1"
+                ).fetchone()
+                current_delivery = holder is None or turn_order >= holder["last_confirmed_reply_order"]
+                if holder is not None:
+                    if holder["fairy_compute_tier"] in {"THRIFTY", "HIBERNATING"}:
+                        slot = "sister_younger"
+                    elif not update_holder:
+                        slot = str(holder["active_persona_slot"] or "sister_younger")
+                inserted = db.conn.execute(
+                    "INSERT OR IGNORE INTO confirmed_reply_turns(session_id,logical_turn_id,persona_slot) VALUES(?,?,?)",
+                    (session_id, logical_turn_id, slot),
+                ).rowcount
+                if not inserted:
+                    pending.clear()
+                    return False
+
+                mvu = pending.get("mvu")
+                if isinstance(mvu, dict) and current_delivery:
+                    card = get_persona_v2_manager().get_card(str(mvu["card_id"]))
+                    if card is not None:
+                        MVURuntimeEngine.ensure_card_mvu_defaults(db, card)
+                        result = MVURuntimeEngine.apply_turn_updates(
+                            db,
+                            card,
+                            list(mvu.get("raw_sources") or []),
+                            is_owner_private=bool(mvu.get("is_owner_private")),
+                            pre_extracted_ops=list(mvu.get("ops") or []),
+                            pre_extracted_analysis=str(mvu.get("analysis") or ""),
+                            manage_tx=False,
+                        )
+                        mvu_watch = result.to_telemetry_dict()
+                        mvu_watch["status"] = "committed"
+
+                beat = pending.get("beat")
+                if isinstance(beat, dict):
+                    from src.companion_vault.episodic_beats import confirm_beat
+                    confirm_beat(db.conn, logical_turn_id=logical_turn_id, persona_slot=slot, **beat)
+                db.conn.execute(
+                    "INSERT INTO global_state(row_id) VALUES(1) ON CONFLICT(row_id) DO NOTHING"
+                )
+                if update_holder:
+                    holder_updated = bool(db.conn.execute(
+                        "UPDATE global_state SET active_persona_slot=?, active_sister=?, last_confirmed_reply_order=? "
+                        "WHERE row_id=1 AND last_confirmed_reply_order<=?",
+                        (slot, slot, turn_order, turn_order),
+                    ).rowcount)
+                    db.conn.execute(
+                        "INSERT INTO session_speakers(session_id,persona_slot,logical_turn_id,turn_order) VALUES(?,?,?,?) "
+                        "ON CONFLICT(session_id) DO UPDATE SET persona_slot=excluded.persona_slot,"
+                        "logical_turn_id=excluded.logical_turn_id,turn_order=excluded.turn_order "
+                        "WHERE session_speakers.turn_order<=excluded.turn_order",
+                        (session_id, slot, logical_turn_id, turn_order),
+                    )
+        finally:
+            db.close()
+
+        session_id = str(delivery.get("session_id") or "")
+        if holder_updated:
+            ledger.adopt_confirmed_persona_slot(slot)
+        if holder_updated and session_id:
+            _LAST_SPEAKER_SLOT_BY_SESSION[session_id] = slot
+        telemetry = reply_result.metrics.extra.get("st_telemetry")
+        if isinstance(telemetry, dict):
+            if mvu_watch is not None:
+                telemetry["mvu_watch"] = mvu_watch
+            elif isinstance(telemetry.get("mvu_watch"), dict):
+                telemetry["mvu_watch"]["status"] = "committed" if current_delivery else "stale_delivery"
+        pending.clear()
+        return True
 
     def _resolve_slot_profile(self, reply_tool_args: Optional[Dict[str, Any]] = None) -> Any:
         """解析当前值班槽位对应的完整人格 Profile（带配置缺省兼容）。"""
@@ -199,6 +318,14 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
         if not sender_id and getattr(self, "chat_stream", None) is not None:
             sender_id = str(getattr(self.chat_stream, "user_id", "") or "").strip()
             platform = str(getattr(self.chat_stream, "platform", "") or platform).strip() or platform
+        stream = getattr(self, "chat_stream", None)
+        if stream is not None and not is_group_chat:
+            peer_id = str(getattr(stream, "user_id", "") or "")
+            if peer_id:
+                if peer_id != sender_id:
+                    person_id = ""
+                sender_id = peer_id
+                platform = str(getattr(stream, "platform", "") or platform)
         return is_group_chat, platform, sender_id, person_id
 
     def _resolve_is_owner_private(
@@ -429,8 +556,9 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
 
             twin_relation_line = self._build_twin_relation_line(active_slot, bot_name)
 
-            bg_story = str(getattr(global_config.personality, "background_story", "") or "").strip()
-            bg_block = f"\n【项目背景设定】\n{bg_story}" if bg_story else ""
+            from src.companion_vault.twin_worldview import PUBLIC_TWIN_WORLDVIEW
+
+            bg_block = f"\n【公开世界设定】\n{PUBLIC_TWIN_WORLDVIEW}"
             v2_static_suffix = ""
             if slot_profile is not None and not getattr(self, "_suppress_v2_in_personality_prompt", False):
                 try:
@@ -1074,25 +1202,22 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
         return items
 
     def _uses_retro_prompt(self) -> bool:
-        return global_config.debug.replyer_retro_prompt
+        return global_config.debug.replyer_retro_prompt and not self._uses_st_preset_engine()
 
     def _uses_st_preset_engine(self, reply_tool_args: Optional[Dict[str, Any]] = None) -> bool:
         """当挂载了自定义构建器或在 STPresetRuntimeManager 中开启预设引擎时返回 True。"""
         if callable(getattr(self, "_st_preset_request_builder", None)):
             return True
-        try:
-            from src.companion_vault.st_preset_engine import get_st_preset_manager
+        from src.companion_vault.st_preset_engine import get_st_preset_manager
 
-            persona_slot = self._resolve_effective_persona_slot(reply_tool_args)
-            slot_profile = self._resolve_slot_profile(reply_tool_args)
-            preset_override = str(getattr(slot_profile, "st_preset_file", "") or "").strip()
-            eng, _ = get_st_preset_manager().get_active_engine(
-                persona_slot=persona_slot,
-                preset_override=preset_override,
-            )
-            return eng is not None
-        except Exception:
-            return False
+        persona_slot = self._resolve_effective_persona_slot(reply_tool_args)
+        slot_profile = self._resolve_slot_profile(reply_tool_args)
+        preset_override = str(getattr(slot_profile, "st_preset_file", "") or "").strip()
+        eng, _ = get_st_preset_manager().get_active_engine(
+            persona_slot=persona_slot,
+            preset_override=preset_override,
+        )
+        return eng is not None
 
     def _compile_st_preset_for_replyer(
         self,
@@ -1111,6 +1236,7 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
             STHistoryTurn,
             get_st_preset_manager,
         )
+        from src.companion_vault.twin_worldview import PUBLIC_TWIN_WORLDVIEW
 
         args = reply_tool_args or {}
         persona_slot = self._resolve_effective_persona_slot(args)
@@ -1150,13 +1276,27 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
             last_user_msg = str(reply_message.processed_plain_text or "").strip()
 
         turns: List[STHistoryTurn] = []
-        raw_hist_items = self._build_history_messages(chat_history, enable_visual_message)
-        for item in raw_hist_items:
-            t_role: Literal["user", "assistant"] = "assistant" if item.role == RoleType.Assistant else "user"
-            t_text = get_item_text(item).strip()
-            m_parts = [p for p in getattr(item, "parts", ()) if not isinstance(p, ContextTextPart)]
-            if t_text or m_parts:
-                turns.append(STHistoryTurn(role=t_role, text=t_text, media_parts=m_parts))
+        for history_message in chat_history:
+            raw_items = self._build_history_messages([history_message], enable_visual_message)
+            source_message = getattr(history_message, "original_message", None)
+            if source_message is None and isinstance(history_message, SessionBackedMessage):
+                source_message = history_message
+            info = getattr(source_message, "message_info", None)
+            user_info = getattr(info, "user_info", None)
+            for item in raw_items:
+                t_role = "assistant" if item.role == RoleType.Assistant else "user"
+                t_text = get_item_text(item).strip()
+                media = [part for part in getattr(item, "parts", ()) if not isinstance(part, ContextTextPart)]
+                if t_text or media:
+                    turns.append(STHistoryTurn(
+                        role=t_role, text=t_text, media_parts=media,
+                        msg_id=str(getattr(history_message, "message_id", "") or ""),
+                        speaker_id=str(getattr(user_info, "user_id", "") or ""),
+                        speaker_name=str(getattr(user_info, "user_nickname", "") or ""),
+                        timestamp=str(getattr(history_message, "timestamp", "") or ""),
+                        quote_msg_id=str(getattr(history_message, "quote_message_id", "") or ""),
+                        persona_slot=str((getattr(info, "additional_config", {}) or {}).get("persona_slot") or "") if t_role == "assistant" else "",
+                    ))
 
         if not last_user_msg and turns and turns[-1].role == "user":
             last_user_msg = turns[-1].text
@@ -1194,21 +1334,7 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
             if (twin_mode and persona_slot == "sister_elder")
             else str(getattr(self.express_model, "task_name", "") or "replyer").strip() or "replyer"
         )
-        detected_client_type = "openai"
-        try:
-            from src.config.config import model_config as _mc
-            from src.services.service_task_resolver import get_available_models, resolve_task_name
-
-            resolved_task = resolve_task_name(active_task_name)
-            task_cfg = get_available_models().get(resolved_task)
-            model_list = list(getattr(task_cfg, "model_list", []) or [])
-            if model_list:
-                first_model = _mc.get_model_info(model_list[0])
-                prov = _mc.get_provider(first_model.api_provider)
-                detected_client_type = str(getattr(prov, "client_type", "openai") or "openai").lower()
-        except Exception:
-            detected_client_type = "openai"
-
+        detected_client_type = str(args.get("_attempt_client_type") or "openai")
         raw_proto = str(cfg.get("protocol_mode") or "auto").strip().lower()
         proto_mode: Literal["auto", "spreset_tool_envelope", "standard_chat"] = (
             raw_proto if raw_proto in {"auto", "spreset_tool_envelope", "standard_chat"} else "auto"
@@ -1232,23 +1358,47 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
             self._active_slot_profile = prev_slot_profile
             self._active_persona_slot = prev_persona_slot
 
+        archived_scenes = []
+        if reply_message is not None and str(reply_message.message_id).startswith("wechat:"):
+            from src.companion_vault.wechat_recall import memory_scope
+            from src.companion_vault.episodic_beats import read_beats
+            from src.companion_vault.runtime_bridge import _open_truth_db
+            from src.companion_vault.paths import resolve_truth_db_path
+            stream = self.chat_stream
+            ledger_path = os.environ.get("MAIBOT_MESSAGE_LEDGER_PATH", "data/message_ledger.db")
+            scope = memory_scope(message_id=reply_message.message_id, platform="wechat", account=stream.account_id,
+                                 chat_id=stream.group_id if stream.is_group_session else stream.user_id,
+                                 ledger_path=ledger_path)
+            db = _open_truth_db(resolve_truth_db_path())
+            try:
+                archived_scenes = read_beats(db.conn, ledger_path, **scope,
+                    active_msg_ids=[turn.msg_id.split(":")[-1] for turn in turns if turn.msg_id])
+            finally:
+                db.close()
         recalled_media_parts = self._collect_st_recalled_media_parts(args)
         ctx = STCompileContext(
             char_name=bot_name,
             user_name=user_name,
             char_description=char_description,
             char_personality=char_personality,
-            scenario=str(getattr(global_config.personality, "background_story", "") or "").strip(),
+            scenario=PUBLIC_TWIN_WORLDVIEW,
             shujuku_recalled=str(args.get("_recalled_memory_block") or ""),
             director_note=director_note,
             chat_history=turns,
             last_user_message=last_user_msg,
-            model_name=active_task_name,
+            target_msg_ids=[str(reply_message.message_id)] if reply_message is not None else [],
+            persona_slot=persona_slot,
+            archived_scenes=archived_scenes,
+            model_name=str(args.get("_attempt_model_name") or active_task_name),
             is_group_chat=bool(is_group_chat),
             is_owner_private=is_owner_private,
             oracle_mode="chat" if cfg.get("oracle_mode") == "chat" else "theater",
             deep_think=bool(cfg.get("deep_think", False)),
-            output_mode="raw_preset" if cfg.get("output_mode") == "raw_preset" else "im_clean",
+            output_mode=(
+                "im_clean"
+                if str(getattr(getattr(self, "chat_stream", None), "platform", "")).lower() == "wechat"
+                else "raw_preset" if cfg.get("output_mode") == "raw_preset" else "im_clean"
+            ),
             protocol_mode=proto_mode,
             client_type=detected_client_type,
             persona_v2_static=v2_turn.static_core_block if v2_turn is not None else "",
@@ -1260,6 +1410,8 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
             recalled_media_parts=recalled_media_parts,
         )
         compiled = engine.compile_to_context_items(ctx)
+        compiled.persona_card_id = v2_turn.card_id if v2_turn is not None else ""
+        compiled.output_mode = ctx.output_mode
         self._last_st_compiled_request = compiled
         self._last_st_output_mode = ctx.output_mode
         self._last_st_reply_tool_args = dict(args)
@@ -1751,12 +1903,25 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
                 tool_options=st_compiled.tool_definitions or None,
                 temperature=st_compiled.temperature,
                 max_tokens=st_compiled.max_tokens,
-                extra_params=dict(getattr(st_compiled, "extra_params", {}) or {}),
-                validate_required_tool_args=bool(st_compiled.tool_definitions),
+                extra_params={
+                    **dict(getattr(st_compiled, "extra_params", {}) or {}),
+                    **(
+                        {"top_p": st_compiled.top_p}
+                        if getattr(st_compiled, "top_p", None) is not None
+                        else {}
+                    ),
+                    **(
+                        {"top_k": st_compiled.top_k}
+                        if getattr(st_compiled, "top_k", None) is not None
+                        else {}
+                    ),
+                },
+                validate_required_tool_args=False,
                 response_validator=response_validator,
             )
         return LLMGenerationOptions(model_name=model_name)
 
+    @_request_local_generation
     async def run_st_single_turn(
         self,
         *,
@@ -1800,7 +1965,8 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
 
         self._reset_st_request_state()
         self._last_st_request_messages = None
-        request_messages = self._build_request_messages(
+        request_messages = await asyncio.to_thread(
+            self._build_request_messages,
             chat_history=filtered_history,
             reply_message=reply_message,
             reply_reason=reply_reason or "",
@@ -1809,6 +1975,7 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
         )
         self._last_st_request_messages = list(request_messages)
         generation_options = self._build_generation_options(None, allow_external_tool_calls=True)
+        generation_options.attempt_options_factory = lambda: self._build_generation_options(None, allow_external_tool_calls=True)
 
         async def context_factory(
             _client: object,
@@ -1833,7 +2000,8 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
                 reply_reason=reply_reason or "",
                 stream_id=stream_id,
                 enable_visual_message=enable_visual_message,
-                reply_tool_args=active_reply_tool_args,
+                reply_tool_args={**active_reply_tool_args, "_attempt_client_type": str(getattr(getattr(_client, "api_provider", None), "client_type", "openai")),
+                                 "_attempt_model_name": getattr(model_info, "model_identifier", "")},
             )
             request_messages = await self._invoke_before_model_request_hook(
                 request_messages=built_request_messages,
@@ -1857,6 +2025,7 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
         )
         return generation_result, getattr(self, "_last_st_compiled_request", None)
 
+    @_request_local_generation
     async def generate_reply_with_context(
         self,
         extra_info: str = "",
@@ -1892,9 +2061,11 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
         del unknown_words
 
         result = ReplyGenerationResult()
+        confirmed_reply_order = time.time_ns()
         overall_started_at = time.perf_counter()
         active_reply_tool_args = self._normalize_reply_tool_args(reply_tool_args)
         precomputed_st_response = active_reply_tool_args.pop("_precomputed_st_response", None)
+        precomputed_st_request = active_reply_tool_args.pop("_precomputed_st_request", None)
         if getattr(self, "express_model", None) is None and precomputed_st_response is None:
             logger.error("回复模型未初始化")
             result.error_message = "回复模型尚未初始化"
@@ -1963,6 +2134,7 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
         retro_period_regeneration_requested = False
         twin_mode_enabled = bool(getattr(global_config.personality, "twin_mode_enabled", False))
         effective_persona_slot = self._resolve_effective_persona_slot(active_reply_tool_args)
+        locked_persona_slot = effective_persona_slot
         active_slot_profile = self._resolve_slot_profile(active_reply_tool_args)
         base_express_task = (
             str(getattr(getattr(self, "express_model", None), "task_name", "") or "replyer").strip() or "replyer"
@@ -2000,7 +2172,7 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
                 before_request_kwargs = before_request_result.kwargs
                 prev_default_task = default_task_name
                 if isinstance(before_request_kwargs.get("reply_tool_args"), dict):
-                    active_reply_tool_args = dict(before_request_kwargs["reply_tool_args"])
+                    active_reply_tool_args = {**before_request_kwargs["reply_tool_args"], "persona_slot": locked_persona_slot}
                     effective_persona_slot = self._resolve_effective_persona_slot(active_reply_tool_args)
                     active_slot_profile = self._resolve_slot_profile(active_reply_tool_args)
                     default_task_name = (
@@ -2026,6 +2198,12 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
             use_precomputed = precomputed_st_response is not None and retry_count == 0
             prompt_started_at = time.perf_counter()
             cached_st_messages = getattr(self, "_last_st_request_messages", None) if use_precomputed else None
+            if use_precomputed and precomputed_st_request is not None:
+                cached_st_messages = precomputed_st_request.context_items
+                self._last_st_compiled_request = precomputed_st_request
+                self._last_st_output_mode = precomputed_st_request.output_mode
+                self._last_st_reply_tool_args = dict(active_reply_tool_args)
+                self._last_request_used_st = True
             if use_precomputed:
                 self._last_st_request_messages = None
             if cached_st_messages is not None:
@@ -2039,7 +2217,8 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
             else:
                 self._reset_st_request_state()
                 try:
-                    request_messages = self._build_request_messages(
+                    request_messages = await asyncio.to_thread(
+                        self._build_request_messages,
                         chat_history=filtered_history,
                         reply_message=reply_message,
                         reply_reason=reply_reason or "",
@@ -2099,7 +2278,8 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
                     reply_requirements=reply_requirements_for_attempt,
                     stream_id=stream_id,
                     enable_visual_message=enable_visual_message,
-                    reply_tool_args=dict(reply_tool_args_for_attempt),
+                    reply_tool_args={**dict(reply_tool_args_for_attempt), "_attempt_client_type": active_client_type,
+                                     "_attempt_model_name": getattr(model_info, "model_identifier", "")},
                     think_level=think_level,
                 )
                 request_messages = await self._invoke_before_model_request_hook(
@@ -2148,6 +2328,7 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
                             session_id=preview_chat_id,
                         )
                     generation_options = self._build_generation_options(active_model_name)
+                    generation_options.attempt_options_factory = lambda model=active_model_name: self._build_generation_options(model)
                     generation_result = await active_model.generate_response_with_context(
                         context_factory=context_factory,
                         options=generation_options,
@@ -2319,6 +2500,12 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
                         f"after={self._normalize_content(hook_modified_response, limit=300)!r}"
                     )
                 response_text = hook_modified_response
+            if st_engine_used:
+                checked = STPresetEngine.evaluate_wechat_direct_reply(response_text=response_text, output_mode="im_clean")
+                if not checked.is_valid:
+                    result.error_message = checked.message
+                    return finalize(False)
+                response_text = STPresetEngine.unwrap_response(response_text=response_text, output_mode="im_clean").visible_text
             if hasattr(generation_result, "output_items"):
                 generation_result.output_items = tuple(final_output_items)
             retry_requested = self._coerce_hook_bool(after_response_kwargs.get("retry"), default=False)
@@ -2469,7 +2656,6 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
         mvu_watch_payload: Optional[Dict[str, Any]] = None
         try:
             from src.companion_vault import runtime_bridge
-            from src.companion_vault.mvu_engine import MVURuntimeEngine
             from src.companion_vault.persona_v2_engine import get_persona_v2_manager
 
             mvu_enabled = bool(getattr(active_slot_profile, "mvu_enabled", True)) and bool(
@@ -2478,7 +2664,9 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
             v2_mgr = get_persona_v2_manager()
             compiled_v2_turn = getattr(self, "_last_persona_v2_turn", None)
             v2_card = None
-            if use_precomputed and compiled_v2_turn is not None and getattr(compiled_v2_turn, "card_id", ""):
+            if use_precomputed and precomputed_st_request is not None and precomputed_st_request.persona_card_id:
+                v2_card = v2_mgr.get_card(precomputed_st_request.persona_card_id)
+            elif use_precomputed and compiled_v2_turn is not None and getattr(compiled_v2_turn, "card_id", ""):
                 v2_card = v2_mgr.get_card(str(compiled_v2_turn.card_id))
             if v2_card is None:
                 v2_card = v2_mgr.resolve_card_for_profile(active_slot_profile)
@@ -2488,32 +2676,47 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
                     os.environ.get("MAIBOT_TRUTH_DB_PATH", "").strip()
                     or runtime_bridge.DEFAULT_TRUTH_DB_PATH
                 )
-                db = None
-                try:
-                    os.makedirs(os.path.dirname(truth_db_path) or ".", exist_ok=True)
-                    db = runtime_bridge._open_truth_db(truth_db_path)
-                    # STPresetEngine.unwrap_response 已完整提取过 raw/clean 里的 <UpdateVariable>，
-                    # 不得再次把 raw_llm_response_text 传入 raw_sources，避免同一 delta 被双倍结算。
-                    if unwrapped_st_output is not None:
-                        mvu_raw_sources = (
-                            [response_text] if "<updatevariable" in response_text.lower() else []
-                        )
-                    else:
-                        mvu_raw_sources = [raw_llm_response_text, response_text]
-                    mvu_res = MVURuntimeEngine.apply_turn_updates(
-                        db,
-                        v2_card,
-                        mvu_raw_sources,
-                        is_owner_private=is_owner_priv,
-                        pre_extracted_ops=unwrapped_st_output.mvu_patches if unwrapped_st_output is not None else None,
-                        pre_extracted_analysis=unwrapped_st_output.mvu_analysis if unwrapped_st_output is not None else "",
-                    )
-                    mvu_watch_payload = mvu_res.to_telemetry_dict()
-                finally:
-                    if db is not None:
-                        db.close()
+                # STPresetEngine 已从 tool envelope 提取补丁，避免把同一 delta 重复结算。
+                if unwrapped_st_output is not None:
+                    mvu_raw_sources = []
+                else:
+                    mvu_raw_sources = [raw_llm_response_text, response_text]
+                mvu_ops = (
+                    list(unwrapped_st_output.mvu_patches)
+                    if unwrapped_st_output is not None
+                    else []
+                )
+                mvu_analysis = (
+                    unwrapped_st_output.mvu_analysis
+                    if unwrapped_st_output is not None
+                    else ""
+                )
+                result.pending_side_effects["mvu"] = {
+                    "card_id": v2_card.card_id,
+                    "db_path": truth_db_path,
+                    "raw_sources": mvu_raw_sources,
+                    "ops": mvu_ops,
+                    "analysis": mvu_analysis,
+                    "is_owner_private": is_owner_priv,
+                }
+                mvu_watch_payload = {
+                    "card_id": v2_card.card_id,
+                    "status": "pending_delivery",
+                    "changes": [],
+                }
         except Exception as exc:
             logger.warning(f"应用 MVU 变量更新或构建 mvu_watch 失败: {exc}")
+
+        from src.companion_vault.runtime_bridge import DEFAULT_TRUTH_DB_PATH
+
+        result.pending_side_effects["delivery"] = {
+            "persona_slot": effective_persona_slot,
+            "session_id": preview_chat_id,
+            "db_path": os.environ.get("MAIBOT_TRUTH_DB_PATH", "").strip() or DEFAULT_TRUTH_DB_PATH,
+            "logical_turn_id": str(reply_tool_args.get("_logical_turn_id") or reply_tool_args.get("_reply_id") or uuid.uuid4().hex),
+            "update_holder": twin_mode_enabled,
+            "turn_order": confirmed_reply_order,
+        }
 
         if (
             twin_mode_enabled
@@ -2555,7 +2758,5 @@ class BaseMaisakaReplyGenerator(RetroReplyPromptMixin):
                 f"session={preview_chat_id} attempts={retry_count + 1} "
                 f"retry_count={retry_count} final={self._normalize_content(response_text, limit=300)!r}"
             )
-        if preview_chat_id:
-            _LAST_SPEAKER_SLOT_BY_SESSION[preview_chat_id] = effective_persona_slot
         result.text_fragments = [response_text]
         return finalize(True)

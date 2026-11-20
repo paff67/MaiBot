@@ -258,7 +258,7 @@ class MemoryConsolidator:
             prompt = prompt + "\n" + json.dumps(inputs, ensure_ascii=False)
         return prompt
 
-    def read_scoped(self, codes=None):
+    def read_scoped(self, codes=None, *, time_start: str = "", time_end: str = ""):
         # Read-time revision guard closes the gap before enqueue observes a revoke/update.
         from .access_policy import allowed_conversations, can_read_memory
 
@@ -274,6 +274,20 @@ class MemoryConsolidator:
                 return []
             extra = " AND c.code_index IN (" + ",".join("?" for _ in codes) + ")"
             params.extend(codes)
+        if time_start or time_end:
+            from .episodic_beats import normalize_time_bound
+
+            time_predicates = []
+            for value, operator, is_end in ((time_start, ">=", False), (time_end, "<=", True)):
+                if value:
+                    bound = datetime.datetime.fromisoformat(normalize_time_bound(value, end=is_end))
+                    time_predicates.append(f"CAST(json_extract(m.row_json, '$.createTime') AS INTEGER){operator}?")
+                    params.append(int(bound.timestamp() * 1000))
+            extra += (
+                " AND EXISTS(SELECT 1 FROM memory_provenance p JOIN ledger.messages m "
+                "ON m.source=p.source AND m.account=p.account AND m.chat_id=p.chat_id AND m.msg_id=p.msg_id "
+                "WHERE p.code_index=c.code_index AND " + " AND ".join(time_predicates) + ")"
+            )
         return [
             dict(r)
             for r in self.db.execute(
@@ -577,6 +591,7 @@ class MemoryConsolidator:
                     row["code_index"]: tuple(row)
                     for row in self.db.execute("SELECT * FROM chronicle_events")
                 }
+                before_user_status_rows = {row["key"]: dict(row) for row in self.db.execute("SELECT * FROM user_status")}
                 before_user_status_map = {
                     row["key"]: tuple(row)
                     for row in self.db.execute("SELECT * FROM user_status")
@@ -596,7 +611,12 @@ class MemoryConsolidator:
                     )
                 }
                 is_group_scope = self.chat.endswith("@chatroom")
-                if is_group_scope:
+                from .runtime_bridge import _resolve_trust_role
+
+                is_owner_private = not is_group_scope and _resolve_trust_role(
+                    self.truth, "", self.chat, "wechat"
+                ) == "OWNER"
+                if not is_owner_private:
                     before_user_status = [tuple(row) for row in self.db.execute("SELECT * FROM user_status ORDER BY key")]
                     before_global_state = [tuple(row) for row in self.db.execute("SELECT * FROM global_state ORDER BY row_id")]
                     before_mvu_variables = [
@@ -622,18 +642,18 @@ class MemoryConsolidator:
                     self.truth.execute_table_sql(
                         raw_sql,
                         manage_tx=False,
-                        forbid_private_person_columns=is_group_scope,
-                        forbid_owner_state_tables=is_group_scope,
+                        forbid_private_person_columns=not is_owner_private,
+                        forbid_owner_state_tables=not is_owner_private,
                     )
                 except sqlite3.DatabaseError as exc:
-                    if is_group_scope and "not authorized" in str(exc).lower():
+                    if not is_owner_private and "not authorized" in str(exc).lower():
                         if re.search(r"\b(user_status|global_state|mvu_variables)\b", raw_sql, re.IGNORECASE):
                             raise ValueError(
                                 "Group chat consolidation cannot modify owner user_status or global_state or mvu_variables"
                             ) from exc
                         raise ValueError("Group chat consolidation cannot read or modify owner_private_notes") from exc
                     raise
-                if is_group_scope:
+                if not is_owner_private:
                     after_user_status = [tuple(row) for row in self.db.execute("SELECT * FROM user_status ORDER BY key")]
                     after_global_state = [tuple(row) for row in self.db.execute("SELECT * FROM global_state ORDER BY row_id")]
                     after_mvu_variables = [
@@ -672,10 +692,14 @@ class MemoryConsolidator:
                     for qcode, new_q in after_quests_map.items():
                         if before_quests_map.get(qcode) != new_q:
                             self.db.execute(
-                                "UPDATE quests_events SET scope_chat_id = ?, visibility = 'PUBLIC' WHERE quest_code = ?",
-                                (self.chat, qcode),
+                                "UPDATE quests_events SET scope_chat_id = ?, visibility = ? WHERE quest_code = ?",
+                                (self.chat, "PUBLIC" if is_group_scope else "PRIVATE", qcode),
                             )
                 else:
+                    after_status = {row["key"]: dict(row) for row in self.db.execute("SELECT * FROM user_status")}
+                    for key, old in before_user_status_rows.items():
+                        if old.get("scope_chat_id") not in (None, "", self.chat) and after_status.get(key) != old:
+                            raise ValueError("Private consolidation cannot modify user_status from another chat scope")
                     for u_row in self.db.execute("SELECT * FROM user_status"):
                         ukey = str(u_row["key"])
                         if before_user_status_map.get(ukey) != tuple(u_row):
@@ -764,7 +788,7 @@ class MemoryConsolidator:
         return True
 
 
-def read_scoped_memories(truth_path, ledger_path, *, source, account, chat_id, codes=None):
+def read_scoped_memories(truth_path, ledger_path, *, source, account, chat_id, codes=None, time_start="", time_end=""):
     # Reuse the guarded read, without initializing a cursor or writing a model-generated table.
     worker = object.__new__(MemoryConsolidator)
     worker.source, worker.account, worker.chat = source, account, chat_id
@@ -772,7 +796,7 @@ def read_scoped_memories(truth_path, ledger_path, *, source, account, chat_id, c
     worker.db.row_factory = sqlite3.Row
     try:
         worker.db.execute("ATTACH DATABASE ? AS ledger", (Path(ledger_path).resolve().as_uri() + "?mode=ro",))
-        return worker.read_scoped(codes)
+        return worker.read_scoped(codes, time_start=time_start, time_end=time_end)
     finally:
         worker.db.close()
 

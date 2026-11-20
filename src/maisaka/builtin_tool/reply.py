@@ -40,8 +40,11 @@ _REPLY_TOOL_INTERNAL_ARGUMENTS = {
     "_recalled_memory_block",
     "_recalled_file_parts",
     "_precomputed_st_response",
+    "_precomputed_st_request",
     "_external_tools",
     "_tool_observations",
+    "_tool_observation_file_parts",
+    "_logical_turn_id",
 }
 _DUPLICATE_TARGET_REPLY_REMINDER_ARG = "_duplicate_target_reply_reminder"
 _DUPLICATE_TARGET_REPLY_REMINDER_TEMPLATE = (
@@ -143,8 +146,8 @@ def get_tool_spec(context: Optional[ToolAvailabilityContext] = None) -> ToolSpec
             "type": "string",
             "minLength": 1,
             "description": (
-                "提供本次回复的上下文关键信息与回复方向，"
-                "包括当前聊天状态、人物关系、事实信息、回忆信息；不是回复正文。"
+                "仅提供可公开的客观背景、检索事实与回应目标，"
+                "禁止代写台词、语气指令或温和说教。工具证据由服务端自动交接。"
             ),
         },
         "reply_style": {
@@ -436,8 +439,11 @@ async def handle_tool(
             f"{tool_ctx.runtime.log_prefix} 检测到 reply 工具参数被重复包裹，已自动解包: "
             f"调用编号={invocation.call_id}"
         )
-    for internal_key in _REPLY_TOOL_INTERNAL_ARGUMENTS - {"msg_id"}:
-        invocation_arguments.pop(internal_key, None)
+    # Every underscore key is server-owned, including future internal fields.
+    invocation_arguments = {key: value for key, value in invocation_arguments.items() if not key.startswith("_")}
+    invocation_arguments["_tool_observations"] = list(getattr(tool_ctx.engine, "_tool_observations", []))
+    invocation_arguments["_tool_observation_file_parts"] = list(getattr(tool_ctx.engine, "_tool_observation_file_parts", []))
+    invocation_arguments["_logical_turn_id"] = str(getattr(tool_ctx.engine, "_active_logical_turn_id", "") or invocation.call_id)
     return await execute_reply(tool_ctx, invocation_arguments, call_id=invocation.call_id)
 
 
@@ -458,12 +464,15 @@ async def execute_reply(
     """
 
     precomputed_st_response = precomputed if precomputed is not None else arguments.get("_precomputed_st_response")
+    precomputed_st_request = arguments.get("_precomputed_st_request")
     raw_external_tools = arguments.get("_external_tools")
     raw_tool_observations = arguments.get("_tool_observations")
+    raw_observation_parts = list(arguments.get("_tool_observation_file_parts") or [])
     raw_recalled_memory_block = str(arguments.get("_recalled_memory_block") or "")
     raw_recalled_file_parts = list(arguments.get("_recalled_file_parts") or [])
     copy_safe_arguments = {
-        key: value for key, value in arguments.items() if key != "_precomputed_st_response"
+        key: value for key, value in arguments.items()
+        if key not in {"_precomputed_st_response", "_precomputed_st_request"}
     }
     invocation_arguments = deepcopy(copy_safe_arguments)
     if type(invocation_arguments.get("attach_emoji")) is int and invocation_arguments["attach_emoji"] == 0:
@@ -491,10 +500,14 @@ async def execute_reply(
         reply_tool_args["_recalled_memory_block"] = raw_recalled_memory_block
     if raw_recalled_file_parts:
         reply_tool_args["_recalled_file_parts"] = raw_recalled_file_parts
+    if raw_observation_parts:
+        reply_tool_args["_recalled_file_parts"] = [*reply_tool_args.get("_recalled_file_parts", []), *raw_observation_parts]
     if raw_external_tools is not None:
         reply_tool_args["_external_tools"] = list(raw_external_tools)
     if raw_tool_observations is not None:
         reply_tool_args["_tool_observations"] = list(raw_tool_observations)
+    if precomputed_st_request is not None:
+        reply_tool_args["_precomputed_st_request"] = precomputed_st_request
     if precomputed_st_response is not None:
         reply_tool_args["_precomputed_st_response"] = precomputed_st_response
     if not _use_expression_intent():
@@ -537,6 +550,31 @@ async def execute_reply(
             f"未找到要回复的目标消息，msg_id={to_display_message_id(target_message_id)}",
         )
 
+    if target_message.session_id != tool_ctx.runtime.session_id:
+        return tool_ctx.build_failure_result("reply", "Reply target belongs to another session")
+    from src.companion_vault.paths import resolve_truth_db_path
+    from src.platform_io.capabilities import channel_capabilities, unavailable_reply_arguments
+
+    capabilities = channel_capabilities(tool_ctx.runtime.chat_stream.platform, tool_ctx.runtime.session_id)
+    denied = unavailable_reply_arguments(arguments, capabilities)
+    if not capabilities["send_text"] or denied:
+        return tool_ctx.build_failure_result("reply", "Channel capability unavailable: " + ", ".join(denied))
+    beat_scope = {}
+    beat_sources = []
+    if target_message.platform == "wechat" and target_message.message_id.startswith("wechat:"):
+        from src.companion_vault.wechat_recall import memory_scope
+        from src.companion_vault.episodic_beats import capture_turn_sources
+        stream = tool_ctx.runtime.chat_stream
+        destination = stream.group_id if stream.is_group_session else stream.user_id
+        ledger_path = os.environ.get("MAIBOT_MESSAGE_LEDGER_PATH", "data/message_ledger.db")
+        beat_scope = await asyncio.to_thread(
+            memory_scope, message_id=target_message.message_id, platform="wechat",
+            account=str(stream.account_id or ""), chat_id=destination, ledger_path=ledger_path,
+        )
+        beat_sources = await asyncio.to_thread(
+            capture_turn_sources, list(getattr(tool_ctx.engine, "_turn_source_messages", []) or [target_message]),
+            **beat_scope, ledger_path=ledger_path,
+        )
     quote_kwargs = {}
     if target_message.platform == 'wechat':
         from src.companion_vault.wechat_recall import quote_binding
@@ -545,11 +583,14 @@ async def execute_reply(
             quote_binding, message_id=target_message.message_id, platform=target_message.platform,
             account=target_message.account_id or '',
             chat_id=group.group_id if group else target_message.message_info.user_info.user_id,
+            ledger_path=os.environ.get("MAIBOT_MESSAGE_LEDGER_PATH", "data/message_ledger.db"),
         )
     if any(invocation_arguments.get(key) for key in ("memory_greenlights", "file_greenlights", "person_greenlights", "quick_state_patch")):
         memory_block, file_parts = await load_reply_greenlights_async(
+            db_path=resolve_truth_db_path(),
             is_group_chat=tool_ctx.runtime.chat_stream.is_group_session,
-            user_id=target_message.message_info.user_info.user_id,
+            user_id=(target_message.message_info.user_info.user_id if tool_ctx.runtime.chat_stream.is_group_session
+                     else tool_ctx.runtime.chat_stream.user_id),
             platform=target_message.platform,
             memory_greenlights=invocation_arguments.get("memory_greenlights", []),
             file_greenlights=invocation_arguments.get("file_greenlights", []),
@@ -558,7 +599,9 @@ async def execute_reply(
             gemini_api_key=os.environ.get("GEMINI_API_KEY", ""),
             anchor_message_id=target_message.message_id,
             account=target_message.account_id or '',
-            chat_id=target_message.message_info.group_info.group_id if target_message.message_info.group_info else target_message.message_info.user_info.user_id,
+            chat_id=(tool_ctx.runtime.chat_stream.group_id if tool_ctx.runtime.chat_stream.is_group_session
+                     else tool_ctx.runtime.chat_stream.user_id),
+            ledger_path=os.environ.get("MAIBOT_MESSAGE_LEDGER_PATH", "data/message_ledger.db"),
         )
         if memory_block:
             prev_mem = reply_tool_args.get("_recalled_memory_block", "")
@@ -568,7 +611,10 @@ async def execute_reply(
 
     if quote_kwargs:
         from src.companion_vault.wechat_recall import build_quote_context_async
-        quote_block, quote_parts = await build_quote_context_async([target_message])
+        quote_block, quote_parts = await build_quote_context_async(
+            [target_message], db_path=resolve_truth_db_path(),
+            ledger_path=os.environ.get("MAIBOT_MESSAGE_LEDGER_PATH", "data/message_ledger.db"),
+        )
         if quote_block and quote_block not in reply_tool_args.get("_recalled_memory_block", ""):
             prev_mem = reply_tool_args.get("_recalled_memory_block", "")
             reply_tool_args["_recalled_memory_block"] = f"{prev_mem}\n{quote_block}".strip() if prev_mem else quote_block
@@ -657,6 +703,8 @@ async def execute_reply(
         reply_tool_args["_sender_trust_role"] = str(getattr(turn_decision, "sender_trust_role", "") or "")
         reply_tool_args["_is_owner_private"] = bool(getattr(turn_decision, "is_owner_private", False))
 
+    reply_tool_args["_logical_turn_id"] = str(arguments.get("_logical_turn_id") or getattr(tool_ctx.engine, "_active_logical_turn_id", "") or call_id or extension_execution.reply_id)
+    reply_tool_args["_reply_id"] = extension_execution.reply_id
     supplement: Optional["ReplySupplement"] = None
     try:
         stage_desc = (
@@ -887,6 +935,12 @@ async def execute_reply(
             effective_set_quote = True
     if quote_probability is not None:
         reply_metadata["quote_probability"] = quote_probability
+    if beat_scope and beat_sources:
+        summary = str(st_telemetry.get("summary") or "") if isinstance(st_telemetry, dict) else ""
+        if summary:
+            reply_result.pending_side_effects["beat"] = {
+                **beat_scope, "sources": beat_sources, "summary_text": summary,
+            }
     sent_message_ids: list[str] = []
     send_results: list[dict[str, Any]] = []
     # 逐段更新回执，后续发送抛错时也保留已经送达的消息，避免误判为完全未发送。
@@ -964,11 +1018,37 @@ async def execute_reply(
                 previous_sent_message = sent_message
     except Exception:
         logger.exception(f"{tool_ctx.runtime.log_prefix} 发送文字消息时发生异常，目标消息编号={target_message_id}")
+        if sent_message_ids and reply_result.pending_side_effects:
+            try:
+                await asyncio.to_thread(replyer.commit_successful_delivery, reply_result)
+            except Exception:
+                logger.exception(
+                    f"{tool_ctx.runtime.log_prefix} 部分消息已投递，但提交 MVU/持机人状态失败: reply_id={extension_execution.reply_id}"
+                )
+                telemetry = reply_result.metrics.extra.get("st_telemetry")
+                if isinstance(telemetry, dict) and isinstance(telemetry.get("mvu_watch"), dict):
+                    telemetry["mvu_watch"]["status"] = "commit_failed"
+            reply_result.monitor_detail = build_reply_monitor_detail(reply_result)
+            reply_metadata.update(_build_monitor_metadata(reply_result, extension_execution.reply_id))
         return tool_ctx.build_failure_result(
             "reply",
             "发送可见回复时发生异常。",
             metadata=reply_metadata,
         )
+
+    has_successful_send = bool(sent_message_ids)
+    if has_successful_send and reply_result.pending_side_effects:
+        try:
+            await asyncio.to_thread(replyer.commit_successful_delivery, reply_result)
+        except Exception:
+            logger.exception(
+                f"{tool_ctx.runtime.log_prefix} 已投递回复，但提交 MVU/持机人状态失败: reply_id={extension_execution.reply_id}"
+            )
+            telemetry = reply_result.metrics.extra.get("st_telemetry")
+            if isinstance(telemetry, dict) and isinstance(telemetry.get("mvu_watch"), dict):
+                telemetry["mvu_watch"]["status"] = "commit_failed"
+        reply_result.monitor_detail = build_reply_monitor_detail(reply_result)
+        reply_metadata.update(_build_monitor_metadata(reply_result, extension_execution.reply_id))
 
     if not sent:
         return tool_ctx.build_failure_result(

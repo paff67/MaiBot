@@ -257,6 +257,7 @@ class LLMGenerationOptions(BaseDataModel):
 
     temperature: float | None = None
     max_tokens: int | None = None
+    attempt_options_factory: Callable[[], Any] | None = None
     model_name: str | None = None
     tool_options: List[ToolDefinitionInput] | None = None
     response_format: RespFormat | None = None

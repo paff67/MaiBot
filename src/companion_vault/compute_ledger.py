@@ -216,8 +216,10 @@ class ComputeLedger:
                     ) VALUES (1, 'Asia/Tokyo', ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(row_id) DO UPDATE SET
                         timezone_name = 'Asia/Tokyo',
-                        active_persona_slot = excluded.active_persona_slot,
-                        active_sister = excluded.active_sister,
+                        active_persona_slot = CASE WHEN excluded.fairy_compute_tier IN ('THRIFTY','HIBERNATING')
+                            THEN 'sister_younger' ELSE global_state.active_persona_slot END,
+                        active_sister = CASE WHEN excluded.fairy_compute_tier IN ('THRIFTY','HIBERNATING')
+                            THEN 'sister_younger' ELSE global_state.active_sister END,
                         elder_away_arc = excluded.elder_away_arc,
                         chat_execution_mode = excluded.chat_execution_mode,
                         fairy_remote_balance_usd = excluded.fairy_remote_balance_usd,
@@ -240,6 +242,15 @@ class ComputeLedger:
                 )
         finally:
             db.close()
+
+    def adopt_confirmed_persona_slot(self, slot: str) -> str:
+        """Refresh the in-memory holder after the caller commits delivery state."""
+        normalized = str(slot or "").strip()
+        if normalized not in {PERSONA_SLOT_YOUNGER, PERSONA_SLOT_ELDER}:
+            raise ValueError("Unknown persona slot")
+        snapshot = self.get_snapshot(override_persona_slot=normalized)
+        self._active_persona_slot = snapshot.active_persona_slot
+        return snapshot.active_persona_slot
 
     def record_local_cost(self, estimated_usd: float) -> ComputeLedgerSnapshot:
         if estimated_usd > 0:

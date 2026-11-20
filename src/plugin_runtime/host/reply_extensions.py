@@ -34,6 +34,7 @@ def get_reply_extensions(
     filters = asdict(context) if context is not None else {}
     filters.pop("stream_id", None)
     filters.pop("user_id", None)
+    filters.pop("channel_capabilities", None)
     result: Dict[str, ReplyExtensionTarget] = {}
     for supervisor in get_plugin_runtime_manager().supervisors:
         for entry in supervisor.component_registry.get_components_by_type(

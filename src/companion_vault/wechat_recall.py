@@ -113,6 +113,16 @@ def memory_scope(*, message_id, platform, account, chat_id, ledger_path="data/me
     return dict(source=sources[0], account=account, chat_id=chat_id)
 
 
+def message_is_current(*, source, account, chat_id, msg_id, ledger_path="data/message_ledger.db"):
+    """Check one exact ledger identity and reject messages replaced by a revoke row."""
+    with sqlite3.connect(Path(ledger_path).resolve().as_uri() + "?mode=ro", uri=True) as db:
+        rows = db.execute(
+            "SELECT kind FROM messages WHERE source=? AND account=? AND chat_id=? AND msg_id=?",
+            (source, account, chat_id, str(msg_id)),
+        ).fetchall()
+    return len(rows) == 1 and (int(rows[0][0] or 0) & 65535) != 10000
+
+
 async def build_quote_context_async(
     messages,
     *,

@@ -30,6 +30,7 @@ def get_tool_spec(*, enabled: bool = True) -> ToolSpec:
         parameters_schema={
             "type": "object",
             "properties": {
+                "codes": {"type":"array","items":{"type":"string"},"description":"Optional Vault IDs, including BE scene summaries."},
                 "query": {
                     "type": "string",
                     "description": "关键词或问题；非纯时间检索必填。",
@@ -194,6 +195,8 @@ async def handle_tool(
     runtime = tool_ctx.runtime
     chat_stream = runtime.chat_stream
 
+    if chat_stream.platform == "wechat":
+        return await _query_wechat_vault(tool_ctx, invocation)
     clean_query = str(invocation.arguments.get("query") or "").strip()
     mode = str(invocation.arguments.get("mode") or "search").strip().lower() or "search"
     if mode not in _ALLOWED_QUERY_MODES:
@@ -341,3 +344,70 @@ async def handle_tool(
         structured_content=structured_content,
         metadata=metadata,
     )
+
+
+async def _query_wechat_vault(
+    tool_ctx: BuiltinToolRuntimeContext, invocation: ToolInvocation,
+) -> ToolExecutionResult:
+    """Keep WeChat reads in the bound Vault, with no host-memory fallback."""
+    import asyncio
+    import json
+    import os
+    import sqlite3
+    from src.companion_vault.runtime_bridge import resolve_session_scope, _open_truth_db
+    from src.companion_vault.paths import resolve_truth_db_path
+    from src.companion_vault.episodic_beats import read_beats
+    from src.companion_vault.consolidator import read_scoped_memories
+
+    runtime = tool_ctx.runtime
+    messages = list(getattr(tool_ctx.engine, "_turn_source_messages", []))
+    if not messages:
+        messages = [item.original_message for item in runtime._chat_history if hasattr(item, "original_message")]
+    if not messages:
+        return tool_ctx.build_failure_result("query_memory", "Vault requires a bound current message")
+
+    def load() -> Dict[str, Any]:
+        ledger_path = os.environ.get("MAIBOT_MESSAGE_LEDGER_PATH", "data/message_ledger.db")
+        scope = resolve_session_scope(runtime.chat_stream, messages[-1], ledger_path=ledger_path)
+        codes = invocation.arguments.get("codes")
+        if codes is not None and (not isinstance(codes, list) or any(not isinstance(code, str) for code in codes)):
+            raise ValueError("codes must be a list of Vault IDs")
+        # An optional empty search filter is different from an empty reply greenlight.
+        if codes == []:
+            codes = None
+        mode = str(invocation.arguments.get("mode") or "search").strip().lower()
+        if mode not in _ALLOWED_QUERY_MODES:
+            raise ValueError("Unsupported Vault memory query mode")
+        query = str(invocation.arguments.get("query") or "").strip()
+        time_start = str(invocation.arguments.get("time_start") or "")
+        time_end = str(invocation.arguments.get("time_end") or "")
+        if not query and not codes and not time_start and not time_end:
+            raise ValueError("query_memory requires a query, Vault IDs or a time range")
+        try:
+            limit = max(1, min(int(invocation.arguments.get("limit") or 20), 20))
+        except (ValueError, TypeError):
+            limit = 20
+        db_path = resolve_truth_db_path()
+        db = _open_truth_db(db_path)
+        try:
+            bound = {"source": scope.source, "account": scope.account, "chat_id": scope.chat_id}
+            beats = read_beats(
+                db.conn, ledger_path, **bound, codes=codes, query=query, limit=limit,
+                time_start=time_start, time_end=time_end,
+            )
+            memories = read_scoped_memories(
+                db_path, ledger_path, **bound, codes=codes, time_start=time_start, time_end=time_end,
+            )
+            if query:
+                memories = [row for row in memories if query in json.dumps(row, ensure_ascii=False)]
+            return {"episodic_beats": beats, "scoped_memories": memories[:limit]}
+        finally:
+            db.close()
+
+    try:
+        result = await asyncio.to_thread(load)
+        return tool_ctx.build_success_result(
+            "query_memory", json.dumps(result, ensure_ascii=False), structured_content=result,
+        )
+    except (ValueError, OSError, sqlite3.Error) as exc:
+        return tool_ctx.build_failure_result("query_memory", str(exc))

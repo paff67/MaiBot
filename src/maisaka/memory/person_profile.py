@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+import os
 from pathlib import Path
 import sqlite3
 from typing import Sequence
@@ -235,20 +236,9 @@ def _format_profile_person_block(display_name: str, profile_text: str) -> str:
 
 
 def _is_truth_owner(conn: sqlite3.Connection, platform: str, user_id: str) -> bool:
-    clean_uid = _clean_text(user_id)
-    if not clean_uid:
-        return False
-    clean_plat = _clean_text(platform)
-    if clean_plat:
-        row = conn.execute(
-            "SELECT trust_role FROM person_info WHERE person_id = ? OR json_extract(platform_ids, ?) = ? LIMIT 1",
-            (clean_uid, f"$.{clean_plat}", clean_uid),
-        ).fetchone()
-        if row is None and clean_plat.lower() in ("internal", "webui") and clean_uid.lower() == "owner":
-            row = conn.execute("SELECT trust_role FROM person_info WHERE trust_role = 'OWNER' LIMIT 1").fetchone()
-    else:
-        row = conn.execute("SELECT trust_role FROM person_info WHERE person_id = ? LIMIT 1", (clean_uid,)).fetchone()
-    return bool(row and _clean_text(row["trust_role"]).upper() == "OWNER")
+    from src.companion_vault.access_policy import resolve_identity_role
+
+    return resolve_identity_role(conn, platform=platform, user_id=user_id) == "OWNER"
 
 
 def _query_companion_truth_profile(
@@ -259,6 +249,9 @@ def _query_companion_truth_profile(
     *,
     is_group_chat: bool = True,
     requester_user_id: str = "",
+    group_id: str = "",
+    source: str = "",
+    account: str = "",
 ) -> tuple[str, str] | None:
     """从 companion_truth.db 查询人物画像（防线一 SQL 投影级硬裁剪 + json_extract 查询）。"""
     clean_platform = _clean_text(platform)
@@ -284,15 +277,19 @@ def _query_companion_truth_profile(
         if not existing_cols:
             return None
 
-        allow_owner_private = (not is_group_chat) and _is_truth_owner(
-            conn, clean_platform, requester_user_id or clean_user_id
-        )
-        select_cols = ["person_id", "person_name", "trust_role"]
-        if not is_group_chat and "wechat_remark" in existing_cols:
+        from src.companion_vault.access_policy import TurnScope
+
+        owner = not is_group_chat and _is_truth_owner(conn, clean_platform, requester_user_id)
+        scope = TurnScope(clean_platform, "", source, account, group_id if is_group_chat else requester_user_id,
+                          requester_user_id, is_group_chat, "OWNER" if owner else "GROUP_MEMBER")
+        allow_owner_private = scope.is_owner_private
+        predicate, params = scope.person_filter()
+        select_cols = ["person_id", "person_name", "trust_role" if allow_owner_private else "'GROUP_MEMBER' AS trust_role"]
+        if allow_owner_private and "wechat_remark" in existing_cols:
             select_cols.append("wechat_remark")
         if "one_line_intro" in existing_cols:
             select_cols.append("one_line_intro")
-        if "relationship_text" in existing_cols and not is_group_chat:
+        if "relationship_text" in existing_cols and allow_owner_private:
             select_cols.append("relationship_text")
         if "public_impression" in existing_cols:
             select_cols.append("public_impression")
@@ -303,19 +300,20 @@ def _query_companion_truth_profile(
                 select_cols.append("impression")
 
         projection = ", ".join(select_cols)
+        visible_people = f"(SELECT * FROM person_info WHERE {predicate})"
         matched_row: sqlite3.Row | None = None
 
         if clean_user_id:
             if clean_platform:
                 matched_row = conn.execute(
-                    f"SELECT {projection} FROM person_info "
+                    f"SELECT {projection} FROM {visible_people} "
                     f"WHERE person_id = ? OR json_extract(platform_ids, ?) = ? LIMIT 1",
-                    (clean_user_id, f"$.{clean_platform}", clean_user_id),
+                    (*params, clean_user_id, f"$.{clean_platform}", clean_user_id),
                 ).fetchone()
             else:
                 matched_row = conn.execute(
-                    f"SELECT {projection} FROM person_info WHERE person_id = ? OR platform_ids LIKE ? LIMIT 1",
-                    (clean_user_id, f'%"{clean_user_id}"%'),
+                    f"SELECT {projection} FROM {visible_people} WHERE person_id = ? OR platform_ids LIKE ? LIMIT 1",
+                    (*params, clean_user_id, f'%"{clean_user_id}"%'),
                 ).fetchone()
             if (
                 matched_row is None
@@ -323,19 +321,19 @@ def _query_companion_truth_profile(
                 and clean_user_id.lower() == "owner"
             ):
                 matched_row = conn.execute(
-                    f"SELECT {projection} FROM person_info WHERE trust_role = 'OWNER' LIMIT 1"
+                    f"SELECT {projection} FROM {visible_people} WHERE trust_role = 'OWNER' LIMIT 1", params
                 ).fetchone()
 
         if matched_row is None and clean_person_name:
-            if not is_group_chat and "wechat_remark" in existing_cols:
+            if allow_owner_private and "wechat_remark" in existing_cols:
                 matched_row = conn.execute(
-                    f"SELECT {projection} FROM person_info WHERE person_name = ? OR wechat_remark = ? LIMIT 1",
-                    (clean_person_name, clean_person_name),
+                    f"SELECT {projection} FROM {visible_people} WHERE person_name = ? OR wechat_remark = ? LIMIT 1",
+                    (*params, clean_person_name, clean_person_name),
                 ).fetchone()
             else:
                 matched_row = conn.execute(
-                    f"SELECT {projection} FROM person_info WHERE person_name = ? LIMIT 1",
-                    (clean_person_name,),
+                    f"SELECT {projection} FROM {visible_people} WHERE person_name = ? LIMIT 1",
+                    (*params, clean_person_name,),
                 ).fetchone()
     except Exception as exc:
         logger.debug(f"读取 companion_truth.db 人物画像失败: err={exc}")
@@ -392,6 +390,7 @@ async def build_person_profile_injection_messages(
     pending_messages: Sequence[SessionMessage] | None = None,
     db_path: str = DEFAULT_TRUTH_DB_PATH,
     is_group_chat: bool | None = None,
+    turn_scope=None,
 ) -> list[str]:
     """构造注入 planner 的一次性人物画像内部参考消息。"""
 
@@ -415,6 +414,30 @@ async def build_person_profile_injection_messages(
     if not candidates:
         return []
 
+    group_info = anchor_message.message_info.group_info
+    group_id = _clean_text(group_info.group_id) if group_info is not None else ""
+    source = ""
+    if turn_scope is not None:
+        requester_uid = turn_scope.requester_id
+        effective_is_group = turn_scope.is_group
+        group_id = turn_scope.chat_id
+        source = turn_scope.source
+    elif effective_is_group and is_wechat_platform and group_id:
+        try:
+            from src.companion_vault.wechat_recall import memory_scope
+
+            resolved_scope = await asyncio.to_thread(
+                memory_scope,
+                message_id=anchor_message.message_id,
+                platform=anchor_message.platform,
+                account=anchor_message.account_id or "",
+                chat_id=group_id,
+                ledger_path=os.environ.get("MAIBOT_MESSAGE_LEDGER_PATH", "data/message_ledger.db"),
+            )
+            source = str(resolved_scope.get("source") or "")
+        except (ValueError, OSError, sqlite3.Error):
+            source = ""
+
     context_text = "\n".join(
         str(message.processed_plain_text or "").strip()
         for message in [anchor_message, *(pending_messages or ())]
@@ -431,6 +454,9 @@ async def build_person_profile_injection_messages(
                 db_path,
                 is_group_chat=effective_is_group,
                 requester_user_id=requester_uid,
+                group_id=group_id,
+                source=source,
+                account=turn_scope.account if turn_scope else anchor_message.account_id or "",
             )
         except Exception as exc:
             logger.debug(f"从 companion_truth.db 查询人物画像失败: person_id={candidate.person_id!r} err={exc}")

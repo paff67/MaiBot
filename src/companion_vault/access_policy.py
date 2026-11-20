@@ -1,6 +1,7 @@
 """Friend-group access: private chats may read joined groups; groups never read DMs."""
 
 from typing import Iterable
+from dataclasses import dataclass
 import re
 
 
@@ -39,6 +40,58 @@ def set_group_member(db, *, source, account, group_id, user_id, present):
                 "DELETE FROM group_members WHERE source=? AND account=? AND group_id=? AND user_id=?",
                 (source, account, group_id, user_id),
             )
+
+
+def resolve_identity_role(conn, *, platform: str, user_id: str, person_id: str = "") -> str:
+    """Grant a role only for a unique, matching platform identity."""
+    platform = str(platform or "").strip()
+    user_id = str(user_id or "").strip()
+    if not platform or not user_id:
+        return "GROUP_MEMBER"
+    rows = conn.execute(
+        "SELECT person_id,trust_role FROM person_info WHERE "
+        "json_extract(platform_ids, ?)=?",
+        (f"$.{platform}", user_id),
+    ).fetchall()
+    if len(rows) == 1 and (not person_id or rows[0][0] == person_id):
+        return rows[0][1]
+    if platform.lower() in {"internal", "webui"} and user_id.lower() == "owner":
+        owners = conn.execute("SELECT person_id FROM person_info WHERE trust_role='OWNER'").fetchall()
+        if len(owners) == 1 and (not person_id or owners[0][0] == person_id):
+            return "OWNER"
+    return "GROUP_MEMBER"
+
+
+@dataclass(frozen=True)
+class TurnScope:
+    """Bound conversation identity, independent of a tool's reply or lookup target."""
+
+    platform: str
+    session_id: str
+    source: str
+    account: str
+    chat_id: str
+    requester_id: str
+    is_group: bool
+    role: str
+
+    @property
+    def is_owner_private(self) -> bool:
+        return not self.is_group and self.requester_id == self.chat_id and self.role == "OWNER"
+
+    def person_filter(self):
+        """SQL predicate and parameters shared by catalog, name search and profile injection."""
+        if self.is_owner_private:
+            return "1", ()
+        identity = "COALESCE(NULLIF(json_extract(platform_ids, ?), ''), person_id)"
+        if self.is_group and self.source and self.account and self.chat_id:
+            return (
+                f"{identity} IN (SELECT user_id FROM group_members WHERE source=? AND account=? AND group_id=?)",
+                ("$.wechat", self.source, self.account, self.chat_id),
+            )
+        if not self.is_group and self.requester_id and self.requester_id == self.chat_id and self.platform:
+            return f"{identity} = ?", (f"$.{self.platform}", self.requester_id)
+        return "0", ()
 
 
 def allowed_conversations(db, *, source, account, requester_id, destination_chat_id):

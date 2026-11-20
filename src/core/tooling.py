@@ -184,6 +184,7 @@ class ToolExecutionContext:
     user_id: str = ""
     platform: str = ""
     metadata: Dict[str, Any] = field(default_factory=dict)
+    channel_capabilities: Dict[str, bool] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -196,6 +197,7 @@ class ToolAvailabilityContext:
     group_id: str = ""
     user_id: str = ""
     platform: str = ""
+    channel_capabilities: Dict[str, bool] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -314,6 +316,16 @@ class ToolRegistry:
         for provider, original in entries:
             name = original.name
             spec = deepcopy(original)
+            from src.platform_io.capabilities import channel_capabilities, TOOL_CAPABILITIES, REPLY_CAPABILITIES
+            caps = channel_capabilities(context.platform, context.session_id, context.channel_capabilities) if context else None
+            required_capability = spec.metadata.get("channel_capability") or TOOL_CAPABILITIES.get(name)
+            if caps is not None and required_capability and not caps.get(required_capability, True):
+                continue
+            if caps is not None and name == "reply" and spec.parameters_schema:
+                schema = spec.parameters_schema
+                removed = {key for key, capability in REPLY_CAPABILITIES.items() if not caps[capability]}
+                schema["properties"] = {key: value for key, value in schema.get("properties", {}).items() if key not in removed}
+                schema["required"] = [key for key in schema.get("required", []) if key not in removed]
             spec.metadata["registry_original_name"] = name
             if name in routes:
                 source = str(
@@ -401,11 +413,19 @@ class ToolRegistry:
                 group_id=context.group_id,
                 user_id=context.user_id,
                 platform=context.platform,
+                channel_capabilities=dict(context.channel_capabilities),
             )
 
         route = (await self._list_routes(availability_context)).get(invocation.tool_name)
         if route is not None:
             provider, spec = route
+            if availability_context and spec.metadata["registry_original_name"] == "reply":
+                from src.platform_io.capabilities import channel_capabilities, unavailable_reply_arguments
+                caps = channel_capabilities(availability_context.platform, availability_context.session_id, availability_context.channel_capabilities)
+                denied = unavailable_reply_arguments(invocation.arguments, caps)
+                if denied:
+                    return ToolExecutionResult(tool_name=invocation.tool_name, success=False,
+                                               error_message="Channel capability unavailable: " + ", ".join(denied))
             metadata = dict(invocation.metadata)
             if provider.provider_type == "mcp":
                 # 服务器选择来自注册表，不接受调用方伪造的路由元数据。

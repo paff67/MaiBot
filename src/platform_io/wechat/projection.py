@@ -9,6 +9,7 @@ import json
 import os
 import re
 import sqlite3
+import xml.etree.ElementTree as ET
 
 from .message_quotes import latest_quote, parse_quote, safe_body
 
@@ -197,16 +198,15 @@ def enrich_sender_identity(
     """
     解耦微信公开昵称 (person_name) 与号主单向备注 (wechat_remark)：
     - sender_nickname: 优先使用 person_name（如公开群昵称），确保群友 @提及 时名字在上下文中可对齐；
-    - sender_cardname: 承载 wechat_remark，使消息头渲染为 <message user="公开昵称" group_card="备注">。
+    - sender_cardname: 仅使用公开昵称，私有通讯录备注不进入消息投影。
     """
     profile = wxid_to_profile.get(sender_wxid, {})
     person_name = profile.get("person_name", "").strip()
-    wechat_remark = profile.get("wechat_remark", "").strip()
 
-    enriched["sender_nickname"] = person_name or wechat_remark or enriched.get("sender_nickname") or sender_wxid
-    enriched["sender_cardname"] = wechat_remark or person_name or enriched.get("sender_cardname") or ""
+    enriched["sender_nickname"] = person_name or enriched.get("sender_nickname") or sender_wxid
+    enriched["sender_cardname"] = person_name or enriched.get("sender_nickname") or sender_wxid
     enriched["sender_person_name"] = person_name
-    enriched["sender_wechat_remark"] = wechat_remark
+    enriched["sender_wechat_remark"] = ""
 
 
 def parse_wechat_text_to_raw_segments(
@@ -252,9 +252,8 @@ def parse_wechat_text_to_raw_segments(
 
         target_wxid = resolved_wxid or f"unmapped_name:{at_display_name}"
         prof = wxid_to_profile.get(target_wxid, {})
-        remark = prof.get("wechat_remark", "")
         p_name = prof.get("person_name", "") or at_display_name
-        display_name = f"{p_name}(备注:{remark})" if (remark and remark != p_name) else p_name
+        display_name = p_name
 
         raw_message_segments.append(
             {
@@ -347,7 +346,7 @@ def enrich_record_from_truth_db(
     return enriched
 
 
-def project_message(record: Dict[str, Any]) -> Dict[str, Any]:
+def project_message(record: Dict[str, Any], *, channel_capabilities: Optional[Dict[str, bool]] = None) -> Dict[str, Any]:
     row = json.loads(record["row_json"])
     if row["msgId"] != record["msg_id"] or row["talker"] != record["chat_id"]:
         raise ValueError("Ledger ownership mismatch")
@@ -360,7 +359,24 @@ def project_message(record: Dict[str, Any]) -> Dict[str, Any]:
     if not sender:
         raise ValueError("Unknown sender; never substitute a group ID or nickname")
 
-    quote = parse_quote(row) if kind == 49 else None
+    from src.platform_io.capabilities import WECHAT_CAPABILITIES
+    from .message_quotes import app_message, parse_forward_recorditem
+    capabilities = {**WECHAT_CAPABILITIES, **(channel_capabilities or {})}
+    try:
+        app = app_message(row.get("content") or "") if kind == 49 else None
+    except (ValueError, ET.ParseError):
+        app = None
+    is_forward = app is not None and app.findtext("type") == "19"
+    forward_nodes = []
+    if is_forward and capabilities["read_forward_text"]:
+        try:
+            forward_nodes = parse_forward_recorditem(row.get("content") or "")
+        except (ValueError, ET.ParseError):
+            forward_nodes = []
+    try:
+        quote = parse_quote(row) if kind == 49 else None
+    except (ValueError, ET.ParseError):
+        quote = None
     body = (
         quote["reply_text"]
         if quote
@@ -418,7 +434,12 @@ def project_message(record: Dict[str, Any]) -> Dict[str, Any]:
             ref_author = quote.get("display_name") or quote.get("target_sender_id") or "群友"
             body = f"[引用 @{ref_author}] {body}"
 
-    if kind in (1, 49) or "@" in body or xml_at_wxids:
+    if is_forward:
+        if forward_nodes:
+            raw_message.append({"type": "forward", "data": forward_nodes})
+        else:
+            raw_message.append({"type": "text", "data": "[合并转发文本能力未开启]" if not capabilities["read_forward_text"] else "[合并转发无内嵌正文，当前不可用]"})
+    elif kind in (1, 49) or "@" in body or xml_at_wxids:
         segments = parse_wechat_text_to_raw_segments(
             body,
             sender_id=sender,

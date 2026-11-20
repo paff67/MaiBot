@@ -921,17 +921,24 @@ async def _send_via_platform_io(
             and message.message_info.group_info
             and str(message.message_info.group_info.group_id or "").strip()
         )
-        if is_group_outbound:
-            from src.companion_vault.output_guardrail import check_group_outbound_text
+        if message.platform == "wechat" or is_group_outbound:
+            from src.companion_vault.output_guardrail import check_group_outbound_text, is_owner_private_destination
 
             text_parts = [str(message.processed_plain_text or "")]
             for comp in message.raw_message.components:
                 if isinstance(comp, TextComponent) and comp.text:
                     text_parts.append(comp.text)
             combined_outbound = "\n".join(text_parts)
-            allowed_outbound, hit_anchor = check_group_outbound_text(
+            additional_config = message.message_info.additional_config or {}
+            destination_user_id = str(additional_config.get("platform_io_target_user_id") or "")
+            allowed_outbound, hit_anchor = await asyncio.to_thread(
+                check_group_outbound_text,
                 combined_outbound,
-                is_group_chat=True,
+                is_group_chat=is_group_outbound,
+                is_owner_private=await asyncio.to_thread(
+                    is_owner_private_destination,
+                    destination_user_id,
+                ) if not is_group_outbound else False,
             )
             if not allowed_outbound:
                 logger.error(

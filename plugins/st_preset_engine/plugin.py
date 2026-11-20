@@ -16,6 +16,7 @@ from src.companion_vault.st_preset_engine import (
     get_st_preset_manager,
 )
 from src.companion_vault.twin_narrative_router import get_twin_narrative_director
+from src.config.config import global_config
 from src.llm_models.payload_content.context_item import (
     FunctionCallItem,
     FunctionCallOutputItem,
@@ -133,17 +134,19 @@ class STPresetEnginePlugin(MaiBotPlugin):
                 protocol_label = "预设读取失败"
         elder_text = str(cfg.get("sister_elder_preset") or "") or "跟随默认预设"
         return {
-            "enabled_label": "已启用接管" if cfg.get("enabled") else "待机（原生提示词）",
+            "enabled_label": "已启用 Replyer ST 预设" if cfg.get("enabled") else "Replyer ST 预设已关闭",
+            "execution_topology_label": str(global_config.twin_economy.chat_execution_mode),
             "active_preset_label": active_name or "暂无预设",
             "protocol_label": protocol_label,
             "preset_count": len(presets),
             "binding_summary": (
-                f"默认/妹妹预设：{active_name or '无'} ｜ 姐姐专属预设：{elder_text} ｜ 输出模式：{cfg.get('output_mode', 'im_clean')}"
+                f"默认/妹妹预设：{active_name or '无'} ｜ 姐姐专属预设：{elder_text} ｜ "
+                f"输出模式：{cfg.get('output_mode', 'im_clean')}"
             ),
             "entry_rows": entry_rows,
         }
 
-    @API("webui_quick_toggle", description="快速切换全局 STPresetEngine 接管开关", version="1")
+    @API("webui_quick_toggle", description="快速切换 Replyer ST 预设启用开关", version="1")
     async def webui_quick_toggle(self, enabled: bool = True) -> Dict[str, Any]:
         mgr = get_st_preset_manager()
         cfg = mgr.save_config({"enabled": bool(enabled)})
@@ -155,6 +158,7 @@ class STPresetEnginePlugin(MaiBotPlugin):
         director = get_twin_narrative_director()
         return {
             "engine_config": mgr.load_config(),
+            "chat_execution_mode": str(global_config.twin_economy.chat_execution_mode),
             "available_presets": mgr.list_preset_names(),
             "twin_narrative": {
                 "config": asdict(director.load_prompts()),
@@ -165,7 +169,7 @@ class STPresetEnginePlugin(MaiBotPlugin):
     async def webui_inspect_preset(self, preset_name: str) -> Dict[str, Any]:
         return self._inspect_engine(preset_name)
 
-    @API("webui_save_config", description="保存 STPresetEngine 配置与双子动态叙事约束 Prompt", version="1")
+    @API("webui_save_config", description="保存 Replyer ST 预设启用状态、预设与双子动态叙事约束", version="1")
     async def webui_save_config(
         self,
         enabled: bool,

@@ -509,6 +509,7 @@ class LLMOrchestrator:
         extra_params: Optional[Dict[str, Any]] = None,
         validate_required_tool_args: bool = False,
         response_validator: ResponseValidator | None = None,
+        attempt_options_factory: Optional[Callable[[], Any]] = None,
     ) -> LLMResponseResult:
         """基于外部消息工厂异步生成响应。
 
@@ -544,6 +545,7 @@ class LLMOrchestrator:
             extra_params=extra_params,
             validate_required_tool_args=validate_required_tool_args,
             response_validator=response_validator,
+            attempt_options_factory=attempt_options_factory,
             session_id=session_id,
         )
         response = execution_result.api_response
@@ -1411,6 +1413,7 @@ class LLMOrchestrator:
         extra_params: Optional[Dict[str, Any]] = None,
         validate_required_tool_args: bool = False,
         response_validator: ResponseValidator | None = None,
+        attempt_options_factory: Optional[Callable[[], Any]] = None,
     ) -> LLMExecutionResult:
         """执行一次完整的模型调度请求。
 
@@ -1466,26 +1469,27 @@ class LLMOrchestrator:
                 if request_type == RequestType.RESPONSE and context_items:
                     # 图片解码、缩放及切图在线程池执行，避免阻塞 Bot 或 WebUI 事件循环。
                     context_items = await asyncio.to_thread(normalize_context_images, context_items)
+                attempt_options = attempt_options_factory() if attempt_options_factory else None
                 request = self._build_client_request(
                     request_type=request_type,
                     model_info=model_info,
                     context_items=context_items,
-                    tool_options=tool_options,
+                    tool_options=self._build_tool_options(attempt_options.tool_options) if attempt_options is not None else tool_options,
                     response_format=response_format,
                     stream_response_handler=stream_response_handler,
                     async_response_parser=async_response_parser,
                     interrupt_flag=interrupt_flag,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
+                    temperature=attempt_options.temperature if attempt_options is not None else temperature,
+                    max_tokens=attempt_options.max_tokens if attempt_options is not None else max_tokens,
                     embedding_input=embedding_input,
                     image_bytes=image_bytes,
                     image_mime_type=image_mime_type,
                     image_preprocess_version=image_preprocess_version,
                     audio_base64=audio_base64,
                     trace_context=trace_context,
-                    extra_params=extra_params,
-                    validate_required_tool_args=validate_required_tool_args,
-                    response_validator=response_validator,
+                    extra_params=attempt_options.extra_params if attempt_options is not None else extra_params,
+                    validate_required_tool_args=attempt_options.validate_required_tool_args if attempt_options is not None else validate_required_tool_args,
+                    response_validator=attempt_options.response_validator if attempt_options is not None else response_validator,
                 )
                 if self.request_type.startswith("maisaka."):
                     logger.debug(

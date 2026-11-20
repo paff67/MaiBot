@@ -132,6 +132,8 @@ GEMINI_SAFE_SETTINGS: List[SafetySetting] = [
 """默认安全策略，避免 Gemini 在部分内容上返回空响应。"""
 
 GENERATE_CONFIG_RESERVED_EXTRA_PARAMS = {
+    "temperature",
+    "max_output_tokens",
     "thinking_budget",
     "thinking_level",
     "think_level",
@@ -936,6 +938,7 @@ class GeminiClient(AdapterClient[AsyncIterator[GenerateContentResponse], Generat
         if isinstance(raw_level, str):
             normalized = raw_level.strip().upper()
             str_map = {
+                "0": ThinkingLevel.MINIMAL,
                 "MINIMAL": ThinkingLevel.MINIMAL,
                 "LOW": ThinkingLevel.LOW,
                 "MEDIUM": ThinkingLevel.MEDIUM,
@@ -1160,7 +1163,7 @@ class GeminiClient(AdapterClient[AsyncIterator[GenerateContentResponse], Generat
                 extra_params=request.extra_params,
                 enable_google_search=enable_google_search,
             )
-            if request.tool_choice == "none":
+            if request.tool_choice == "none" and "hydrogen" not in model_identifier.lower():
                 generation_config.tool_config = ToolConfig(function_calling_config=FunctionCallingConfig(mode="NONE"))
             snapshot_provider_request["request_kwargs"] = {
                 "config": generation_config,

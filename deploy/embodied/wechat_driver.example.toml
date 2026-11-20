@@ -16,3 +16,13 @@ max_sends_per_chat_per_minute = 3
 rate_limit_wait_seconds = 65.0
 poll_interval = 1.0
 backfill = false
+
+[drivers.capabilities]
+send_text = true
+native_quote = true
+text_mention_fallback = true
+send_image = false
+send_emoji = false
+native_at = false
+read_forward_text = false
+phone_action = false

@@ -95,6 +95,17 @@ class MainSystem:
 
     async def initialize(self) -> None:
         """初始化系统组件"""
+        from src.companion_vault.st_preset_engine import get_st_preset_manager, is_st_preset_enabled
+
+        execution_mode = str(global_config.twin_economy.chat_execution_mode)
+        preset_manager = await asyncio.to_thread(get_st_preset_manager)
+        preset_enabled = is_st_preset_enabled(await asyncio.to_thread(preset_manager.load_config))
+        if execution_mode == "one_pass_st" and not preset_enabled:
+            raise RuntimeError("Invalid chat configuration: one_pass_st requires STPresetEngine enabled=true")
+        if preset_enabled:
+            for slot in ("sister_younger", "sister_elder"):
+                profile = global_config.personality.resolve_slot_profile(slot, global_config.bot, global_config.chat.reply_style)
+                await asyncio.to_thread(preset_manager.get_active_engine, slot, profile.st_preset_file)
         logger.info(t("startup.waking_up", nickname=global_config.bot.nickname))
 
         # 主循环看门狗提前覆盖启动阶段；独立采样线程补充阻塞当时的调用栈。

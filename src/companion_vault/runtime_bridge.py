@@ -7,39 +7,24 @@ import json
 import os
 import sqlite3
 
+from .access_policy import TurnScope
 from .truth_db import CompanionTruthDB
 from .asset_pipeline import AssetPipeline
 from .quote_recall import load_original_descriptors, recall_quotes
 
-DEFAULT_TRUTH_DB_PATH = "data/companion_truth.db"
+from .paths import DEFAULT_TRUTH_DB_PATH as DEFAULT_TRUTH_DB_PATH, resolve_truth_db_path
 
 
-def _open_truth_db(db_path: str) -> CompanionTruthDB:
+def _open_truth_db(db_path: str | None = None) -> CompanionTruthDB:
+    db_path = resolve_truth_db_path(db_path)
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     return CompanionTruthDB(db_path)
 
 
 def _resolve_trust_role(db: CompanionTruthDB, person_id: str, user_id: str, platform: str) -> str:
-    if person_id:
-        row = db.conn.execute("SELECT trust_role FROM person_info WHERE person_id = ?", (person_id,)).fetchone()
-        if row is not None:
-            return row["trust_role"]
-    clean_uid = str(user_id or "").strip()
-    clean_plat = str(platform or "").strip()
-    # platform_ids 为平台到账号 ID 的映射；若 person_id 直接存为平台账号 ID 也做匹配。
-    for row in db.conn.execute("SELECT person_id, platform_ids, trust_role FROM person_info"):
-        try:
-            pids = json.loads(row["platform_ids"] or "{}")
-        except (ValueError, TypeError):
-            pids = {}
-        if pids.get(clean_plat) == clean_uid or (clean_uid and row["person_id"] == clean_uid):
-            return row["trust_role"]
-    # 本地 WebUI Owner 聊天室（platform in ('internal', 'webui') 且 user_id == 'owner'）映射至 OWNER
-    if clean_plat.lower() in ("internal", "webui") and clean_uid.lower() == "owner":
-        owner_row = db.conn.execute("SELECT trust_role FROM person_info WHERE trust_role = 'OWNER' LIMIT 1").fetchone()
-        if owner_row is not None:
-            return owner_row["trust_role"]
-    return "GROUP_MEMBER"
+    from .access_policy import resolve_identity_role
+
+    return resolve_identity_role(db.conn, platform=platform, user_id=user_id, person_id=person_id)
 
 
 def _resolve_owner_primary_scope(db: CompanionTruthDB) -> Dict[str, str] | None:
@@ -61,8 +46,6 @@ def _resolve_owner_primary_scope(db: CompanionTruthDB) -> Dict[str, str] | None:
         (owner_chat_id,),
     ).fetchone()
     if prov is None:
-        prov = db.conn.execute("SELECT source, account FROM memory_provenance LIMIT 1").fetchone()
-    if prov is None:
         return None
     source = str(prov["source"] or "").strip()
     account = str(prov["account"] or "").strip()
@@ -77,6 +60,46 @@ def _resolve_trust_role_sync(db_path: str, person_id: str, user_id: str, platfor
         return _resolve_trust_role(db, person_id, user_id, platform)
     finally:
         db.close()
+
+
+def resolve_session_scope(stream, message=None, *, db_path=None, ledger_path=None) -> TurnScope:
+    """Resolve authority from the destination stream. A reply/quote author never grants access."""
+    platform = stream.platform
+    group = stream.is_group_session
+    account = str(getattr(stream, "account_id", "") or "")
+    destination = str((stream.group_id if group else stream.user_id) or "")
+    requester = str(message.message_info.user_info.user_id if group and message else destination)
+    source = ""
+    if platform == "wechat":
+        from .wechat_recall import memory_scope
+
+        native_id = str(getattr(message, "message_id", "") or "")
+        if message is None or not account or not destination:
+            raise ValueError("Missing WeChat session binding")
+        if message.session_id != stream.session_id or message.platform != platform or message.account_id != account:
+            raise ValueError("WeChat session or account mismatch")
+        parts = native_id.split(":")
+        driver_scope = getattr(stream, "scope", "")
+        if len(parts) != 4 or (driver_scope and driver_scope != parts[1]):
+            raise ValueError("WeChat driver scope mismatch")
+        binding = memory_scope(
+            message_id=native_id, platform=platform, account=account, chat_id=destination,
+            ledger_path=ledger_path or os.environ.get("MAIBOT_MESSAGE_LEDGER_PATH", "data/message_ledger.db"),
+        )
+        source = binding["source"]
+        bound_ledger = ledger_path or os.environ.get("MAIBOT_MESSAGE_LEDGER_PATH", "data/message_ledger.db")
+        with sqlite3.connect(Path(bound_ledger).resolve().as_uri() + "?mode=ro", uri=True) as ledger:
+            row = ledger.execute(
+                "SELECT sender_id,kind,direction FROM messages WHERE source=? AND account=? AND chat_id=? AND msg_id=?",
+                (source, account, destination, parts[3]),
+            ).fetchone()
+        if not row or (int(row[1]) & 65535) == 10000 or row[2] != "incoming":
+            raise ValueError("Missing or revoked incoming message")
+        if group and row[0] != requester:
+            raise ValueError("Incoming sender differs from the ledger author")
+    person_id = str(getattr(message.message_info.user_info, "person_id", "") or "") if message else ""
+    role = _resolve_trust_role_sync(resolve_truth_db_path(db_path), person_id, requester, platform)
+    return TurnScope(platform, stream.session_id, source, account, destination, requester, group, role)
 
 
 def build_owner_persona_overlay(
@@ -107,7 +130,7 @@ def build_owner_persona_overlay(
                 "WHERE trust_role = 'OWNER' AND (person_id = ? OR json_extract(platform_ids, ?) = ?) LIMIT 1",
                 (clean_uid, f"$.{clean_plat}", clean_uid),
             ).fetchone()
-        if row is None:
+        if row is None and clean_plat in ("internal", "webui") and clean_uid == "owner":
             row = db.conn.execute(
                 "SELECT owner_private_notes, impression, one_line_intro FROM person_info WHERE trust_role = 'OWNER' LIMIT 1"
             ).fetchone()
@@ -118,6 +141,8 @@ def build_owner_persona_overlay(
         owner_notes = ""
         owner_intro = ""
 
+    if row is None:
+        return ""
     configured_overlay = (overlay_text or os.environ.get("MAIBOT_OWNER_PERSONA_OVERLAY", "")).strip()
     if not owner_notes and not owner_intro and not configured_overlay:
         return ""
@@ -133,8 +158,9 @@ def build_owner_persona_overlay(
     return "\n".join(parts)
 
 
-def get_twin_routing_state(db_path: str = DEFAULT_TRUTH_DB_PATH) -> Dict[str, Any]:
+def get_twin_routing_state(db_path: str | None = None) -> Dict[str, Any]:
     """读取 global_state 中的双子角色槽位、离场弧光状态与对话执行模式预留状态。"""
+    db_path = resolve_truth_db_path(db_path)
     default_state: Dict[str, Any] = {
         "timezone_name": "Asia/Tokyo",
         "active_persona_slot": "sister_younger",
@@ -214,22 +240,41 @@ async def build_planner_truth_catalog_async(
     is_group_chat: bool,
     user_id: str,
     platform: str,
-    db_path: str = DEFAULT_TRUTH_DB_PATH,
+    db_path: str | None = None,
     anchor_message_id: str = "",
     account: str = "",
     chat_id: str = "",
     ledger_path: str = "data/message_ledger.db",
     owner_overlay_text: str = "",
 ) -> str:
+    db_path = resolve_truth_db_path(db_path)
     def build() -> str:
         db = _open_truth_db(db_path)
         try:
             sender_role = _resolve_trust_role(db, "", user_id, platform)
+            if not is_group_chat and chat_id and chat_id != user_id:
+                sender_role = "GROUP_MEMBER"
+            scope = _resolve_active_memory_scope(
+                db,
+                platform=platform,
+                sender_role=sender_role,
+                is_group_chat=is_group_chat,
+                anchor_message_id=anchor_message_id,
+                account=account,
+                chat_id=chat_id,
+                ledger_path=ledger_path,
+            )
+            roster_source = str(scope.get("source") or "")
+            roster_account = str(scope.get("account") or account)
             catalog = db.build_planner_catalog_injection(
                 is_group_chat=is_group_chat,
                 sender_trust_role=sender_role,
                 include_unscoped_media_and_events=(platform != "wechat"),
                 chat_id=chat_id,
+                source=roster_source,
+                account=roster_account,
+                requester_user_id=user_id,
+                requester_platform=platform,
             )
             overlay_block = build_owner_persona_overlay(
                 db,
@@ -241,16 +286,6 @@ async def build_planner_truth_catalog_async(
             )
             if overlay_block:
                 catalog = f"{catalog}\n\n{overlay_block}"
-            scope = _resolve_active_memory_scope(
-                db,
-                platform=platform,
-                sender_role=sender_role,
-                is_group_chat=is_group_chat,
-                anchor_message_id=anchor_message_id,
-                account=account,
-                chat_id=chat_id,
-                ledger_path=ledger_path,
-            )
             if scope:
                 from .consolidator import read_scoped_memories
                 from .access_policy import authorized_file_rows
@@ -280,9 +315,10 @@ async def build_planner_truth_catalog_async(
                         entry["drive_status"] = r.get("drive_status") or "pending"
                     if has_links:
                         link_row = db.conn.execute(
-                            "SELECT msg_id FROM message_asset_links WHERE file_code=? AND account=? AND active=1 "
-                            "ORDER BY CAST(msg_id AS INTEGER) DESC LIMIT 1",
-                            (r["file_code"], scope_account),
+                            "SELECT l.msg_id FROM message_asset_links l JOIN message_media_jobs j USING(job_id) "
+                            "WHERE l.file_code=? AND l.account=? AND l.active=1 AND j.source=? AND l.chat_id=? "
+                            "ORDER BY CAST(l.msg_id AS INTEGER) DESC LIMIT 1",
+                            (r["file_code"], scope_account, scope["source"], scope_chat_id),
                         ).fetchone()
                         if link_row is not None and link_row[0]:
                             entry["msg_id"] = str(link_row[0])
@@ -319,7 +355,7 @@ async def load_reply_greenlights_async(
     file_greenlights: Sequence[Any],
     person_greenlights: Sequence[str] = (),
     quick_state_patch: Sequence[Dict[str, Any]] = (),
-    db_path: str = DEFAULT_TRUTH_DB_PATH,
+    db_path: str | None = None,
     vault_root: str = "/mnt/gdrive/companion_vault",
     gemini_api_key: str = "",
     quote_message_ids: Sequence[str] = (),
@@ -332,6 +368,7 @@ async def load_reply_greenlights_async(
     chat_id: str = "",
     client_factory: Any = None,
 ) -> Tuple[str, List[Dict[str, Any]]]:
+    db_path = resolve_truth_db_path(db_path)
     memory_codes = [item if isinstance(item, str) else item["code"] for item in memory_greenlights]
     file_codes = [item if isinstance(item, str) else item["code"] for item in file_greenlights]
 
@@ -339,14 +376,17 @@ async def load_reply_greenlights_async(
         db = _open_truth_db(db_path)
         try:
             trust_role = _resolve_trust_role(db, person_id, user_id, platform)
+            if not is_group_chat and chat_id and chat_id != user_id:
+                trust_role = "GROUP_MEMBER"
             if not is_group_chat and trust_role == "OWNER" and quick_state_patch:
                 with db.conn:
                     db.conn.executemany(
-                        "INSERT INTO user_status (key, category, current_value, updated_at) "
-                        "VALUES (?, ?, ?, datetime('now', 'localtime')) "
+                        "INSERT INTO user_status (key, category, current_value, visibility, scope_chat_id, updated_at) "
+                        "VALUES (?, ?, ?, 'PRIVATE', ?, datetime('now', 'localtime')) "
                         "ON CONFLICT(key) DO UPDATE SET category=excluded.category, "
-                        "current_value=excluded.current_value, updated_at=excluded.updated_at",
-                        [(patch["key"], patch.get("category", ""), patch["value"]) for patch in quick_state_patch],
+                        "current_value=excluded.current_value, visibility='PRIVATE', scope_chat_id=excluded.scope_chat_id, "
+                        "updated_at=excluded.updated_at WHERE COALESCE(user_status.scope_chat_id, '') IN ('', excluded.scope_chat_id)",
+                        [(patch["key"], patch.get("category", ""), patch["value"], chat_id or user_id) for patch in quick_state_patch],
                     )
             memory_block, file_rows = db.load_greenlight_payload(
                 memory_codes=memory_codes,
@@ -370,6 +410,10 @@ async def load_reply_greenlights_async(
                 from .consolidator import read_scoped_memories
                 from .access_policy import authorized_file_rows
 
+                from .episodic_beats import read_beats
+                beats = read_beats(db.conn, ledger_path, codes=memory_codes, **scope)
+                if beats:
+                    memory_block += "\n" + json.dumps({"episodic_beats": beats}, ensure_ascii=False)
                 rows = read_scoped_memories(db_path, ledger_path, codes=memory_codes, **scope)
                 memory_block += "\n" + json.dumps({"scoped_memories": rows}, ensure_ascii=False)
                 scope_account = scope.get("account") or account

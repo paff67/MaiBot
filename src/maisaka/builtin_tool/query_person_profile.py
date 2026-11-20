@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 import sqlite3
 from typing import Any, Dict, Optional
@@ -95,18 +96,9 @@ def _clean_text(value: Any) -> str:
 
 
 def _is_requester_owner(conn: sqlite3.Connection, platform: str, user_id: str) -> bool:
-    clean_uid = _clean_text(user_id)
-    if not clean_uid:
-        return False
-    clean_plat = _clean_text(platform)
-    if clean_plat:
-        row = conn.execute(
-            "SELECT trust_role FROM person_info WHERE person_id = ? OR json_extract(platform_ids, ?) = ? LIMIT 1",
-            (clean_uid, f"$.{clean_plat}", clean_uid),
-        ).fetchone()
-    else:
-        row = conn.execute("SELECT trust_role FROM person_info WHERE person_id = ? LIMIT 1", (clean_uid,)).fetchone()
-    return bool(row and _clean_text(row["trust_role"]).upper() == "OWNER")
+    from src.companion_vault.access_policy import resolve_identity_role
+
+    return resolve_identity_role(conn, platform=platform, user_id=user_id) == "OWNER"
 
 
 def _query_companion_truth_person(
@@ -117,6 +109,9 @@ def _query_companion_truth_person(
     is_group_chat: bool = True,
     requester_platform: str = "",
     requester_user_id: str = "",
+    group_id: str = "",
+    source: str = "",
+    account: str = "",
 ) -> Optional[Dict[str, str]]:
     """从 companion_truth.db -> person_info 查询人物档案（防线一 SQL 投影级物理硬裁剪）。"""
     clean_id = _clean_text(person_id)
@@ -140,12 +135,18 @@ def _query_companion_truth_person(
             return None
 
         allow_owner_private = (not is_group_chat) and _is_requester_owner(conn, requester_platform, requester_user_id)
-        select_cols = ["person_id", "person_name", "trust_role"]
-        if not is_group_chat and "wechat_remark" in existing_cols:
+        from src.companion_vault.access_policy import TurnScope
+
+        scope = TurnScope(requester_platform, "", source, account, group_id if is_group_chat else requester_user_id,
+                          requester_user_id, is_group_chat, "OWNER" if allow_owner_private else "GROUP_MEMBER")
+        predicate, params = scope.person_filter()
+        visible_people = f"(SELECT * FROM person_info WHERE {predicate})"
+        select_cols = ["person_id", "person_name", "trust_role" if allow_owner_private else "'GROUP_MEMBER' AS trust_role"]
+        if allow_owner_private and "wechat_remark" in existing_cols:
             select_cols.append("wechat_remark")
         if "one_line_intro" in existing_cols:
             select_cols.append("one_line_intro")
-        if "relationship_text" in existing_cols and not is_group_chat:
+        if "relationship_text" in existing_cols and allow_owner_private:
             select_cols.append("relationship_text")
         if "public_impression" in existing_cols:
             select_cols.append("public_impression")
@@ -160,21 +161,21 @@ def _query_companion_truth_person(
 
         if clean_id:
             matched_row = conn.execute(
-                f"SELECT {projection} FROM person_info "
+                f"SELECT {projection} FROM {visible_people} "
                 f"WHERE person_id = ? OR json_extract(platform_ids, '$.wechat') = ? OR person_name = ? LIMIT 1",
-                (clean_id, clean_id, clean_id),
+                (*params, clean_id, clean_id, clean_id),
             ).fetchone()
         if matched_row is None and clean_name:
-            if not is_group_chat and "wechat_remark" in existing_cols:
+            if allow_owner_private and "wechat_remark" in existing_cols:
                 matched_row = conn.execute(
-                    f"SELECT {projection} FROM person_info "
+                    f"SELECT {projection} FROM {visible_people} "
                     f"WHERE person_name = ? OR wechat_remark = ? OR person_id = ? LIMIT 1",
-                    (clean_name, clean_name, clean_name),
+                    (*params, clean_name, clean_name, clean_name),
                 ).fetchone()
             else:
                 matched_row = conn.execute(
-                    f"SELECT {projection} FROM person_info WHERE person_name = ? OR person_id = ? LIMIT 1",
-                    (clean_name, clean_name),
+                    f"SELECT {projection} FROM {visible_people} WHERE person_name = ? OR person_id = ? LIMIT 1",
+                    (*params, clean_name, clean_name),
                 ).fetchone()
 
         if matched_row is None:
@@ -186,12 +187,12 @@ def _query_companion_truth_person(
                     search_cols.append("one_line_intro")
                 if "public_impression" in existing_cols:
                     search_cols.append("public_impression")
-                if not is_group_chat and "wechat_remark" in existing_cols:
+                if allow_owner_private and "wechat_remark" in existing_cols:
                     search_cols.append("wechat_remark")
                 where_like = " OR ".join(f"COALESCE({c}, '') LIKE ?" for c in search_cols)
                 matched_row = conn.execute(
-                    f"SELECT {projection} FROM person_info WHERE {where_like} LIMIT 1",
-                    tuple(like_pat for _ in search_cols),
+                    f"SELECT {projection} FROM {visible_people} WHERE {where_like} LIMIT 1",
+                    (*params, *(like_pat for _ in search_cols)),
                 ).fetchone()
     except Exception:
         return None
@@ -251,11 +252,21 @@ async def handle_tool(
         )
 
     limit = _normalize_limit(invocation.arguments.get("limit"))
-    db_path = str(invocation.arguments.get("db_path") or DEFAULT_TRUTH_DB_PATH).strip() or DEFAULT_TRUTH_DB_PATH
+    db_path = os.environ.get("MAIBOT_TRUTH_DB_PATH") or DEFAULT_TRUTH_DB_PATH
     chat_stream = getattr(getattr(tool_ctx, "runtime", None), "chat_stream", None)
     is_group_chat = bool(getattr(chat_stream, "is_group_session", True)) if chat_stream is not None else True
     req_platform = _clean_text(getattr(chat_stream, "platform", "")) if chat_stream is not None else ""
     req_user_id = _clean_text(getattr(chat_stream, "user_id", "")) if chat_stream is not None else ""
+    group_id = _clean_text(getattr(chat_stream, "group_id", "")) if chat_stream is not None else ""
+    source = ""
+    account = _clean_text(getattr(chat_stream, "account_id", "")) if chat_stream is not None else ""
+    if req_platform == "wechat":
+        engine = getattr(tool_ctx.runtime, "_reasoning_engine", None)
+        scope = getattr(getattr(engine, "_current_turn_decision", None), "scope", None)
+        if scope is None or scope.session_id != chat_stream.session_id:
+            return tool_ctx.build_failure_result(invocation.tool_name, "缺少已验证的微信会话范围。")
+        group_id, account, source = scope.chat_id, scope.account, scope.source
+        req_user_id, is_group_chat = scope.requester_id, scope.is_group
 
     try:
         truth_record = await asyncio.to_thread(
@@ -266,6 +277,9 @@ async def handle_tool(
             is_group_chat=is_group_chat,
             requester_platform=req_platform,
             requester_user_id=req_user_id,
+            group_id=group_id,
+            source=source,
+            account=account,
         )
     except Exception:
         truth_record = None

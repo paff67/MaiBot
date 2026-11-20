@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import re
+import xml.etree.ElementTree as ET
 import sqlite3
 import time
 
@@ -63,18 +64,23 @@ class MessageLedger:
                 sender = match.group(1)
                 body = raw[match.end() :]
             else:
-                for pattern in (
-                    r'<emoji\b[^>]*\bfromusername="([A-Za-z0-9_.@-]+)"',
-                    r"<fromusername>\s*([A-Za-z0-9_.@-]+)\s*</fromusername>",
-                    r'\bfromusername="([A-Za-z0-9_.@-]+)"',
-                    r"<chatusr>\s*([A-Za-z0-9_.@-]+)\s*</chatusr>",
-                ):
-                    xml_match = re.search(pattern, raw)
-                    if xml_match:
-                        candidate = xml_match.group(1).strip()
-                        if candidate and not candidate.endswith("@chatroom"):
-                            sender = candidate
-                            break
+                if not re.search(r"<!\s*(DOCTYPE|ENTITY)", raw, re.I):
+                    try:
+                        root = ET.fromstring(raw[raw.find("<"):])
+                    except ET.ParseError:
+                        root = None
+                    if root is not None:
+                        # Referenced and forwarded content never establishes the outer author.
+                        for parent in root.iter():
+                            for child in list(parent):
+                                if child.tag.lower() in {"recorditem", "refermsg"}:
+                                    parent.remove(child)
+                        candidate = root.get("fromusername") or root.findtext("fromusername") or root.findtext("chatusr")
+                        if not candidate:
+                            emoji = root.find("emoji")
+                            candidate = emoji.get("fromusername") if emoji is not None else None
+                        if candidate and re.fullmatch(r"[A-Za-z0-9_.@-]+",candidate.strip()) and not candidate.endswith("@chatroom"):
+                            sender = candidate.strip()
         elif direction == "incoming":
             sender = chat
         with self.db:

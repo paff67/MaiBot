@@ -142,6 +142,10 @@ class ReplyGenerationResult(BaseDataModel):
         default_factory=list,
         metadata={"description": "本次 replyer 完整的 Provider 调用诊断链。"},
     )
+    pending_side_effects: Dict[str, Any] = field(
+        default_factory=dict,
+        metadata={"description": "等待至少一条消息成功投递后提交的本轮状态变更。"},
+    )
 
 def _format_selected_expression_line(expression: Dict[str, Any], fallback_id: Optional[int] = None) -> str:
     """格式化单条已选表达方式，供终端与监控详情展示。"""

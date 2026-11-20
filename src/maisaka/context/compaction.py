@@ -134,6 +134,8 @@ class PlannerRequestSnapshot:
 
     request: ResponseRequest | ACPPlannerSnapshot
     history: Tuple[LLMContextMessage, ...]
+    session_id: str = ""
+    logical_turn_id: str = ""
 
 
 def save_compaction_prompt_preview(

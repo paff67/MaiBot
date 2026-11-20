@@ -40,15 +40,6 @@ DEFAULT_RETURN_DIRECTION_PROMPT = (
 )
 
 
-def _resolve_background_story() -> str:
-    try:
-        from src.config.config import global_config
-
-        return str(getattr(getattr(global_config, "personality", None), "background_story", "") or "").strip()
-    except Exception:
-        return ""
-
-
 @dataclass
 class TwinNarrativePrompts:
     away_direction_prompt: str = DEFAULT_AWAY_DIRECTION_PROMPT
@@ -90,12 +81,17 @@ class TwinNarrativeDirector:
 
         try:
             cfg = mgr.load_config()
-            preset_name = str(cfg.get("active_preset") or mgr.DEFAULT_PRESET_NAME).strip() or mgr.DEFAULT_PRESET_NAME
-            engine = mgr.get_engine(preset_name)
-            if engine is None and preset_name != mgr.DEFAULT_PRESET_NAME:
-                preset_name = mgr.DEFAULT_PRESET_NAME
+            candidates = (
+                str(cfg.get("sister_elder_preset") or "").strip(),
+                str(cfg.get("sister_younger_preset") or "").strip(),
+                str(cfg.get("active_preset") or "").strip(),
+                mgr.DEFAULT_PRESET_NAME,
+            )
+            for preset_name in dict.fromkeys(name for name in candidates if name):
                 engine = mgr.get_engine(preset_name)
-            return mgr, preset_name, engine
+                if engine is not None and engine.get_twin_narrative_prompts():
+                    return mgr, preset_name, engine
+            return mgr, "", None
         except Exception:
             return None, "", None
 
@@ -188,14 +184,12 @@ class TwinNarrativeDirector:
 
     @staticmethod
     def _prepare_direction_header(explicit_prompt: str, configured_prompt: str) -> str:
-        bg_story = _resolve_background_story()
+        from .twin_worldview import PUBLIC_TWIN_WORLDVIEW
+
         effective_direction = explicit_prompt.strip() or configured_prompt
-        if bg_story:
-            effective_direction = (
-                effective_direction.replace("{{background_story}}", bg_story).replace("{{scenario}}", bg_story)
-            )
-            return f"【项目背景设定】：{bg_story}\n\n{effective_direction}"
-        return effective_direction
+        effective_direction = effective_direction.replace("{{background_story}}", PUBLIC_TWIN_WORLDVIEW)
+        effective_direction = effective_direction.replace("{{scenario}}", PUBLIC_TWIN_WORLDVIEW)
+        return f"【公开世界设定】：{PUBLIC_TWIN_WORLDVIEW}\n\n{effective_direction}"
 
     async def generate_elder_away_arc(
         self,
@@ -214,7 +208,7 @@ class TwinNarrativeDirector:
         full_prompt = (
             f"{header}{cast_hint}\n\n"
             f"【当前东京时间】：{t_desc}\n"
-            f"【当前算力经费水位】：${balance_usd:.2f} USD（进入吃紧省流阶段）\n"
+            "【当前算力档位】：进入吃紧省流阶段\n"
             f"【最近聊天上下文摘录】：\n{recent_chat_excerpt.strip() or '（暂无近期对话，处于日常公寓待机中）'}\n"
         )
         generated = await self._invoke_llm(full_prompt)
@@ -259,7 +253,7 @@ class TwinNarrativeDirector:
         full_prompt = (
             f"{header}\n\n"
             f"【当前东京时间】：{t_desc}\n"
-            f"【最新恢复经费水位】：${balance_usd:.2f} USD\n"
+            "【当前算力档位】：算力恢复可用\n"
             f"【姐姐离场期间演进的最终状态线】：{evolved_arc.strip()}\n"
             f"【当前前台最新对话上下文】：\n{recent_chat_excerpt.strip() or '（刚收到新的联络或经费到账提示）'}\n"
         )

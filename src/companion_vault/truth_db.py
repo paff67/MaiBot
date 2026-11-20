@@ -2,14 +2,22 @@
 
 from typing import Any, Dict, List, Sequence, Tuple
 from datetime import datetime, timezone
+from contextlib import nullcontext
 import json
 import os
 import re
 import sqlite3
 
 from .sql_normalizer import normalize_sql_structure
-from .access_policy import GROUP_MEMBERS_SCHEMA
+from .access_policy import GROUP_MEMBERS_SCHEMA, TurnScope
 
+
+COMPUTE_TIER_LABELS = {
+    "SUPERCHARGED": "充裕超频态",
+    "STANDARD": "日常标准态",
+    "THRIFTY": "吃紧省流态",
+    "HIBERNATING": "断粮休眠态",
+}
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS memory_provenance(
@@ -24,6 +32,7 @@ CREATE TABLE IF NOT EXISTS global_state (
     live_observation TEXT DEFAULT '', latest_screen_file_code TEXT DEFAULT '',
     timezone_name TEXT DEFAULT 'Asia/Tokyo',
     active_persona_slot TEXT DEFAULT 'sister_younger',
+    last_confirmed_reply_order INTEGER DEFAULT 0,
     active_sister TEXT DEFAULT 'sister_younger',
     elder_away_arc TEXT DEFAULT '',
     chat_execution_mode TEXT DEFAULT 'dual_director',
@@ -99,16 +108,29 @@ class CompanionTruthDB:
         self.conn = sqlite3.connect(db_path)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
+        from .episodic_beats import SCHEMA as EPISODIC_SCHEMA
         self.conn.executescript(_SCHEMA)
+        self.conn.executescript(EPISODIC_SCHEMA)
         self.conn.executescript(GROUP_MEMBERS_SCHEMA)
+        self.conn.executescript("""
+        CREATE TABLE IF NOT EXISTS confirmed_reply_turns(
+          session_id TEXT NOT NULL, logical_turn_id TEXT NOT NULL, persona_slot TEXT NOT NULL,
+          confirmed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          PRIMARY KEY(session_id, logical_turn_id));
+        CREATE TABLE IF NOT EXISTS session_speakers(
+          session_id TEXT PRIMARY KEY, persona_slot TEXT NOT NULL, logical_turn_id TEXT NOT NULL,
+          turn_order INTEGER NOT NULL DEFAULT 0);
+        """)
         self._ensure_schema_migrations()
 
     def _ensure_schema_migrations(self) -> None:
         """单一 Schema 事实源：幂等补齐存量真值库演进列并迁移旧 impression 至物理分列。"""
         table_additions: dict[str, dict[str, str]] = {
+            "session_speakers": {"turn_order": "INTEGER NOT NULL DEFAULT 0"},
             "global_state": {
                 "timezone_name": "TEXT DEFAULT 'Asia/Tokyo'",
                 "active_persona_slot": "TEXT DEFAULT 'sister_younger'",
+                "last_confirmed_reply_order": "INTEGER DEFAULT 0",
                 "active_sister": "TEXT DEFAULT 'sister_younger'",
                 "elder_away_arc": "TEXT DEFAULT ''",
                 "chat_execution_mode": "TEXT DEFAULT 'dual_director'",
@@ -210,7 +232,7 @@ class CompanionTruthDB:
         def authorize(action: int, arg1: str, arg2: str, database: str, source: str) -> int:
             if source is not None or database not in {None, "main"}:
                 return sqlite3.SQLITE_DENY
-            if forbid_owner_state_tables and arg1 in {"global_state", "user_status", "mvu_variables"} and action in (
+            if forbid_owner_state_tables and arg1 not in {"chronicle_events", "quests_events", "person_info"} and action in (
                 sqlite3.SQLITE_INSERT,
                 sqlite3.SQLITE_UPDATE,
                 sqlite3.SQLITE_DELETE,
@@ -356,57 +378,6 @@ class CompanionTruthDB:
             "</自身账号与提及判定准则>"
         )
 
-    def _build_group_desensitized_roster(
-        self,
-        chat_id: str = "",
-        active_sender_ids: set[str] | None = None,
-        limit: int = 150,
-    ) -> list[str]:
-        """
-        [v1.1 修正 P1 - 严格遵守 RBAC 红线]
-        群聊场景下显式声明仅查询 5 个安全公开字段：person_id, person_name, wechat_remark, platform_ids, trust_role。
-        优先对齐群内真实成员与活跃发言人，严禁查询或输出 impression（角色印象）、birthday（生日）及 tags（私密标签）！
-        """
-        active_set = set(active_sender_ids or [])
-        group_member_ids: set[str] = set()
-        if chat_id:
-            try:
-                cur = self.conn.execute("SELECT user_id FROM group_members WHERE group_id = ?", (chat_id,))
-                group_member_ids = {str(r[0]).strip() for r in cur.fetchall() if r[0]}
-            except Exception:
-                pass
-
-        all_candidate_rows = self.conn.execute(
-            """
-            SELECT person_id, person_name, wechat_remark, platform_ids, trust_role
-            FROM person_info
-            """
-        ).fetchall()
-
-        def sort_priority(r: Any) -> tuple[int, str]:
-            pid = str(r["person_id"] or "").strip()
-            role = str(r["trust_role"] or "").strip()
-            if role == "OWNER":
-                return (0, pid)
-            if pid in active_set:
-                return (1, pid)
-            if pid in group_member_ids:
-                return (2, pid)
-            return (3, pid)
-
-        sorted_rows = sorted(all_candidate_rows, key=sort_priority)[:int(limit)]
-
-        lines: list[str] = []
-        for r in sorted_rows:
-            person_id = str(r["person_id"] or "").strip()
-            person_name = str(r["person_name"] or "").strip() or "未知"
-            wechat_remark = str(r["wechat_remark"] or "").strip()
-            trust_role = str(r["trust_role"] or "GROUP_MEMBER").strip()
-            lines.append(
-                f"[角色ID: {person_id}] 备注名: {wechat_remark or '无'} | 微信昵称: {person_name} | 身份: {trust_role}"
-            )
-        return lines
-
     def _render_twin_and_compute_economy_block(
         self,
         *,
@@ -452,13 +423,7 @@ class CompanionTruthDB:
             pass
 
         effective_bal = max(0.0, round(remote_bal - unsettled_cost, 4))
-        tier_label_map = {
-            "SUPERCHARGED": "充裕超频态",
-            "STANDARD": "日常标准态",
-            "THRIFTY": "吃紧省流态",
-            "HIBERNATING": "断粮休眠态",
-        }
-        tier_label = tier_label_map.get(tier_code, "日常标准态")
+        tier_label = COMPUTE_TIER_LABELS.get(tier_code, "日常标准态")
         is_owner_private = (not is_group_chat) and (sender_trust_role.upper() == "OWNER")
 
         active_job_line = f"- 后台慢轨长程任务：{active_job_summary}\n" if active_job_summary else ""
@@ -490,6 +455,10 @@ class CompanionTruthDB:
         include_unscoped_media_and_events: bool = True,
         chat_id: str = "",
         active_sender_ids: set[str] | None = None,
+        source: str = "",
+        account: str = "",
+        requester_user_id: str = "",
+        requester_platform: str = "",
     ) -> str:
         blocks: list[str] = [
             self._render_self_identity_anchor(),
@@ -507,7 +476,8 @@ class CompanionTruthDB:
             quests = [
                 dict(row)
                 for row in self.conn.execute(
-                    "SELECT * FROM quests_events WHERE status = 'ongoing' ORDER BY quest_code"
+                    "SELECT * FROM quests_events WHERE status = 'ongoing' "
+                    "AND COALESCE(scope_chat_id, '') IN ('', ?) ORDER BY quest_code", (clean_chat_id,)
                 )
             ]
         elif clean_chat_id:
@@ -530,7 +500,10 @@ class CompanionTruthDB:
 
         state = {
             "global_state": [dict(row) for row in self.conn.execute("SELECT * FROM global_state")] if owner else [],
-            "user_status": [dict(row) for row in self.conn.execute(f"SELECT * FROM user_status WHERE {visibility} ORDER BY key")],
+            "user_status": [dict(row) for row in self.conn.execute(
+                f"SELECT * FROM user_status WHERE {visibility} AND COALESCE(scope_chat_id, '') IN ('', ?) ORDER BY key",
+                (clean_chat_id,),
+            )],
             "quests_events": quests,
         }
         blocks.append("<全局与实时状态>\n" + json.dumps(state, ensure_ascii=False) + "\n</全局与实时状态>")
@@ -544,12 +517,14 @@ class CompanionTruthDB:
                 "person_id", "person_name", "wechat_remark", "trust_role", "one_line_intro",
             )))
         else:
-            roster_lines = self._build_group_desensitized_roster(
-                chat_id=chat_id,
-                active_sender_ids=active_sender_ids,
+            scope = TurnScope(requester_platform, "", source, account, chat_id, requester_user_id,
+                              is_group_chat, sender_trust_role)
+            predicate, params = scope.person_filter()
+            columns = ("person_id", "person_name", "one_line_intro")
+            people = self.conn.execute(
+                f"SELECT {', '.join(columns)} FROM person_info WHERE {predicate} ORDER BY person_id LIMIT 150", params
             )
-            roster_body = "\n".join(roster_lines) if roster_lines else "（暂无记录）"
-            blocks.append(f"<重要角色索引>\n{roster_body}\n</重要角色索引>")
+            blocks.append(_render_catalog("重要角色索引", people, columns))
         events = self._catalog_rows(
             "chronicle_events", "code_index, time_span, summary, trigger_when, related_files, tk_estimate",
             f"status = 'active' AND {visibility} AND code_index NOT IN (SELECT code_index FROM memory_provenance)", "CAST(SUBSTR(code_index, 3) AS INTEGER) DESC, code_index DESC",
@@ -666,7 +641,7 @@ class CompanionTruthDB:
         if not cid or not variable_defs:
             return
         now_iso = datetime.now(timezone.utc).isoformat()
-        with self.conn:
+        with nullcontext() if self.conn.in_transaction else self.conn:
             for vdef in variable_defs:
                 vkey = str(vdef.get("key") or "").strip()
                 if not vkey:
@@ -776,6 +751,7 @@ class CompanionTruthDB:
         var_value: Any,
         visibility: str,
         updated_at: str = "",
+        manage_tx: bool = True,
     ) -> None:
         cid = str(card_id or "").strip()
         vkey = str(var_key or "").strip()
@@ -787,7 +763,7 @@ class CompanionTruthDB:
         eff_scope = str(scope_key or ("OWNER_PRIVATE" if vis == "PRIVATE" else "GLOBAL_PUBLIC")).strip()
         ts = str(updated_at or "").strip() or datetime.now(timezone.utc).isoformat()
         serialized = self._serialize_mvu_value(var_type, var_value)
-        with self.conn:
+        with self.conn if manage_tx else nullcontext():
             self.conn.execute(
                 """
                 INSERT INTO mvu_variables

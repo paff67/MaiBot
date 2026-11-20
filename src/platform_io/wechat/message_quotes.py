@@ -168,3 +168,99 @@ def latest_quote(
         item["resolution"] = "resolved"
     item["target"] = target
     return item
+
+
+def parse_forward_recorditem(content: str) -> list[Dict[str, Any]]:
+    """Parse inline type=19 text records without fetching remote content."""
+    import html
+    from urllib.parse import urlsplit, urlunsplit
+
+    max_bytes = 262144
+    total_nodes = 0
+    total_bytes = 0
+
+    def clean_text(value: str) -> str:
+        def remove_auth(match):
+            url = urlsplit(html.unescape(match.group(0)))
+            return urlunsplit((url.scheme, url.netloc, url.path, "", ""))
+        return re.sub(r'https?://[^\s<>"\]]+', remove_auth, value)[:16000]
+
+    def parse_document(raw: str) -> ET.Element:
+        nonlocal total_nodes, total_bytes
+        total_bytes += len(raw.encode("utf-8"))
+        if total_bytes > max_bytes:
+            raise ValueError("Forward byte limit exceeded")
+        for _ in range(4):
+            if re.search(r"<!\s*(DOCTYPE|ENTITY)", raw, re.I):
+                raise ValueError("Unsafe forward XML")
+            if raw.lstrip().startswith("<"):
+                break
+            decoded = html.unescape(raw)
+            if decoded == raw:
+                break
+            raw = decoded
+        if re.search(r"<!\s*(DOCTYPE|ENTITY)", raw, re.I):
+            raise ValueError("Unsafe forward XML")
+        element = ET.fromstring(raw)
+        stack = [(element, 1)]
+        while stack:
+            node, depth = stack.pop()
+            total_nodes += 1
+            if total_nodes > 64 or depth > 4:
+                raise ValueError("Forward XML node/depth limit exceeded")
+            stack.extend((child, depth + 1) for child in node)
+        return element
+
+    def parse_records(raw: str, depth: int) -> list[Dict[str, Any]]:
+        if depth > 4:
+            raise ValueError("Forward nesting limit exceeded")
+        root = parse_document(raw)
+        if root.tag == "msg":
+            app = root.find("appmsg")
+            if app is None or app.findtext("type") != "19":
+                raise ValueError("Not a type=19 forward")
+            record = app.find("recorditem")
+            if record is None:
+                return []
+            if list(record):
+                root = list(record)[0]
+            elif record.text and record.text.strip():
+                root = parse_document(record.text)
+            else:
+                return []
+        elif root.tag == "recorditem":
+            if list(root):
+                root = list(root)[0]
+            elif root.text and root.text.strip():
+                root = parse_document(root.text)
+            else:
+                return []
+        data_list = root if root.tag == "datalist" else root.find("datalist")
+        if data_list is None:
+            return []
+        result = []
+        for index, item in enumerate(data_list.findall("dataitem")):
+            kind = item.get("datatype") or item.findtext("datatype") or "1"
+            if kind == "19":
+                nested = item.find("recorditem")
+                if nested is None:
+                    text = "[合并转发无内嵌正文，当前不可用]"
+                    parts = [{"type": "text", "data": text}]
+                else:
+                    raw_nested = ET.tostring(nested, encoding="unicode")
+                    children = parse_records(raw_nested, depth + 1)
+                    parts = [{"type": "forward", "data": children}] if children else [{"type": "text", "data": "[合并转发无内嵌正文，当前不可用]"}]
+            elif kind == "1":
+                text = item.findtext("datadesc") or item.findtext("content") or ""
+                parts = [{"type": "text", "data": clean_text(text) or "[空文本]"}]
+            else:
+                parts = [{"type": "text", "data": "[转发媒体原件不可用]"}]
+            result.append({
+                "user_id": item.findtext("fromusr") or item.findtext("sourceusername") or "",
+                "user_nickname": clean_text(item.findtext("sourcename") or "转发用户"),
+                "message_id": item.get("dataid") or f"forward_{index}",
+                "content": parts,
+            })
+        return result
+
+    return parse_records(content, 1)

@@ -38,12 +38,13 @@ def _upsert_contacts_into_person_info(conn, contacts: Dict[str, Any]) -> None:
                 conn.execute(
                     "INSERT OR IGNORE INTO person_info(person_id, person_name, wechat_remark, trust_role, platform_ids) "
                     "VALUES (?, ?, ?, 'GROUP_MEMBER', ?)",
-                    (wxid, remark or nickname, remark, json.dumps({"wechat": wxid}, ensure_ascii=False)),
+                    (wxid, nickname or wxid, remark, json.dumps({"wechat": wxid}, ensure_ascii=False)),
                 )
             else:
                 pid, cur_name, cur_remark = existing
                 new_remark = remark or cur_remark
-                new_name = cur_name if (cur_name and cur_name != pid) else (remark or nickname or cur_name)
+                # Repair legacy rows where a private remark was copied into the public name.
+                new_name = cur_name if (cur_name and cur_name not in {pid, cur_remark}) else (nickname or wxid)
                 if new_remark != cur_remark or new_name != cur_name:
                     conn.execute(
                         "UPDATE person_info SET person_name=?, wechat_remark=? WHERE person_id=?",

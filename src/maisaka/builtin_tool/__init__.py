@@ -16,6 +16,8 @@ from .device_sandbox_tools import (
 )
 from .query_person_profile import get_tool_spec as get_query_person_profile_tool_spec
 from .query_person_profile import handle_tool as handle_query_person_profile_tool
+from .query_memory import get_tool_spec as get_query_memory_tool_spec
+from .query_memory import handle_tool as handle_query_memory_tool
 from .read_tool_result import get_tool_spec as get_read_tool_result_tool_spec
 from .read_tool_result import handle_tool as handle_read_tool_result_tool
 from .reply import get_tool_spec as get_reply_tool_spec
@@ -84,6 +86,7 @@ def _get_query_person_profile_tool_spec() -> ToolSpec:
 
 
 BUILTIN_TOOL_ENTRIES: List[BuiltinToolEntry] = [
+    BuiltinToolEntry("query_memory", get_query_memory_tool_spec, handle_query_memory_tool, stage="action", visibility="deferred"),
     BuiltinToolEntry("phone_action", get_phone_action_tool_spec, handle_phone_action_tool, stage="action", chat_scope="private"),
     BuiltinToolEntry("wait", get_wait_tool_spec, handle_wait_tool, stage="both"),
     BuiltinToolEntry("stop", get_stop_tool_spec, handle_stop_tool, stage="action"),

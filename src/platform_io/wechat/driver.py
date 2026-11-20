@@ -83,6 +83,7 @@ class WeChatRootDriver(PlatformIODriver):
         truth_path: Optional[str] = None,
         poll_interval: float = 1.0,
         backfill: bool = False,
+        channel_capabilities: Optional[Dict[str, bool]] = None,
     ):
         scope = hashlib.sha256(edge.source.encode()).hexdigest()[:24]
         super().__init__(
@@ -94,6 +95,8 @@ class WeChatRootDriver(PlatformIODriver):
                 scope=scope,
             )
         )
+        from src.platform_io.capabilities import WECHAT_CAPABILITIES
+        self.channel_capabilities = {**WECHAT_CAPABILITIES, **(channel_capabilities or {})}
         self.edge = edge
         self.allowed_chats = frozenset(["*"] if allowed_chats is None else allowed_chats)
         self.send_enabled = send_enabled
@@ -201,7 +204,7 @@ class WeChatRootDriver(PlatformIODriver):
             record = await asyncio.to_thread(
                 enrich_record_from_truth_db, record, self.truth_path, self.ledger_path
             )
-        payload = project_message(record)
+        payload = project_message(record, channel_capabilities=self.channel_capabilities)
         return await self.emit_inbound(
             InboundMessageEnvelope(
                 route_key=self.descriptor.route_key,
@@ -259,8 +262,13 @@ class WeChatRootDriver(PlatformIODriver):
             return DeliveryReceipt(
                 **receipt, status=DeliveryStatus.FAILED, error="WeChat send disabled or route not authorized"
             )
+        if not self.channel_capabilities["send_text"]:
+            return DeliveryReceipt(**receipt, status=DeliveryStatus.FAILED, error="Text capability disabled")
         components = message.raw_message.components if message.raw_message else []
-        if not components or any(not (_is_text(c) or _is_reply(c)) for c in components):
+        def is_at(component):
+            return getattr(component, "format_name", "") == "at"
+        allow_at = self.channel_capabilities["native_at"] or self.channel_capabilities["text_mention_fallback"]
+        if not components or any(not (_is_text(c) or _is_reply(c) or (allow_at and is_at(c))) for c in components):
             return DeliveryReceipt(
                 **receipt,
                 status=DeliveryStatus.FAILED,
@@ -276,8 +284,32 @@ class WeChatRootDriver(PlatformIODriver):
             )
         reply_comp = next((c for c in components if _is_reply(c)), None)
         quote_target: Optional[Dict[str, Any]] = None
-        if reply_comp and self.ledger_path:
-            quote_target = self._resolve_quote_target(reply_comp, chat)
+        if reply_comp and self.ledger_path and self.channel_capabilities["native_quote"]:
+            quote_target = await asyncio.to_thread(self._resolve_quote_target, reply_comp, chat)
+        if allow_at and chat.endswith("@chatroom"):
+            mentions = []
+            seen = set()
+            for component in components:
+                if not is_at(component):
+                    continue
+                uid = str(getattr(component, "target_user_id", "") or "")
+                if uid in seen or (quote_target and quote_target["sender_id"] == uid):
+                    continue
+                name = await asyncio.to_thread(self._public_member_name, uid, chat)
+                if name:
+                    mentions.append("@" + name + " ")
+                    seen.add(uid)
+            text = "".join(mentions) + text
+        from src.companion_vault.output_guardrail import check_group_outbound_text, is_owner_private_destination
+        allowed, _ = await asyncio.to_thread(
+            check_group_outbound_text,
+            text + ("\n" + json.dumps(quote_target, ensure_ascii=False) if quote_target else ""),
+            is_group_chat=chat.endswith("@chatroom"),
+            is_owner_private=await asyncio.to_thread(is_owner_private_destination, chat, db_path=self.truth_path),
+            db_path=self.truth_path,
+        )
+        if not allowed:
+            return DeliveryReceipt(**receipt, status=DeliveryStatus.FAILED, error="Outbound private anchor blocked")
         try:
             if quote_target:
                 result = await self.edge.send_quote(chat, text, quote_target, message.message_id)
@@ -292,6 +324,18 @@ class WeChatRootDriver(PlatformIODriver):
             metadata=result,
         )
 
+    def _public_member_name(self, user_id: str, chat: str) -> str:
+        if not self.truth_path or not Path(self.truth_path).is_file():
+            return ""
+        with sqlite3.connect(self.truth_path) as db:
+            row = db.execute(
+                "SELECT p.person_name FROM person_info p JOIN group_members g ON "
+                "COALESCE(NULLIF(json_extract(p.platform_ids, '$.wechat'), ''), p.person_id)=g.user_id "
+                "WHERE g.source=? AND g.account=? AND g.group_id=? AND g.user_id=?",
+                (self.edge.source.rstrip("/"), self.edge.account, chat, user_id),
+            ).fetchone()
+        return str(row[0] or "").strip() if row else ""
+
     def _resolve_quote_target(self, reply_comp: Any, chat: str) -> Optional[Dict[str, Any]]:
         target_id_raw = getattr(reply_comp, "target_message_id", None)
         if not target_id_raw or not self.ledger_path or not Path(self.ledger_path).exists():
@@ -299,23 +343,38 @@ class WeChatRootDriver(PlatformIODriver):
         clean_id = target_id_raw.strip().lstrip("#")
         parts = clean_id.split(":")
         target_msg_id = parts[-1]
-        target_account = parts[-2] if len(parts) >= 3 else self.edge.account
+        target_account = self.edge.account
+        if len(parts) == 4 and parts[0] == "wechat":
+            expected_source = hashlib.sha256(self.edge.source.rstrip("/").encode()).hexdigest()[:24]
+            if parts[1] != expected_source or parts[2] != self.edge.account:
+                return None
+        elif len(parts) == 2:
+            if parts[0] != self.edge.account:
+                return None
+        elif len(parts) != 1:
+            return None
         if not target_msg_id.isdigit():
             return None
         try:
+            from src.companion_vault.wechat_recall import message_is_current
+
+            if not message_is_current(
+                source=self.edge.source.rstrip("/"),
+                account=target_account,
+                chat_id=chat,
+                msg_id=target_msg_id,
+                ledger_path=self.ledger_path,
+            ):
+                return None
             with sqlite3.connect(self.ledger_path) as conn:
                 conn.row_factory = sqlite3.Row
                 cur = conn.execute(
-                    "SELECT server_id, sender_id, body, updated_at_ms, row_json FROM messages WHERE account = ? AND msg_id = ?",
-                    (target_account, target_msg_id),
+                    "SELECT server_id, sender_id, body, updated_at_ms, row_json FROM messages "
+                    "WHERE source=? AND account=? AND chat_id=? AND msg_id=? "
+                    "AND (CAST(kind AS INTEGER)&65535)<>10000",
+                    (self.edge.source.rstrip("/"), target_account, chat, target_msg_id),
                 )
                 row = cur.fetchone()
-                if not row:
-                    cur = conn.execute(
-                        "SELECT server_id, sender_id, body, updated_at_ms, row_json FROM messages WHERE msg_id = ? ORDER BY updated_at_ms DESC LIMIT 1",
-                        (target_msg_id,),
-                    )
-                    row = cur.fetchone()
                 if not row or not row["server_id"] or str(row["server_id"]) == "0":
                     return None
                 row_json = json.loads(row["row_json"]) if row["row_json"] else {}
@@ -330,20 +389,18 @@ class WeChatRootDriver(PlatformIODriver):
                     if m:
                         body = m.group(1).strip()
                 sender_id = str(row["sender_id"] or "")
-                display_name = (
-                    getattr(reply_comp, "target_message_sender_cardname", None)
-                    or getattr(reply_comp, "target_message_sender_nickname", None)
-                )
-                if not display_name and self.truth_path and Path(self.truth_path).exists() and sender_id:
+                display_name = self._public_member_name(sender_id, chat) if chat.endswith("@chatroom") else None
+                if not chat.endswith("@chatroom") and self.truth_path and Path(self.truth_path).exists() and sender_id:
                     try:
                         with sqlite3.connect(self.truth_path) as truth_conn:
                             tcur = truth_conn.execute(
-                                "SELECT wechat_remark, person_name FROM person_info WHERE platform_ids LIKE ?",
-                                (f"%{sender_id}%",),
+                                "SELECT person_name FROM person_info "
+                                "WHERE json_extract(platform_ids, '$.wechat')=? OR person_id=? LIMIT 1",
+                                (sender_id, sender_id),
                             )
                             tr = tcur.fetchone()
-                            if tr and (tr[0] or tr[1]):
-                                display_name = tr[0] or tr[1]
+                            if tr and tr[0]:
+                                display_name = tr[0]
                     except Exception:
                         pass
                 return {
@@ -405,6 +462,7 @@ def configured_wechat_drivers(config_path: str) -> list[WeChatRootDriver]:
             truth_path=item.get("truth_path", default_truth),
             poll_interval=float(item.get("poll_interval", 1.0)),
             backfill=bool(item.get("backfill", False)),
+            channel_capabilities=item.get("capabilities"),
         )
         drivers.append(driver)
     return drivers

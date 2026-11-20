@@ -789,7 +789,9 @@ class MaisakaChatLoopService:
         """构建 Stage 1 静态 ST 导演定调帧与双子槽位对比卡（不含任何私密/动态状态，保持 KV Cache 稳定）。"""
 
         twin_mode = bool(getattr(global_config.personality, "twin_mode_enabled", False))
-        bg_story = str(getattr(global_config.personality, "background_story", "") or "").strip()
+        from src.companion_vault.twin_worldview import PUBLIC_TWIN_WORLDVIEW
+
+        bg_story = PUBLIC_TWIN_WORLDVIEW
         try:
             from pathlib import Path
             from src.companion_vault.st_preset_engine import (
@@ -916,9 +918,18 @@ class MaisakaChatLoopService:
         if decision is None:
             return ""
 
+        from src.companion_vault.truth_db import COMPUTE_TIER_LABELS
+
+        is_owner_private = (
+            bool(getattr(decision, "is_owner_private", False))
+            and str(getattr(decision, "sender_trust_role", "")) == "OWNER"
+        )
+        tier_label = COMPUTE_TIER_LABELS.get(decision.compute_tier, "日常标准态")
+        if is_owner_private:
+            tier_label += f"；有效余额约 ${decision.balance_usd:.2f} USD"
         lines: List[str] = [
             "【@D0 动态导演调度指令（仅对本轮生效）】",
-            f"- 算力档位：{decision.compute_tier}（有效余额约 ${float(decision.balance_usd):.2f} USD）；发送方信任角色：{decision.sender_trust_role}",
+            f"- 算力档位：{decision.compute_tier}（{tier_label}）；发送方信任角色：{decision.sender_trust_role}",
         ]
         if getattr(decision, "forced_slot", None):
             slot_label = "妹妹 (sister_younger)" if decision.forced_slot == "sister_younger" else decision.forced_slot
@@ -940,10 +951,6 @@ class MaisakaChatLoopService:
         if transient_note:
             lines.append(f"- 本轮瞬时剧情衔接提示：{transient_note}")
 
-        is_owner_private = (
-            bool(getattr(decision, "is_owner_private", False))
-            and str(getattr(decision, "sender_trust_role", "")) == "OWNER"
-        )
         younger_prof = getattr(decision, "younger_profile", None) or global_config.personality.resolve_slot_profile(
             "sister_younger", global_config.bot, global_config.chat.reply_style
         )
@@ -1622,8 +1629,8 @@ class MaisakaChatLoopService:
                 )
         if request_kind == "planner":
             self.planner_request_snapshot = (
-                PlannerRequestSnapshot(external_snapshot, tuple(selected_history)) if external_planner else
-                PlannerRequestSnapshot(generation_result.request_snapshot, tuple(selected_history))
+                PlannerRequestSnapshot(external_snapshot, tuple(selected_history), self._session_id, logical_turn_id or "") if external_planner else
+                PlannerRequestSnapshot(generation_result.request_snapshot, tuple(selected_history), self._session_id, logical_turn_id or "")
                 if generation_result.request_snapshot is not None else None
             )
         if logical_turn_id:

@@ -3,7 +3,7 @@
 from base64 import b64decode
 from binascii import Error as BinasciiError
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from html import escape
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Literal, Optional
@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Literal,
 import asyncio
 import difflib
 import os
+import re
 import time
 import uuid
 
@@ -151,6 +152,12 @@ class CycleRuntimeState:
     tool_result_summaries: list[str] = field(default_factory=list)
     tool_monitor_results: list[dict[str, Any]] = field(default_factory=list)
     tool_multimodal_parts: list[dict[str, Any]] = field(default_factory=list)
+    proactive_triggered: bool = False
+    proactive_correction_attempted: bool = False
+    trigger_message: Optional[SessionMessage] = None
+    source_messages: list[SessionMessage] = field(default_factory=list)
+    round_index: int = 0
+    round_text: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,6 +179,8 @@ class MaisakaReasoningEngine:
         self._turn_passive_replyer: Optional[bool] = None
         self._compaction_failure_count: int = 0
         self._current_turn_decision: Any = None
+        self._tool_observations: list[dict[str, Any]] = []
+        self._tool_observation_file_parts: list[dict[str, Any]] = []
 
     @property
     def passive_replyer_enabled(self) -> bool:
@@ -212,6 +221,13 @@ class MaisakaReasoningEngine:
     ) -> Any:
         """运行一轮可被新消息打断的主 planner 请求。"""
 
+        if getattr(self, "_turn_interrupt_count", 0) >= 5:
+            return await self._runtime._chat_loop_service.chat_loop_step(
+                self._runtime._chat_history, injected_user_messages=injected_user_messages,
+                tail_user_messages=tail_user_messages, tool_definitions=tool_definitions,
+                max_context_size=self._runtime._max_context_size,
+                logical_turn_id=self._active_logical_turn_id, task_override=task_override,
+            )
         interrupt_flag = asyncio.Event()
         self._runtime._planner_interrupt.bind(interrupt_flag)
         self._runtime._chat_loop_service.set_interrupt_flag(interrupt_flag)
@@ -312,13 +328,17 @@ class MaisakaReasoningEngine:
                     anchor_message=profile_message,
                     pending_messages=source_messages,
                     is_group_chat=self._runtime.chat_stream.is_group_session,
+                    turn_scope=getattr(getattr(self, "_current_turn_decision", None), "scope", None),
                 )
             except Exception as exc:
                 logger.debug(f"{self._runtime.log_prefix} 人物画像自动注入失败，已跳过: {exc}")
                 return []
 
         async def build_truth_catalog_message() -> str:
+            from src.companion_vault.paths import resolve_truth_db_path
+
             return await build_planner_truth_catalog_async(
+                db_path=resolve_truth_db_path(),
                 session_id=self._runtime.session_id,
                 is_group_chat=self._runtime.chat_stream.is_group_session,
                 user_id=profile_message.message_info.user_info.user_id,
@@ -326,6 +346,7 @@ class MaisakaReasoningEngine:
                 anchor_message_id=profile_message.message_id,
                 account=profile_message.account_id or '',
                 chat_id=profile_message.message_info.group_info.group_id if profile_message.message_info.group_info else profile_message.message_info.user_info.user_id,
+                ledger_path=os.environ.get("MAIBOT_MESSAGE_LEDGER_PATH", "data/message_ledger.db"),
             )
 
         pending = {"人物画像", "真值目录"}
@@ -360,6 +381,8 @@ class MaisakaReasoningEngine:
         )
         quote_block, quote_parts = await build_quote_context_async(
             source_messages or [profile_message],
+            db_path=os.environ.get("MAIBOT_TRUTH_DB_PATH", "data/companion_truth.db"),
+            ledger_path=os.environ.get("MAIBOT_MESSAGE_LEDGER_PATH", "data/message_ledger.db"),
             exclude_direct_attachment_ids=hydrated_direct_ids,
         )
         if quote_block:
@@ -457,6 +480,26 @@ class MaisakaReasoningEngine:
                 return True
             state.cycle_end = CycleEnd("tool_continue", "Planner 工具执行完成，继续下一轮内部思考。")
             return False
+
+        needs_action = bool(state.source_messages or state.proactive_triggered or state.tool_result_summaries)
+        if not self.passive_replyer_enabled and needs_action:
+            if not state.proactive_correction_attempted:
+                state.proactive_correction_attempted = True
+                await self._run_planner_request(
+                    trigger_message=state.trigger_message,
+                    source_messages=state.source_messages,
+                    round_index=state.round_index,
+                    round_text=state.round_text,
+                    state=state,
+                    correction_retry=True,
+                )
+                return await self._handle_planner_response_actions(
+                    response=state.response, cycle_detail=cycle_detail, state=state,
+                    planner_extra_lines=planner_extra_lines,
+                )
+            self._end_planner_no_tool_cycle(planner_extra_lines, status_line="状态：Planner 动作纠偏失败")
+            state.cycle_end = CycleEnd("planner_no_tool_failed", "Planner 一次纠偏后仍未调用工具。")
+            return True
 
         if self.passive_replyer_enabled and planner_content:
             await self._reply_from_planner_content(planner_content, cycle_detail, state)
@@ -617,6 +660,7 @@ class MaisakaReasoningEngine:
         round_index: int,
         round_text: str,
         state: CycleRuntimeState,
+        correction_retry: bool = False,
     ) -> None:
         """准备上下文并执行一次 Planner 请求。"""
 
@@ -677,6 +721,11 @@ class MaisakaReasoningEngine:
             )
             decision = getattr(self, "_current_turn_decision", None)
             tail_user_messages = list(build_consecutive_wait_reminders(self._runtime._consecutive_wait_count) or [])
+            if correction_retry:
+                tail_user_messages.append(
+                    "主动触发轮纠偏：上一请求只有散文，没有执行动作。现在必须调用一个已声明的原生工具，"
+                    "可用 reply 发送回复、wait/stop 结束或等待，或调用检索工具；禁止把 Planner 文本直接发送给用户。"
+                )
             if (
                 decision is not None
                 and callable(getattr(self._runtime._chat_loop_service, "build_planner_d0_director_guidance", None))
@@ -1004,8 +1053,12 @@ class MaisakaReasoningEngine:
     ) -> Any:
         """调用 TwinRuntimeRouter 计算当前轮次的双子路由与模型策略。"""
 
+        self._turn_source_messages = list(source_messages)
         try:
+            from src.companion_vault.runtime_bridge import resolve_session_scope
             from src.companion_vault.twin_runtime_router import resolve_turn_route
+
+            scope = await asyncio.to_thread(resolve_session_scope, self._runtime.chat_stream, trigger_message)
 
             is_group_chat = bool(self._runtime.chat_stream.is_group_session)
             platform = str(
@@ -1046,7 +1099,7 @@ class MaisakaReasoningEngine:
                 for msg in eff_sources
             )
 
-            return await resolve_turn_route(
+            decision = await resolve_turn_route(
                 session_id=str(self._runtime.session_id or ""),
                 platform=platform,
                 sender_id=sender_id,
@@ -1058,9 +1111,12 @@ class MaisakaReasoningEngine:
                 batch_sender_ids=batch_sender_ids or None,
                 mentions_bot=mentions_bot,
             )
+            return replace(decision, scope=scope)
         except Exception as exc:
-            logger.warning(f"{self._runtime.log_prefix} TwinRuntimeRouter 仲裁异常，将沿用默认策略: {exc}")
-            return None
+            from src.companion_vault.twin_runtime_router import TwinTurnDecision
+
+            logger.warning(f"{self._runtime.log_prefix} TwinRuntimeRouter 会话校验失败: {exc}")
+            return TwinTurnDecision(abort_turn=True, abort_reason="invalid_turn_scope")
 
     async def _build_one_pass_external_tools(self) -> list[dict[str, Any]]:
         """收集统一 ST-Agent 模式可用的外部动作工具定义（排除 reply/context/soliumbra_reply）。"""
@@ -1150,6 +1206,7 @@ class MaisakaReasoningEngine:
                 pending_messages=source_messages,
                 db_path=truth_db_path,
                 is_group_chat=is_group_chat,
+                turn_scope=getattr(self._current_turn_decision, "scope", None),
             )
             for block in profile_messages:
                 clean_block = str(block or "").strip()
@@ -1173,6 +1230,7 @@ class MaisakaReasoningEngine:
                     anchor_message_id=str(getattr(trigger_message, "message_id", "") or ""),
                     account=str(getattr(trigger_message, "account_id", "") or ""),
                     chat_id=chat_id,
+                    ledger_path=os.environ.get("MAIBOT_MESSAGE_LEDGER_PATH", "data/message_ledger.db"),
                 )
                 clean_catalog = str(truth_catalog or "").strip()
                 if clean_catalog:
@@ -1191,6 +1249,7 @@ class MaisakaReasoningEngine:
             quote_block, quote_parts = await build_quote_context_async(
                 source_messages or [trigger_message],
                 db_path=truth_db_path,
+                ledger_path=os.environ.get("MAIBOT_MESSAGE_LEDGER_PATH", "data/message_ledger.db"),
                 exclude_direct_attachment_ids=hydrated_direct_ids,
             )
             if quote_block and str(quote_block).strip():
@@ -1244,6 +1303,8 @@ class MaisakaReasoningEngine:
     ) -> None:
         """统一 ST-Agent 一 Pass 直答与原生工具闭环：私聊/群聊通用。"""
 
+        self._tool_observations = []
+        self._tool_observation_file_parts = []
         cycle_detail, round_text = await self._start_cycle_round(0)
         state = CycleRuntimeState()
         state.reply_target_message = trigger_message
@@ -1258,6 +1319,7 @@ class MaisakaReasoningEngine:
             await self._refresh_visual_placeholders_for_cycle(cycle_detail)
             await self._post_process_chat_history_after_cycle(cycle_detail, consume_references=False)
             eff_source_messages = list(source_messages) if source_messages else [trigger_message]
+            self._turn_source_messages = eff_source_messages
             slot = str(
                 getattr(decision, "forced_slot", None)
                 or getattr(decision, "recommended_slot", None)
@@ -1380,19 +1442,11 @@ class MaisakaReasoningEngine:
                     state.cycle_end = self._cycle_end_for_pause_tool(pause_tool_name)
                     return
 
-                tool_observations = [
-                    {
-                        "tool": tc.func_name,
-                        "args": dict(tc.args or {}),
-                        "result": tool_result_summaries[idx] if idx < len(tool_result_summaries) else "",
-                    }
-                    for idx, tc in enumerate(non_st_calls)
-                ]
                 pass2_args = dict(arguments)
-                pass2_args["_tool_observations"] = tool_observations
+                pass2_args["_tool_observations"] = list(self._tool_observations)
                 pass2_args["_external_tools"] = []
-                if state.tool_multimodal_parts:
-                    pass2_args["_tool_observation_file_parts"] = list(state.tool_multimodal_parts)
+                if self._tool_observation_file_parts:
+                    pass2_args["_tool_observation_file_parts"] = list(self._tool_observation_file_parts)
                 self._runtime._update_stage_status("Replyer", "ST工具收敛生成回复中", round_text=round_text)
                 reply_started_at = time.time()
                 result = await execute_reply(
@@ -1423,7 +1477,9 @@ class MaisakaReasoningEngine:
 
             from src.companion_vault.st_preset_engine import STPresetEngine
 
-            st_output_mode = str(getattr(replyer, "_last_st_output_mode", "im_clean") or "im_clean").strip() or "im_clean"
+            st_output_mode = str(getattr(_compiled_req, "output_mode", "im_clean") or "im_clean")
+            if self._runtime.chat_stream.platform == "wechat":
+                st_output_mode = "im_clean"
             compiled_tool_defs = getattr(_compiled_req, "tool_definitions", None) if _compiled_req is not None else None
             compiled_tool_options = normalize_tool_options(compiled_tool_defs) if compiled_tool_defs else None
             direct_check = STPresetEngine.evaluate_wechat_direct_reply(
@@ -1486,12 +1542,6 @@ class MaisakaReasoningEngine:
                 output_mode="im_clean" if st_output_mode == "im_clean" else "raw_preset",
                 native_reasoning=str(getattr(llm_res, "reasoning", "") or ""),
             )
-            allowed_slots = tuple(getattr(decision, "allowed_slots", ("sister_younger", "sister_elder")) or ())
-            forced_slot = getattr(decision, "forced_slot", None)
-            extracted_slot = str(getattr(unwrapped, "persona_slot", "") or "").strip()
-            if not forced_slot and extracted_slot and extracted_slot in allowed_slots:
-                arguments["persona_slot"] = extracted_slot
-
             target_msg = trigger_message
             extracted_quote_id = str(getattr(unwrapped, "quote_msg_id", "") or "").strip()
             if extracted_quote_id:
@@ -1508,6 +1558,7 @@ class MaisakaReasoningEngine:
                         state.reply_target_message = target_msg
 
             arguments["_precomputed_st_response"] = llm_res
+            arguments["_precomputed_st_request"] = _compiled_req
             self._runtime._update_stage_status("Replyer", "一Pass直答发送中", round_text=round_text)
             result = await execute_reply(
                 tool_ctx,
@@ -1570,6 +1621,8 @@ class MaisakaReasoningEngine:
                     self._turn_passive_replyer = global_config.experimental.passive_replyer
                     self._runtime._chat_loop_service.passive_replyer_override = self._turn_passive_replyer
                     self._active_logical_turn_id = turn_start_context.logical_turn_id or uuid.uuid4().hex
+                    self._tool_observations = []
+                    self._tool_observation_file_parts = []
                     if force_continue_reason := self._runtime._consume_forced_turn_reason():
                         logger.info(f"{self._runtime.log_prefix} {force_continue_reason}")
 
@@ -1595,15 +1648,31 @@ class MaisakaReasoningEngine:
                         )
                         continue
                     round_index = 0
+                    self._turn_interrupt_count = 0
+                    correction_attempted = False
                     while round_index < self._runtime._max_internal_rounds:
                         # 工具执行或整理上下文期间收到的消息，在下一次模型请求前补齐。
                         pending_round_messages = await self._ingest_pending_messages() if round_index > 0 else []
                         if pending_round_messages:
                             cached_messages = self._merge_turn_source_messages(cached_messages, pending_round_messages)
                             trigger_message = pending_round_messages[-1]
+                            self._current_turn_decision = await self._resolve_current_turn_decision(
+                                trigger_message=trigger_message, source_messages=pending_round_messages,
+                            )
+                            self._runtime._chat_loop_service.planner_request_snapshot = None
+                            self._tool_observations = []
+                            self._tool_observation_file_parts = []
+                            if self._current_turn_decision is not None and self._current_turn_decision.abort_turn:
+                                self._runtime._enter_stop_state()
+                                break
 
                         cycle_detail, round_text = await self._start_cycle_round(round_index)
-                        state = CycleRuntimeState()
+                        state = CycleRuntimeState(
+                            trigger_message=trigger_message, source_messages=cached_messages or [trigger_message],
+                            proactive_triggered=turn_start_context.proactive_triggered,
+                            proactive_correction_attempted=correction_attempted,
+                            round_index=round_index, round_text=round_text,
+                        )
                         try:
                             await self._refresh_visual_placeholders_for_cycle(cycle_detail)
                             await self._post_process_chat_history_after_cycle(cycle_detail, consume_references=False)
@@ -1650,6 +1719,17 @@ class MaisakaReasoningEngine:
                                 cached_messages, interrupt_result.retry_messages
                             )
                             trigger_message = interrupt_result.retry_messages[-1]
+                            self._current_turn_decision = await self._resolve_current_turn_decision(
+                                trigger_message=trigger_message, source_messages=interrupt_result.retry_messages,
+                            )
+                            self._runtime._chat_loop_service.planner_request_snapshot = None
+                            self._tool_observations = []
+                            self._tool_observation_file_parts = []
+                            if self._current_turn_decision is not None and self._current_turn_decision.abort_turn:
+                                state.cycle_end = CycleEnd("turn_scope_aborted", self._current_turn_decision.abort_reason)
+                                self._runtime._enter_stop_state()
+                                break
+                            self._turn_interrupt_count += 1
                             continue
                         except asyncio.CancelledError:
                             state.cycle_end = CycleEnd("cancelled", "思考任务已取消，本轮结束。")
@@ -1658,6 +1738,7 @@ class MaisakaReasoningEngine:
                             state.cycle_end = CycleEnd("cycle_error", f"本轮处理异常：{exc}")
                             raise
                         finally:
+                            correction_attempted = state.proactive_correction_attempted
                             state.cycle_end = await self._finalize_cycle(
                                 cycle_detail=cycle_detail,
                                 round_index=round_index,
@@ -2012,6 +2093,12 @@ class MaisakaReasoningEngine:
         final_history = process_result.history
         if process_result.removed_messages and enable_compaction:
             planner_snapshot = self._runtime._chat_loop_service.planner_request_snapshot
+            if planner_snapshot is not None and (
+                (planner_snapshot.session_id and planner_snapshot.session_id != self._runtime.session_id)
+                or (planner_snapshot.logical_turn_id and planner_snapshot.logical_turn_id != self._active_logical_turn_id)
+            ):
+                self._runtime._chat_loop_service.planner_request_snapshot = None
+                return
             if planner_snapshot is None:
                 # 冷启动或上次摘要提交后必须先完成一次 Planner 请求，才能复用真实前缀。
                 return
@@ -2205,6 +2292,7 @@ class MaisakaReasoningEngine:
             group_id=str(getattr(chat_stream, "group_id", "") or "").strip(),
             user_id=str(getattr(chat_stream, "user_id", "") or "").strip(),
             platform=str(getattr(chat_stream, "platform", "") or "").strip(),
+            channel_capabilities=dict(getattr(chat_stream, "channel_capabilities", {}) or {}),
         )
 
     def _build_tool_execution_context(
@@ -2229,6 +2317,7 @@ class MaisakaReasoningEngine:
             group_id=str(getattr(chat_stream, "group_id", "") or "").strip(),
             user_id=str(getattr(chat_stream, "user_id", "") or "").strip(),
             platform=str(getattr(chat_stream, "platform", "") or "").strip(),
+            channel_capabilities=dict(getattr(chat_stream, "channel_capabilities", {}) or {}),
         )
 
     @staticmethod
@@ -2854,6 +2943,36 @@ class MaisakaReasoningEngine:
                 state.tool_multimodal_parts.extend(
                     item for item in result.metadata["_multimodal_parts"] if isinstance(item, dict)
                 )
+            if result.success and invocation.tool_name not in {"reply", "wait", "stop"}:
+                from src.llm_models.generation_diagnostics import sanitize_diagnostic_url, sanitize_generation_diagnostic
+                from src.companion_vault.output_guardrail import check_group_outbound_text
+                raw_result = result.structured_content if result.structured_content is not None else result.get_history_content()
+                sanitized = sanitize_generation_diagnostic(raw_result)
+                if isinstance(sanitized, str):
+                    raw_observation = sanitized[:6000]
+                else:
+                    import json
+
+                    raw_observation = json.dumps(sanitized, ensure_ascii=False)[:6000]
+                raw_observation = re.sub(
+                    r'https?://[^\s<>"\]]+',
+                    lambda match: sanitize_diagnostic_url(match.group(0)), raw_observation,
+                )
+                decision = getattr(self, "_current_turn_decision", None)
+                allowed, _ = await asyncio.to_thread(
+                    check_group_outbound_text, raw_observation,
+                    is_group_chat=bool(availability_context and availability_context.is_group_chat),
+                    is_owner_private=bool(decision and decision.is_owner_private),
+                )
+                if allowed:
+                    self._tool_observations = [
+                        *getattr(self, "_tool_observations", []),
+                        {"tool": invocation.tool_name, "call_id": invocation.call_id, "result": raw_observation},
+                    ][-12:]
+                    self._tool_observation_file_parts = [
+                        *getattr(self, "_tool_observation_file_parts", []),
+                        *(part for part in result.metadata.get("_multimodal_parts", []) if isinstance(part, dict)),
+                    ][-16:]
             # 超长结果先交给子代理按当前意图整理，Planner 历史里只留整理后的结论
             condensed_content: str | None = None
             raw_history_content = result.get_history_content()

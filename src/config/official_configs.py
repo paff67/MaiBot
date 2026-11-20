@@ -489,7 +489,7 @@ class TwinEconomyConfig(ConfigBase):
             "x-option-labels": {"dual_director": "双层导演", "one_pass_st": "统一 ST 一步直出"},
         },
     )
-    """dual_director 为 Planner + Replyer 双层协作；one_pass_st 在私聊与群聊中均启用统一 ST-Agent 一步直出与原生工具循环（全局启用 STPresetEngine 时亦自动切换）。"""
+    """执行拓扑与 STPresetEngine 启用状态相互独立；one_pass_st 必须同时启用 STPresetEngine。"""
 
     away_direction_prompt: str = Field(
         default="",

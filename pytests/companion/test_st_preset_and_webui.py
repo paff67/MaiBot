@@ -333,7 +333,8 @@ def test_spreset_external_tools_observations_convergence_and_optional_slots():
     assert [opt.name for opt in normalized_opts] == tool_names
 
     sol_schema = compiled_p1.tool_definitions[0]["parameters_schema"]
-    assert "propertyOrdering" not in sol_schema
+    prop_order = list(sol_schema["properties"])
+    assert sol_schema["propertyOrdering"] == prop_order
     prop_keys = list(sol_schema["properties"].keys())
     assert "persona_slot" in prop_keys
     assert "quote_msg_id" in prop_keys
